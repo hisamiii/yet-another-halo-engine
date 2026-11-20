@@ -393,13 +393,21 @@ class LoomPrefill {
         if (!std::strcmp(r, "list"))
           for (std::size_t i = 0; i < jobs.size(); ++i) std::fprintf(stderr, "npu cpu-driven: job %zu %s\n", i, jobs[i].tag.c_str());
         std::vector<NpuSplit::Queued> kept;
+        std::vector<std::size_t> from;   // each kept job's index in the chunk
         std::size_t a = 0, b = 0;
         for (int n = 0; std::sscanf(r, "%zu-%zu%n", &a, &b, &n) == 2 && a <= b && b < jobs.size(); ++r) {
           kept.insert(kept.end(), jobs.begin() + a, jobs.begin() + b + 1);
+          for (std::size_t i = a; i <= b; ++i) from.push_back(i);
           r += n;
           if (*r != ',') break;
         }
         jobs.swap(kept);
+        // The gate counts jobs per family run (NpuSplit::NewJob; gate = sequence * 64 + calls, gen_npu_gemm.GATE_CALLS).
+        // A job kept right after one of its tag that was not its neighbor in the chunk (no family switch between them
+        // now) counts on from that one; every other job keeps the chunk's value.
+        for (std::size_t i = 1; i < jobs.size(); ++i)
+          if (jobs[i].tag == jobs[i - 1].tag && from[i] != from[i - 1] + 1)
+            jobs[i].words.gate = (jobs[i - 1].words.gate / 64 + 1) * 64 + jobs[i].words.gate % 64;
         for (const auto& q : jobs) std::fprintf(stderr, "npu cpu-driven: keep %s gate %08x\n", q.tag.c_str(), q.words.gate);
       }
       std::thread enq([&] {   // it blocks while the NPU's queue is full, the NPU waits for the stores below
