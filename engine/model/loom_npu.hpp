@@ -1515,6 +1515,16 @@ class LoomNpu {
         for (std::uint32_t q = 0; q < nw && off + 4 * q < 0x3F300; ++q)
           std::memcpy(&shim[col][(off - 0x3F000) / 4 + q], op + 16 + 4 * q, 4);
       }
+      // An image whose MM2S0 slave runs by packets (HRX LOOM_EXP_SHIM_SHARE: two panels on one shim channel, parted
+      // by id at the shim switch): the lane needs that slave as a circuit while the packets stream, so the slave's
+      // packet mode, its slot rules and the packet-switched masters wait for the packets' end (the slave's circuit
+      // enable goes ahead, below and in the lane's setup).
+      if (row == 0 && op[0] == 0 &&
+          ((off == 0x3F114 && (v & 0x40000000u)) || (off >= 0x3F250 && off < 0x3F260) ||
+           (off >= 0x3F000 && off < 0x3F058 && off != 0x3F008 && off != 0x3F044 && (v & 0x40000000u)))) {
+        deferred.insert(deferred.end(), op, op + len), ++deferred_ops;
+        return true;
+      }
       // the shim mux / demux, MM2S0's slave port and the token route, ahead of the packets (the first setup's array
       // has none of them)
       if (row == 0 && ((op[0] == 3 && (off == 0x1F000 || off == 0x1F004)) ||
@@ -1714,6 +1724,7 @@ class LoomNpu {
         for (std::uint32_t m = 0; m < 22; ++m)
           if (ps.shim[c][m] == 0x80000005 || (m != 17 && (program_.s5[c] >> m & 1)))
             w32(tile(c, 0) | 0x3F000 + 4 * m, 0);
+        w32(tile(c, 0) | 0x3F114, 0x80000000);   // S5 a circuit (an earlier image may have left it by packets)
         w32(tile(c, 0) | 0x3F044, 0x80000005);                                // M17 <- S5 (MM2S0)
         if (keep && program_.lane[c]) continue;
         w32(tile(c, 1) | 0xB0130, 0x80000000), w32(tile(c, 1) | 0xB0040, 0x8000000C);   // S12, M16 <- S12
