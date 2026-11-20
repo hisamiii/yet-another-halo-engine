@@ -151,18 +151,15 @@ def st(e, words, base):
         e(f"    vector.store %w{n}, %ov[%wa{n}] : vector<8xi8>, view<[%nout]xi8>")
 
 
-def body(rows, K, p="", rstride=None, koff=0, stream=None):
-    """The decode of work item %item (views %wv over the rows, %ov over the fragments), names prefixed with p.
-    Row r's IQ4_XS blocks start at byte r * rstride + koff (default: K's blocks back to back)."""
+def prologue(e, rows, K, rb, koff=0, stream=None, blk=136):
+    """Work item %item's fragment: %g8 (its 8-row group), %kbi (its k-block), %frag (its first output byte: row-major
+    or the swap's stream), opening "scf.if %live" (closed by the caller). Shared by the K-quant decoders."""
     kb = K // 8
-    rb = rstride or K // 256 * 136
-    L = []
-    e = L.append
     e(f"  %citems = index.constant {items(rows, K)} : index")
     e("  %live = index.cmp ult, %item, %citems : index")
     e("  scf.if %live {")
     for nm, v in (("ckb", kb), ("crb", rb), ("ckoff", koff), ("c8", 8), ("c4", 4), ("c2", 2), ("c32", 32),
-                  ("c136", 136), ("c16", 16), ("c72", 72)) + ((("c0i", 0),) if stream else ()):
+                  ("c136", blk), ("c16", 16), ("c72", 72)) + ((("c0i", 0),) if stream else ()):
         e(f"    %{nm} = index.constant {v} : index")
     if stream:   # a lane pair: one k-block's two 8-row halves of a 16-row group (144 contiguous stream bytes)
         e("    %ihf = index.rem %item, %c2 : index")
@@ -189,6 +186,16 @@ def body(rows, K, p="", rstride=None, koff=0, stream=None):
         e(f"    %frag = index.add {fr}, %c0i : index")
     else:
         e("    %frag = index.mul %item, %c72 : index")
+
+
+def body(rows, K, p="", rstride=None, koff=0, stream=None):
+    """The decode of work item %item (views %wv over the rows, %ov over the fragments), names prefixed with p.
+    Row r's IQ4_XS blocks start at byte r * rstride + koff (default: K's blocks back to back)."""
+    kb = K // 8
+    rb = rstride or K // 256 * 136
+    L = []
+    e = L.append
+    prologue(e, rows, K, rb, koff, stream)
     # k-block kbi: super-block kbi / 32, sub-block (kbi % 32) / 4, nibble half (kbi % 4) / 2, byte half kbi % 2
     e("    %sb = index.div %kbi, %c32 : index")
     e("    %kbl = index.rem %kbi, %c32 : index")
