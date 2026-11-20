@@ -83,7 +83,10 @@ def store(e, src):
     diag = os.environ.get("KQ_DIAG", "")
     if diag == "storeonly":
         e("    %dgf = index.cast %frag : index to i32")
-        I.st(e, ["%dgf"] * 18, "%frag")
+        if LDS:
+            I.restage(e, ["%dgf"] * 18)
+        else:
+            I.st(e, ["%dgf"] * 18, "%frag")
         return
     words = I.pack(e, src)
     if diag == "nostore":
