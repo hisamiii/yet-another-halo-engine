@@ -5,6 +5,8 @@ The f32 decode ops (one f16 rounding) match the reference dequant, so the GEMMs 
 gen_gemm_tile.configure() sets the per-format switches and the geometry below before it emits a kernel.
 """
 
+import os
+
 NW = 2                      # decoding waves per workgroup
 LR = 64                     # weight rows per decoded tile
 PAD = 0                     # f16 of padding per LDS weight row
@@ -250,6 +252,12 @@ def iq4xs_compute(v, gb):
     return L
 
 
+# The IQ4 codebook bytes paired 0 / 1 and 2 / 3: each f16 pair register feeds one result register's two v_fma_mix
+# halves, which engine/hrx patch 0101 runs in place (no zeroed accumulator; 0103 then lands the pair in the ds_store
+# tuple). YAH_IQ4_PAIRSRC=0: bytes 0 / 2 and 1 / 3 (an andi and a perm).
+PAIRSRC = os.environ.get("YAH_IQ4_PAIRSRC", "1") == "1"
+
+
 def _iq4_f16(e, u, dsc):
     """The 4-bit codebook values of nibble vectors %nlo{u} / %nhi{u} times the f32 scale dsc (an SSA name) as
     %hlo{u} / %hhi{u} (vector<16xf16>), one v_fma_mix each (IQ4_XS, IQ4_NL)."""
@@ -261,15 +269,23 @@ def _iq4_f16(e, u, dsc):
         e(f"    %cuw{part}{u} = vector.bitcast %cu{part}{u} : vector<16xi8> to vector<4xi32>")
         for w in range(4):
             tw = f"{part}{u}_{w}"
-            # bytes 0 / 2 and 1 / 3 in the low bits of the two halves: f16 subnormals c * 2^-24 (exact)
+            # two bytes in the low bits of each half: f16 subnormals c * 2^-24 (exact)
             e(f"    %cw{tw} = vector.extract %cuw{part}{u}[{w}] : vector<4xi32> -> i32")
-            e(f"    %cwe{tw} = scalar.andi %cw{tw}, %fpm00ff : i32")
-            # bytes 1 / 3 with zero high bytes: one v_perm_b32 (shuffle with a zero word)
-            e(f"    %cwz{tw} = vector.from_elements %cw{tw}, %c0i : vector<2xi32>")
-            e(f"    %cwb{tw} = vector.bitcast %cwz{tw} : vector<2xi32> to vector<8xi8>")
-            e(f"    %cwq{tw} = vector.shuffle<[1, 4, 3, 4, 4, 4, 4, 4]> %cwb{tw} : vector<8xi8>")
-            e(f"    %cwr{tw} = vector.bitcast %cwq{tw} : vector<8xi8> to vector<2xi32>")
-            e(f"    %cwo{tw} = vector.extract %cwr{tw}[0] : vector<2xi32> -> i32")
+            if PAIRSRC:   # bytes 0 / 1 and 2 / 3
+                e(f"    %cwz{tw} = vector.from_elements %cw{tw}, %c0i : vector<2xi32>")
+                e(f"    %cwb{tw} = vector.bitcast %cwz{tw} : vector<2xi32> to vector<8xi8>")
+                for nm, sh in (("cwe", "[0, 4, 1, 4, 4, 4, 4, 4]"), ("cwo", "[2, 4, 3, 4, 4, 4, 4, 4]")):
+                    e(f"    %{nm}q{tw} = vector.shuffle<{sh}> %cwb{tw} : vector<8xi8>")
+                    e(f"    %{nm}r{tw} = vector.bitcast %{nm}q{tw} : vector<8xi8> to vector<2xi32>")
+                    e(f"    %{nm}{tw} = vector.extract %{nm}r{tw}[0] : vector<2xi32> -> i32")
+            else:   # bytes 0 / 2 and 1 / 3
+                e(f"    %cwe{tw} = scalar.andi %cw{tw}, %fpm00ff : i32")
+                # bytes 1 / 3 with zero high bytes: one v_perm_b32 (shuffle with a zero word)
+                e(f"    %cwz{tw} = vector.from_elements %cw{tw}, %c0i : vector<2xi32>")
+                e(f"    %cwb{tw} = vector.bitcast %cwz{tw} : vector<2xi32> to vector<8xi8>")
+                e(f"    %cwq{tw} = vector.shuffle<[1, 4, 3, 4, 4, 4, 4, 4]> %cwb{tw} : vector<8xi8>")
+                e(f"    %cwr{tw} = vector.bitcast %cwq{tw} : vector<8xi8> to vector<2xi32>")
+                e(f"    %cwo{tw} = vector.extract %cwr{tw}[0] : vector<2xi32> -> i32")
             for hh, src in ((0, f"%cwe{tw}"), (1, f"%cwo{tw}")):
                 e(f"    %cwv{tw}_{hh} = vector.from_elements {src} : vector<1xi32>")
                 e(f"    %cwh{tw}_{hh} = vector.bitcast %cwv{tw}_{hh} : vector<1xi32> to vector<2xf16>")
@@ -280,7 +296,8 @@ def _iq4_f16(e, u, dsc):
         hs = []
         for j in range(16):
             w, b = divmod(j, 4)
-            e(f"    %yh{part}{u}_{j} = vector.extract %cwh{part}{u}_{w}_{b % 2}[{b // 2}] : vector<2xf16> -> f16")
+            hh, hx = (b // 2, b % 2) if PAIRSRC else (b % 2, b // 2)
+            e(f"    %yh{part}{u}_{j} = vector.extract %cwh{part}{u}_{w}_{hh}[{hx}] : vector<2xf16> -> f16")
             e(f"    %y{part}{u}_{j} = scalar.extf %yh{part}{u}_{j} : f16 to f32")
             e(f"    %m{part}{u}_{j} = scalar.fmaf %dsc24_{u}, %y{part}{u}_{j}, %nb{u} : f32")
             e(f"    %t{part}{u}_{j} = scalar.fptrunc %m{part}{u}_{j} : f32 to f16")
