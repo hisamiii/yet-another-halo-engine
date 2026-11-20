@@ -524,9 +524,11 @@ class LoomPrefill {
                            NpuOk(pre + "attn_gate.weight") &&
                            !NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)).empty() &&
                            !NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)).empty();
-      RunLayerNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow, qkv_npu ? "qkv" : nullptr,
-                   qkv_npu && (NpuPk(pre + "attn_qkv.weight") || NpuPk(pre + "attn_gate.weight")));
-      RunDeltaNet(l, pre, qkv_af, gate_af);
+      // ab_t: alpha / beta read the fragment-major copy too (gemm_kst2 .at.hal), so no row-major copy is written
+      const bool ab_t = qkv_npu && qkv_af && gate_af && !AlphaBetaHal(pre, true).empty();
+      RunLayerNorm(pre + "attn_norm.weight", ab_t ? NormOut::kTiled : qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow,
+                   qkv_npu ? "qkv" : nullptr, qkv_npu && (NpuPk(pre + "attn_qkv.weight") || NpuPk(pre + "attn_gate.weight")));
+      RunDeltaNet(l, pre, qkv_af, gate_af, ab_t);
     }
     if (!pending_norm_.empty()) throw LoomError("prefill: " + pre + " fused norm without its f16 output");
     if (tail_ != kNoRows) {
@@ -2055,13 +2057,26 @@ class LoomPrefill {
   // ssm_alpha and ssm_beta: in one kstore when the set has "gemm_kst2_<fmt>_<mt>_<kb>.hal" (emit_prefill_pp KST2) and the
   // tensors are of one format and stored back to back (one weight binding spans both; rows of beta go to beta_), else
   // two kstores.
-  void RunAlphaBeta(const std::string& pre) {
+  // The KST2 HAL of layer pre's alpha / beta ("" if none); tiled: its fragment-major-input form (".at.hal", input
+  // normt_; YAH_KST2AT=0 turns it off).
+  std::string AlphaBetaHal(const std::string& pre, bool tiled, Fmt* fo = nullptr) const {
+    static const bool at_off = [] { const char* v = std::getenv("YAH_KST2AT"); return v && std::string(v) == "0"; }();
     const auto* ta = Find(pre + "ssm_alpha.weight");
     const auto* tb = Find(pre + "ssm_beta.weight");
     Fmt f{};
-    const std::string hal = ta->type != tb->type || ta->dims != tb->dims || tb->offset != ta->offset + ta->bytes
-                                ? "" : GemmHal("gemm_kst2", *ta, &f);
-    if (hal.empty() || !geom_.count(hal)) {
+    std::string hal = ta->type != tb->type || ta->dims != tb->dims || tb->offset != ta->offset + ta->bytes
+                          ? "" : GemmHal("gemm_kst2", *ta, &f);
+    if (fo) *fo = f;
+    if (tiled && !hal.empty()) hal = at_off ? "" : hal.substr(0, hal.size() - 4) + ".at.hal";
+    return hal.empty() || !geom_.count(hal) ? "" : hal;
+  }
+  void RunAlphaBeta(const std::string& pre, bool tiled = false) {
+    const auto* ta = Find(pre + "ssm_alpha.weight");
+    const auto* tb = Find(pre + "ssm_beta.weight");
+    Fmt f{};
+    const std::string hal = AlphaBetaHal(pre, tiled, &f);
+    if (tiled && hal.empty()) throw LoomError("prefill: " + pre + " alpha / beta: no fragment-major-input KST2");
+    if (hal.empty()) {
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
       RunKstore(pre + "ssm_beta.weight", *beta_);
       return;
@@ -2070,7 +2085,7 @@ class LoomPrefill {
     auto b = GemmWeights(*ta, f);
     b[0].length = static_cast<std::size_t>(ta->bytes + tb->bytes);
     const std::size_t first = b.size();
-    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{scratch_, wstage_, ostage_, alpha_, beta_})
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{tiled ? normt_ : scratch_, wstage_, ostage_, alpha_, beta_})
       b.push_back(Ref(*x));
     const std::size_t rb = std::size_t(ta->dims[1]) * 4;
     const std::uint32_t tt = Trim(b, first, {std::size_t(ta->dims[0]) * 2, 0, 0, rb, rb}, g);
@@ -2404,7 +2419,7 @@ class LoomPrefill {
   }
 
 
-  void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
+  void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af, bool ab_t = false) {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
     // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
     // last-level cache (0.18 vs ~0.39 M cycles each)
@@ -2424,8 +2439,8 @@ class LoomPrefill {
       // decoder-column sets: each matrix's activations in its decoder's k-block order
       const bool kq = NpuPk(pre + "attn_qkv.weight"), kg = NpuPk(pre + "attn_gate.weight");
       std::vector<NpuView> a4, ak;
-      if (!kq || !kg) a4 = NpuEncode("qkv", *scratch_, false);
-      if (kq || kg) ak = NpuEncode("qkv", *scratch_, false, true);
+      if (!kq || !kg) a4 = NpuEncode("qkv", ab_t ? *normt_ : *scratch_, ab_t);   // (ab_t: no row-major copy)
+      if (kq || kg) ak = NpuEncode("qkv", ab_t ? *normt_ : *scratch_, ab_t, true);
       std::size_t c_off = 0;
       const auto wq = NpuRawRows("qkv", pre + "attn_qkv.weight", nq);
       const auto wg = NpuRawRows("gate", pre + "attn_gate.weight", ng);
@@ -2435,7 +2450,7 @@ class LoomPrefill {
       cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
       gate_job = NpuEnqueue(std::move(calls), "gate");
       RunPendingNorm();
-      RunAlphaBeta(pre);
+      RunAlphaBeta(pre, ab_t);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
       NpuJoin(qkv_job);
@@ -2446,6 +2461,7 @@ class LoomPrefill {
         NpuUnpack(Np4Hal("npu_unpack_qkv", wqkv), cq, {Ref(*qkv_)}, 2);
       }
     } else {
+      if (ab_t) throw LoomError("prefill: " + pre + " tiled alpha / beta input without the NPU split");
       // seg: alpha and beta ride in the qkv GEMM's dispatch (f16 sets)
       const bool seg = qkv_af && RunSeg({{"gemm_kstore", pre + "attn_qkv.weight", {qkv_}},
                                          {"gemm_kstore", pre + "ssm_alpha.weight", {alpha_}},

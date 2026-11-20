@@ -598,12 +598,17 @@ def kst2(rows, B, outdir):
             continue
         TG.SPLIT2 = True
         try:
-            r = _emit_gen(lambda f, k: TG.gen(f, "kstore", t, False), t.bn, fmt, 2 * mt, kb, B,
-                          "gemm_kst2_%s_%d_%d.hal" % (fmt, mt, kb), outdir, "kst2", t.rowgrp)
+            # ".at.hal": the same GEMM reading the norm's fragment-major copy (Tile.atin), so a deltanet layer whose
+            # qkv / gate are afrag needs no row-major copy (GN_KST2AT=0: not emitted)
+            for sfx, tt in [(".hal", t)] + ([(".at.hal", dataclasses.replace(t, atin=True))]
+                                             if os.environ.get("GN_KST2AT", "1") != "0" else []):
+                TG.check(tt)
+                r = _emit_gen(lambda f, k: TG.gen(f, "kstore", tt, False), tt.bn, fmt, 2 * mt, kb, B,
+                              "gemm_kst2_%s_%d_%d%s" % (fmt, mt, kb, sfx), outdir, "kst2", tt.rowgrp)
+                if r:
+                    out.append(r)
         finally:
             TG.SPLIT2 = False
-        if r:
-            out.append(r)
     return out
 
 
