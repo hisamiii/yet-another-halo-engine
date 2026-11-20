@@ -3697,12 +3697,15 @@ def gate_signal(e, exp, sts, pol, one):
 
 
 def gate_record(e, words, idr):
-    """One signal record (GN_QPSHARE: a packet, header first, TLAST on the last word)."""
+    """One signal record (GN_QPSHARE: a packet, header first), TLAST on its last word. Circuit records end with TLAST
+    too: their ports carry packets in the images that use GN_QPSHARE (memory tile slave 15 / core slave 16 of the
+    gate's columns), and a port whose last word had no TLAST takes the next image's first packet header for payload
+    (11-20: after ffnswap, every next image's go / done landed one word late, so its job never read done)."""
     if pshare():
         e(f"  {idr} = mova.i32 2")   # (Loom's LOOM_AIE2P_SHARE_CHANNEL_ID)
         e(f"  mov.ph {idr}, 0")
     for i, v in enumerate(words):
-        e(f"  mov.ms{'.last' if pshare() and i == 3 else ''} {v}")
+        e(f"  mov.ms{'.last' if i == 3 else ''} {v}")
 
 
 def gate_done_late(e):
