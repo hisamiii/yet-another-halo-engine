@@ -798,7 +798,8 @@ def colpair(l):
     """A layer whose gate and up run as column pairs (NPU_COLPAIR). Q' (QCP): one format too but IQ4_XS's (the
     formats of odd super-blocks have no single-format qsw image: pairs read one tensor a column)."""
     g, u = l["ffn_gate"][0], l["ffn_up"][0]
-    return (g != u or (QCP and NPU_Q and g != "iq4xs")) and {g, u} <= set(NPU_COLPAIR)
+    iq4 = os.environ.get("YAH_NPU_QCP_IQ4") == "1"   # (diag: IQ4_XS / IQ4_XS layers as column pairs too)
+    return (g != u or (QCP and NPU_Q and (g != "iq4xs" or iq4))) and {g, u} <= set(NPU_COLPAIR)
 
 
 def gu_fmt(fmt):
@@ -914,6 +915,16 @@ def kseg_for(fmt, mt, kb):
 # "npunp4_<fmt>" (LoomPrefill::Np4)
 QNP4_FMTS = tuple(os.environ.get("YAH_NPU_NP4", "iq3s,iq3xxs,iq2s,iq2xs,q3k,q4k,q5k").split(","))   # (YAH_NPU_NP4: a subset)
 QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (npu_images source)
+# YAH_NPU_RSWAP_EMIT=1 (row 5 stepping stone, Q' NP 4 gate / up, i.e. YAH_NPU_FFNSW5=0): also the swapped IQ4_XS
+# gate / up image ("npu_ffnswap_iq4xs": gen_npu_q GN_QSWAP + GN_QSWHT, fuse 0: the weights as its stream, GPU-decoded
+# into A, 512 tokens a call as its panel in W, H in today's down A layout), the GPU decoders of the NPU's rows
+# ("npu_swdec_iq4xs_<g|u>.hal", gen_iq4xs_bfp stream) and the token panel encode ("npu_swpanel.hal", gen_bfp16_encode
+# wgt p1k); dispatch.txt "npurswap <F>", "npubytes_ffnswap". The engine uses them with YAH_NPU_RSWAP=1 only.
+RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT") == "1"
+RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.py's, checked)
+RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
+                 GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0")   # (no fill at fuse 0)
+RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
 
 
 def ffnblk_parts(F):
@@ -1297,12 +1308,28 @@ def npu_images(images, B, tmp, outdir, extra=()):
         old = {k: os.environ.get(k) for k in QJOB_ENV.get(name, {})}   # (the image's own knobs, QJOB_ENV)
         os.environ.update(QJOB_ENV.get(name, {}))
         GN.qf_p1kd_layout()
+        tl = name in os.environ.get("GN_QCYCIMG", "").split(",")   # (diag: these images with GN_QCYC stamps, GN.qtlp)
+        qswap = GN.QSWAP
         try:
+            GN.QSWAP = qswap or name.startswith("npu_ffnswap_")   # (RSWAP_EMIT: gen_npu_gemm reads GN_QSWAP at import)
+            GN.QCYC = GN.QCYC or tl
+            GN.QFCYC = tl and os.environ.get("GN_QFCYC") == "1"
             with GN.np_override(np_):
                 src = os.path.join(tmp, name + ".loom")
-                open(src, "w").write(Q.gen(cfg) if NPU_Q else GN.gen(cfg))
-                return cfg, name, src, dict(hrx_paths.env(), **(Q.loom_env(cfg) if NPU_Q else GN.loom_env(cfg)))
+                text = Q.gen(cfg) if NPU_Q else GN.gen(cfg)
+                open(src, "w").write(GN.qtlp(text) if tl and os.environ.get("GN_QTLP") == "1" else text)
+                env_ = dict(hrx_paths.env(), **(Q.loom_env(cfg) if NPU_Q else GN.loom_env(cfg)))
+                if name.startswith("npu_ffnswap_"):
+                    for k_, v_ in Q.P1K_LOOM.items():
+                        if k_ not in RSWAP_DROP:
+                            env_.setdefault(k_, v_)
+                    for k_ in RSWAP_DROP:
+                        env_.pop(k_, None)
+                return cfg, name, src, env_
         finally:
+            GN.QSWAP = qswap
+            GN.QCYC = GN.QCYC and not tl
+            GN.QFCYC = False
             for k, v in old.items():
                 if v is None:
                     os.environ.pop(k, None)
@@ -1497,6 +1524,12 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                        swcol=40 if np5 else 32, hpass=qcallss, hord=hord),
                              "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 5 if np5 else 4))
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
+                if RSWAP_EMIT and fmt == "iq4xs" and not np5 and hord == "P4":
+                    assert B == 2048 and FS % 1024 == 0 and all(u[2] % 4 == 0 for u in ffnblk_units(FS))
+                    jobs.append((GN.Config(NPU_COLS, B // 64, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
+                                           rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
+                                 "npu_ffnswap_iq4xs", 4))
+                    QJOB_ENV["npu_ffnswap_iq4xs"] = dict(RSWAP_ENV)
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
                                  swcol=32, hpass=FS // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
@@ -1694,6 +1727,22 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for gf, uf in sorted({(l["ffn_gate"][0], l["ffn_up"][0]) for l in bsw}):
         out.append(("npuffnbx_%s_%s" % (gf, uf), 1, 0, 0))
     out.append(("npuffnblk", FS, 256, rows))   # F, gate / up features per call, down rows
+    swj = next((j for j in jobs if j[1] == "npu_ffnswap_iq4xs"), None)
+    if swj:   # (YAH_NPU_RSWAP_EMIT) the swap's GPU side: the NPU rows' decoders, the token panel
+        import gen_iq4xs_bfp
+        st_ = dict(ks=RSWAP_KS, passes=RSWAP_PASSES, tile=64)
+        for up_, nm_ in ((0, "npu_swdec_iq4xs_g"), (1, "npu_swdec_iq4xs_u")):
+            src = os.path.join(tmp, nm_ + ".loom")
+            open(src, "w").write(gen_iq4xs_bfp.gen(FS, 5120, dict(st_, up=up_)))
+            E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+            out.append((nm_ + ".hal", gen_iq4xs_bfp.items(FS, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(FS, 5120, st_)))
+        src = os.path.join(tmp, "npu_swpanel.loom")
+        open(src, "w").write(GE.gen("wgt", B, RSWAP_KS, RSWAP_PASSES, 64, True, True, p1k=True))
+        E.emit(src, ["nop=0"], "npu_swpanel.hal", outdir)
+        out.append(("npu_swpanel.hal", B // 8 * 640, GE.WG, GE.layout_bytes("wgt", B, RSWAP_KS, RSWAP_PASSES)))
+        out.append(("npurswap", FS, 0, 0))
+        with GN.np_override(4):
+            out.append(("npubytes_ffnswap",) + tuple(GN.stream_bytes(swj[0])))
     if NPU_Q:
         out.append(("npuffnq", 1, 0, 0))
         for fmt, mt, kb in sorted(DNSEG):   # (the engine reorders these formats' down rows: LoomWeights)

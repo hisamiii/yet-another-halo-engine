@@ -44,8 +44,15 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& A() const = 0;
   [[nodiscard]] virtual const LoomBuffer& W() const = 0;
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
+  // (diag YAH_NPU_CDUMP) a host thread waits for the done word to reach gate, then copies C's first bytes to path
+  virtual void DiagDumpC(std::uint32_t /*done*/, std::uint32_t /*gate*/, std::size_t /*bytes*/, std::string /*path*/) {}
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
+  // (row 5 stepping stone, YAH_NPU_RSWAP) one call of a fuse 0 image on A / W / C views, bound as one family (its
+  // setup once a job, not a call): the swapped FFN gate / up image (npu_ffnswap_*)
+  virtual std::uint32_t BindSwap(const std::string& /*image*/, NpuView /*a*/, NpuView /*w*/, NpuView /*c*/) {
+    throw LoomError("npu: BindSwap needs the NPU split");
+  }
   // Decoder-column sets (NpuPlan::dcol): the NPU reads raw weight rows, the model's (from the GPU's copy, ShareWeights)
   // or pre-decoded host copies.
   // RegisterRaw makes the pages holding [p, p + bytes) readable by the NPU (once per range, before any work).

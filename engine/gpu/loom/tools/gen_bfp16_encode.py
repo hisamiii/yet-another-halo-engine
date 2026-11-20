@@ -44,11 +44,14 @@ def layout_bytes(layout, rows, ks, passes, tile=64, pad=True):
     return (rows // tile) * sum(passes * (tile // 16) * b for b in sb)
 
 
-def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src=None, kb_count=None):
+def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src=None, kb_count=None, p1k=False, wperm=None):
     """layout: "act" | "wgt"; rows: tokens (act) or NPU output features (wgt); ks: k-blocks per K-slice.
     The input is f16 [rows][k_src] (default K), or fragment-major with tiled ([row / 16][k / 16][row % 16][k % 16], the
     afrag GEMMs' input); the encoded K columns are k_off .. k_off + K of it (a K chunk of a wider matrix).
-    kb_count: only the stream's first kb_count k-blocks (the rest written by another kernel, gen_npu_unpack bfp)."""
+    kb_count: only the stream's first kb_count k-blocks (the rest written by another kernel, gen_npu_unpack bfp).
+    p1k (wgt, one slice, row 5 swap): the P1K panel order [column][k half][pass][slab][ks / 2 k-blocks] (each slab's
+    two halves split, the half first: npu_gemm_check's P1K transpose); wperm (wgt): the source k-block order, as
+    ACT_PERM for act (the swap's weight stream holds the decoder's panel order, so the token panel must too)."""
     assert layout in ("act", "wgt") and rows % tile == 0 and tile % 16 == 0
     pk = sum(ks)
     kb = passes * pk
@@ -104,10 +107,11 @@ def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src
     e("    %g8 = index.add %g16x2, %ihalf : index")
     # ACT_PERM: this encoder permutes its source instead (position kbi reads k-block perm[kbi]; destination offsets keep
     # their range proofs, which a permuted destination loses for partial streams)
-    frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi", perm=False)
+    frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi", perm=False, p1k=p1k)
     kbs = "%kbi"
-    if layout == "act" and ACT_PERM:
-        kbs = emit_perm(e, "%kbi", ACT_PERM, "s_", forward=True)
+    sperm = ACT_PERM if layout == "act" else wperm
+    if sperm:
+        kbs = emit_perm(e, "%kbi", sperm, "s_", forward=True)
         # the permutation stays inside its group of 4 / 8 k-blocks: state kbs < kbe for the bound proofs
         e(f"    %s_kbl = index.constant {kbe - 1} : index")
         e(f"    %s_kbm = index.min {kbs}, %s_kbl : index")
@@ -157,7 +161,7 @@ def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src
     return "\n".join(L) + "\n"
 
 
-def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    ", perm=True):
+def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    ", perm=True, p1k=False):
     """Emit the byte offset of the fragment of row group g8 (8 rows) and k-block kbi in the stream layout; returns its name.
     The caller defines the index constants %{p}c2, %{p}c144, %{p}c72, %{p}csub (tile / 16), %{p}cpk (sum(ks)) and %{p}cpass."""
     sb = [slab_bytes(k, pad) for k in ks]
@@ -223,12 +227,25 @@ def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    
     else:
         x(f"%{p}cpanel = index.constant {panel} : index")
         x(f"%{p}po = index.mul %{p}blk, %{p}cpanel : index")
-        x(f"%{p}r1 = index.mul %{p}pass, %{p}csub : index")
-        x(f"%{p}rec = index.add %{p}r1, %{p}slab : index")
-        x(f"%{p}slo = index.mul %{p}rec, {sel_sb} : index")
+        if p1k:   # [k half][pass][slab][ks / 2 k-blocks]: record ((kh passes + pass) sub + slab) of sb / 2 bytes
+            assert len(ks) == 1 and ks[0] % 2 == 0 and len(groups) == 1 and sb[0] == 144 * ks[0] and (72 * ks[0]) % 64 == 0
+            x(f"%{p}chk = index.constant {ks[0] // 2} : index")
+            x(f"%{p}kh = index.div %{p}kin, %{p}chk : index")
+            x(f"%{p}kl = index.rem %{p}kin, %{p}chk : index")
+            x(f"%{p}kh1 = index.mul %{p}kh, %{p}cpass : index")
+            x(f"%{p}kh2 = index.add %{p}kh1, %{p}pass : index")
+            x(f"%{p}r1 = index.mul %{p}kh2, %{p}csub : index")
+            x(f"%{p}rec = index.add %{p}r1, %{p}slab : index")
+            x(f"%{p}chb = index.constant {72 * ks[0]} : index")
+            x(f"%{p}slo = index.mul %{p}rec, %{p}chb : index")
+        else:
+            x(f"%{p}r1 = index.mul %{p}pass, %{p}csub : index")
+            x(f"%{p}rec = index.add %{p}r1, %{p}slab : index")
+            x(f"%{p}slo = index.mul %{p}rec, {sel_sb} : index")
         x(f"%{p}off1 = index.add {sel_base}, %{p}slo : index")
         x(f"%{p}off0 = index.add %{p}po, %{p}off1 : index")
-    x(f"%{p}ko = index.mul %{p}kin, %{p}c144 : index")
+    kk = f"%{p}kl" if p1k and layout != "act" else f"%{p}kin"
+    x(f"%{p}ko = index.mul {kk}, %{p}c144 : index")
     x(f"%{p}ho = index.mul %{p}h, %{p}c72 : index")
     x(f"%{p}off2 = index.add %{p}off0, %{p}ko : index")
     x(f"%{p}frag = index.add %{p}off2, %{p}ho : index")

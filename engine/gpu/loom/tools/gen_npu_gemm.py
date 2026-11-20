@@ -3258,6 +3258,20 @@ def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
 MBNAME = [None]   # (GN_QMB1 diag) the leaf being generated
 
 def leaf(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=None):
+    """(GN_QCYCSKIP=<regex>, diag with GN_QCYC: leaves whose name matches get no stamps, e.g. a full gate core)"""
+    global QCYC, QFCYC
+    skip = os.environ.get("GN_QCYCSKIP")
+    if QCYC and skip and re.search(skip, name or role + ("_g" if gate else "")):
+        qf = QFCYC
+        QCYC = QFCYC = False
+        try:
+            return leaf_(L, cfg, role, ks, gate, cov, name, helper, pair)
+        finally:
+            QCYC, QFCYC = True, qf
+    return leaf_(L, cfg, role, ks, gate, cov, name, helper, pair)
+
+
+def leaf_(L, cfg, role, ks, gate=None, cov=None, name=None, helper=None, pair=None):
     e = L.append
     tail = role == "tail"
     fa = slab(ks)
@@ -6006,6 +6020,88 @@ def silu_rodata():
         b0 += nb
     out.append(f'global.rodata.def @silu_k = align(64) bytes("{np.concatenate(kv).view(np.uint8).tobytes().hex()}")')
     return "\n".join(out)
+
+
+def qtlp(text_):
+    """(diag GN_QTLP=1, with GN_QCYC, not GN_QCW: the P1K pair leaves' block timeline) per firing, cycles waited in
+    each acquire class (private %tlp words, zeroed at the firing start), and the last A / C2-lazy / relay-intake
+    acquire's done time from the core's first firing; copied into words 1-13 of each stamped H record (word 0: the
+    convert's end, word 14: the first firing's start). GN_QTLPSET: the classes (%tlp offsets) to time."""
+    cls_ = {"  acq %am1, 0": 0, "  acq.cond %am1, %cqn, 0": 0, "  acq %am1, 1": 4, "  acq.cond %am1, %waq, 1": 4,
+            "  acq %am1, 2": 8, "  acq.cond %am1, %qclk, 2": 12, "  acq %crm1, 5": 16, "  acq %crm1, 2": 20,
+            "  acq %am1, 3": 24, "  acq %am1, 4": 24, "  acq.cond %am1, %mbq, 3": 24, "  acq.cond %am1, %mbq, 4": 24,
+            "  acq %am2_e, 3": 24, "  acq %fzAd2, 6": 28, "  acq %fzAm1, 7": 28, "  acq %fzZ0, 7": 28,
+            "  acq %f4AE, 6": 28, "  acq %f4A2, 8": 28, "  acq %am1, 12": 32, "  acq %fzgd, 2": 36}
+    last_ = {0: 40, 12: 44, 16: 48}
+    if os.environ.get("GN_QTLPSET"):   # (the classes to time, %tlp offsets: the code must fit 16 KB)
+        set_ = {int(v_) for v_ in os.environ["GN_QTLPSET"].split(",")}
+        if 16 not in set_ and 48 in set_:   # (word 13: the last fill acquire's done time instead of the relay's)
+            last_[28] = last_.pop(16)
+        cls_ = {k_: v_ for k_, v_ in cls_.items() if v_ in set_}
+        last_ = {k_: v_ for k_, v_ in last_.items() if v_ in set_}
+    cum_ = {int(v_) for v_ in os.environ.get("GN_QTLPCUM", "").split(",") if v_}   # (classes summed over firings)
+    used_ = set(cls_.values()) | set(last_.values())
+    out_, n_, on_, tcs_, fi_, pend_ = [], 0, False, False, -1, False
+    tcsl_ = "  %tcs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>"
+    stamped_ = {i_ for i_, f_ in enumerate(text_.split("\nlow.func.def")[1:]) if tcsl_ in f_}
+    for ln_ in text_.splitlines():
+        n_ += 1
+        if ln_.startswith("low.func.def"):
+            fi_ += 1
+            on_, tcs_ = fi_ in stamped_, False
+        o_ = cls_.get(ln_) if on_ else None
+        if o_ is not None:
+            out_ += [f"  %tpa{n_} = mov.cycles", f"  %tpb{n_} = slice %tpa{n_}[0] : reg<aie2p.er x2> -> reg<aie2p.er>"]
+        if pend_ and "= resource<" not in ln_:   # (after the leaf's resources: the fill code precedes the stamps)
+            out_.append("  %tlp = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+            pend_ = False
+        out_.append(ln_)
+        if on_ and ln_.startswith("low.func.def"):
+            pend_ = True
+        if ln_ == "  %tcs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>":
+            tcs_ = True
+        if o_ is not None:
+            b_ = "%tpp" + str(n_)
+            out_ += [f"  %tpc{n_} = mov.cycles", f"  %tpd{n_} = slice %tpc{n_}[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                     f"  %tpe{n_} = sub %tpd{n_}, %tpb{n_}",
+                     f"  {b_} = storage_address %tlp : low.storage<private> -> reg<aie2p.ep>"]
+            if o_ >= 32:
+                out_ += [f"  %tpk{n_} = mov.i32 32", f"  %tpm{n_} = mov.modifier %tpk{n_}",
+                         f"  %tpq{n_} = padds.modifier {b_}, %tpm{n_}"]
+                b_ = f"%tpq{n_}"
+            out_ += [f"  %tpf{n_} = lda {b_}, {o_ % 32}", f"  %tpg{n_} = add.rr %tpf{n_}, %tpe{n_}",
+                     f"  st %tpg{n_}, {b_}, {o_ % 32}"]
+            if o_ in last_ and tcs_:
+                out_ += [f"  %tpr{n_} = storage_address %tcs : low.storage<private> -> reg<aie2p.ep>",
+                         f"  %tps{n_} = lda %tpr{n_}, 0", f"  %tpt{n_} = sub %tpd{n_}, %tps{n_}",
+                         f"  %tpk2{n_} = mov.i32 32", f"  %tpm2{n_} = mov.modifier %tpk2{n_}",
+                         f"  %tpq2{n_} = storage_address %tlp : low.storage<private> -> reg<aie2p.ep>",
+                         f"  %tpu{n_} = padds.modifier %tpq2{n_}, %tpm2{n_}",
+                         f"  st %tpt{n_}, %tpu{n_}, {last_[o_] - 32}"]
+        if on_ and ln_ == "  st %tsn, %tca, 0":
+            out_ += [f"  %tpz{n_} = mova.i32 0", f"  %tpy{n_} = storage_address %tlp : low.storage<private> -> reg<aie2p.ep>"]
+            zero_ = set(cls_.values()) - cum_
+            out_ += [f"  st %tpz{n_}, %tpy{n_}, {w_}" for w_ in (0, 4, 8, 12, 16, 20, 24, 28) if w_ in zero_]
+            if {32, 36} & zero_:
+                out_ += [f"  %tpk{n_} = mov.i32 32", f"  %tpm{n_} = mov.modifier %tpk{n_}",
+                         f"  %tpy2{n_} = storage_address %tlp : low.storage<private> -> reg<aie2p.ep>",
+                         f"  %tpx{n_} = padds.modifier %tpy2{n_}, %tpm{n_}"]
+                out_ += [f"  st %tpz{n_}, %tpx{n_}, {w_ - 32}" for w_ in (32, 36) if w_ in zero_]
+        if on_ and ln_ == "  st %tsp_l, %cvds, 0":
+            out_ += [f"  %tpy{n_} = storage_address %tlp : low.storage<private> -> reg<aie2p.ep>",
+                     f"  %tpk{n_} = mov.i32 32", f"  %tpm{n_} = mov.modifier %tpk{n_}",
+                     f"  %tpy2{n_} = storage_address %tlp : low.storage<private> -> reg<aie2p.ep>",
+                     f"  %tpx{n_} = padds.modifier %tpy2{n_}, %tpm{n_}",
+                     f"  %tpk3{n_} = mov.i32 32", f"  %tpm3{n_} = mov.modifier %tpk3{n_}",
+                     f"  %tpo{n_} = copy %cvds : reg<aie2p.ep> -> reg<aie2p.ep>",
+                     f"  %tpw{n_} = padds.modifier %tpo{n_}, %tpm3{n_}"]
+            for w_ in [w_ for w_ in range(1, 14) if 4 * (w_ - 1) in used_]:   # (record word w = %tlp byte 4 (w - 1))
+                sb_, so_ = ("%tpy" if 4 * (w_ - 1) < 32 else "%tpx") + str(n_), 4 * (w_ - 1) % 32
+                db_, do_ = ("%cvds" if 4 * w_ < 32 else f"%tpw{n_}"), 4 * w_ % 32
+                out_ += [f"  %tpv{n_}_{w_} = lda {sb_}, {so_}", f"  st %tpv{n_}_{w_}, {db_}, {do_}"]
+            out_ += [f"  st %tst_l, %tpw{n_}, 24"]
+    text_ = "\n".join(out_) + "\n"
+    return text_
 
 
 def gen(cfg):

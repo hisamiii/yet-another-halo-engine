@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -240,10 +242,23 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights) {
         return true;
       }
       run(0, 1);   // (row 0 here: a format Dequantize rejects throws on this thread, not in a worker)
+      static const bool times = std::getenv("YAH_HOST_TIMES") != nullptr;   // (diag) each worker's start and end
+      const auto c0 = std::chrono::steady_clock::now();
+      std::vector<double> t0(threads), t1(threads);
+      const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count(); };
       std::vector<std::thread> pool;
       for (std::size_t w = 0; w < threads; ++w)
-        pool.emplace_back(run, std::max<std::size_t>(1, n * w / threads), n * (w + 1) / threads);
+        pool.emplace_back([&, w] {
+          t0[w] = ms();
+          run(std::max<std::size_t>(1, n * w / threads), n * (w + 1) / threads);
+          t1[w] = ms();
+        });
       for (auto& th : pool) th.join();
+      if (times) {
+        std::fprintf(stderr, "gguf: rows of %s, %zu threads, %.2f ms; worker start .. end ms:", t.name.c_str(), threads, ms());
+        for (std::size_t w = 0; w < threads; ++w) std::fprintf(stderr, " %.1f..%.1f", t0[w], t1[w]);
+        std::fprintf(stderr, "\n");
+      }
       return true;
     };
     // a job's bytes in the copy (dst) and in the file (src)

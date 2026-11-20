@@ -382,6 +382,8 @@ def main():
                          for w_, b2_, o2_ in ((1, "%tsa_l", 20), (2, "%tsa_l", 24), (3, "%tsa_l", 28), (4, f"%qcwy{n_}", 8),
                                               (5, f"%qcwy{n_}", 12), (6, f"%qcwy{n_}", 16))]
         text_ = "\n".join(out_) + "\n"
+    if os.environ.get("GN_QTLP") == "1" and N.QCYC and os.environ.get("GN_QCW") != "1":   # (diag) N.qtlp
+        text_ = N.qtlp(text_)
     open(src, "w").write(text_)
     env = hrx_paths.env()
     env.update(Q.loom_env(cfg) if QMODE else N.loom_env(cfg))

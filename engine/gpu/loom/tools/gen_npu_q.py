@@ -253,6 +253,11 @@ def array_program(L, cfg):
                 # (the down reads it with GN_QHSLAB strides); this call's blocks at its binding offset
                 L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x{rec}xi32, "
                          f"#encoding.layout.strided<strides=[{hm_}, {rec}, {8 * cfg.hpass * rec}, 1]>>>")
+                if os.environ.get("GN_QSWHT") == "1":   # (row 5, diag) H in today's down A layout [M block][call]
+                    # [slab][column][576 B]: a lane's blocks as [2 nbr / 8 calls][8 columns]
+                    assert 2 * nbr % 8 == 0
+                    L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr // 8}x8x{MP}x{rec}xi32, "
+                             f"#encoding.layout.strided<strides=[{hm_}, {MP * 8 * rec}, {rec}, {8 * rec}, 1]>>>")
             if qsw5_on(cfg):   # (qsw5: column c's 144 B at slot c of each of 5 passes; rows 4608 B apart)
                 hm_ = cfg.hpass * MP * 1152
                 L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x5x36xi32, "
@@ -653,6 +658,8 @@ def gate_cols(cfg):
     """(gated) the waiter's and the relay's columns, east neighbours (their channel is a shared-memory hop; 2 and 4 run
     out of DMA channels): 1 and 2; column pairs: 2 and 3, the waiter on a gate column (an up column's waiter with
     the larger decoder overflows the 16 KB program memory: a Q5_K up's, 16416 B)."""
+    if N.fpair(cfg) and os.environ.get("GN_QGCOLS"):   # (diag) the column pairs' waiter, relay columns
+        return tuple(int(x) for x in os.environ["GN_QGCOLS"].split(","))
     return (2, 3) if N.fpair(cfg) else (1, 2)
 
 

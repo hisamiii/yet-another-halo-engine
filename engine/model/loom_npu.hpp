@@ -2275,6 +2275,9 @@ class LoomNpuSplit : public NpuSplit {
                       "power_dpm_force_performance_level): fabric / memory clock switches corrupt NPU outputs");
     if (kSignal + 2 * plan.gate_record > kGateSlot) throw LoomError("npu: the gate records do not fit a gate slot");
   }
+  ~LoomNpuSplit() override {
+    if (dump_.joinable()) dump_.join();
+  }
   const LoomBuffer& A() const override { return a_.gpu; }
   const LoomBuffer& W() const override { return w_.gpu; }
   const LoomBuffer& C() const override { return c_.gpu; }
@@ -2292,6 +2295,19 @@ class LoomNpuSplit : public NpuSplit {
                                               {&flags_, slot + kSignal, 2 * plan_.gate_record}})));
     return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
   }
+  std::uint32_t BindSwap(const std::string& image, NpuView a, NpuView w, NpuView c) override {
+    const auto key = std::make_tuple(image, a.offset, a.length, w.offset, w.length, c.offset, c.length);
+    if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
+    const std::size_t slot = GateSlot();
+    std::vector<LoomNpu::View> views{{&a_, a.offset, a.length},
+                                     {&w_, w.offset, w.length},
+                                     {&c_, c.offset, c.length},
+                                     {&flags_, slot, plan_.gate_record},
+                                     {&flags_, slot + kTick, plan_.gate_record},
+                                     {&flags_, slot + kSignal, 2 * plan_.gate_record}};
+    return ids_[key] = BindViews(image, image, kSwapDec, "ffnswap", std::move(views));
+  }
+  static constexpr int kSwapDec = 98;   // (BindSwap's family id: no decoder; the decoders' are below 98)
   void ShareWeights(const void* key, std::size_t bytes, const LoomBuffer& buffer) override {
     const auto b = reinterpret_cast<std::uintptr_t>(key);
     raw_.push_back({b, b + bytes, &npu_.ImportGpu(buffer)});
@@ -2510,6 +2526,24 @@ class LoomNpuSplit : public NpuSplit {
     npu_.Drain();
     if (Word(kFlagStatus)) std::fprintf(f, "npu: ERROR a GPU wait for the NPU failed\n");
     npu_.Report(f);
+    if (dump_.joinable()) dump_.join();
+  }
+  void DiagDumpC(std::uint32_t done, std::uint32_t gate, std::size_t bytes, std::string path) override {
+    if (dump_.joinable()) dump_.join();
+    dump_ = std::thread([this, done, gate, bytes = std::min(bytes, c_.bytes), path] {
+      const auto t0 = std::chrono::steady_clock::now();
+      while (true) {
+        const std::uint32_t d = HostLoad(done);
+        if ((d & 0x7fffffffu) >= gate || (d & 0x80000000u)) break;
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) return;
+      }
+      std::vector<char> copy(bytes);
+      auto* src = static_cast<const char*>(c_.host);
+      for (std::size_t o = 0; o < bytes; o += 64) __builtin_ia32_clflush(src + o);
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      std::memcpy(copy.data(), src, bytes);
+      if (FILE* fp = std::fopen(path.c_str(), "wb")) std::fwrite(copy.data(), 1, bytes, fp), std::fclose(fp);
+    });
   }
 
   // The amdgpu card's DPM performance level is "high" (results.md: deferred data-fabric errors otherwise).
@@ -2548,6 +2582,7 @@ class LoomNpuSplit : public NpuSplit {
   LoomNpu npu_;
   LoomNpu::Shared &a_, &w_, &c_, &flags_;
   LoomNpu::Shared& cscratch_;   // the setup instances' C (BindRaw)
+  std::thread dump_;   // (diag) DiagDumpC
   NpuPlan plan_;
   std::uint32_t seq_ = 0;
   const void* job_family_ = nullptr;   // NewJob's current family run (decoder-column sets)
