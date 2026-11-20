@@ -49,8 +49,9 @@ def _pre(lines, p="dz_"):
                                                          else p + m.group(1)), ln) for ln in lines]
 
 
-def _frame_prologue(e, n, nin, nout):
-    """The constants, views and lane map every payload shares (the slab map and the record's bfp math)."""
+def _frame_prologue(e, n, nin, nout, pbal=False):
+    """The constants, views and lane map every payload shares (the slab map and the record's bfp math). pbal: wave w
+    keeps row group q = 2 G + w / 8 at every phase (%hq) and sub-block %jp = w % 8; phase kp's half is kp % 2."""
     for nm, v in (("nin", nin), ("nout", nout), ("ldmax", nin - 8), ("stmax", nout - 9), ("lanes", LANES),
                   ("cact", NACT), ("c1", 1), ("c2", 2), ("c4", 4), ("c8", 8), ("c9", 9), ("c16", 16), ("c20", 20),
                   ("csb", SB), ("c32", 32), ("c512", 512), ("c288", 288), ("c511u", WGS - 1)):
@@ -62,6 +63,28 @@ def _frame_prologue(e, n, nin, nout):
     e("  %act = index.cmp ult, %L, %cact : index")
     # the workgroup and lane from the workgroup id and tid (scalar record base); inactive workgroups clamp to 511
     e("  %Gc = index.min %stg_lin, %c511u : index")
+    if pbal:
+        e("  %c576 = index.constant 576 : index")
+        e("  %ww = kernel.subgroup.id : index")
+        e("  %Ll = kernel.subgroup.lane.id : index")
+        e("  %hq = index.div %ww, %c8 : index")
+        e("  %jp = index.rem %ww, %c8 : index")
+        e("  %bb = index.div %Ll, %c16 : index")
+        e("  %r16 = index.rem %Ll, %c16 : index")
+        e("  %G2 = index.mul %Gc, %c2 : index")
+        e("  %ow = index.mul %jp, %c576 : index")   # record 16 (4 jp + 2 h + bb) + row: 576 jp + 288 h + 9 L
+        e("  %oL = index.mul %Ll, %c9 : index")
+        e("  %olane = index.add %ow, %oL : index")
+    else:
+        _frame_lanes(e)
+    for nm, v in (("i1", 1), ("i23", 23), ("iemask", 0x7F800000), ("ib260", (260 << 23) - 2 ** 32),
+                  ("ione", 0x800000), ("i0", 0)):
+        e(f"  %{nm} = scalar.constant {v} : i32")
+    e("  %f1275 = scalar.constant 127.5 : f32")
+    e("  %magic = scalar.constant 12582912.0 : f32")
+
+
+def _frame_lanes(e):
     e("  %tl = index.add %tid, %c0 : index")
     e("  %ww = index.div %tl, %c32 : index")
     e("  %Ll = index.rem %tl, %c32 : index")
@@ -73,19 +96,14 @@ def _frame_prologue(e, n, nin, nout):
     e("  %ow = index.mul %ww, %c288 : index")
     e("  %oL = index.mul %Ll, %c9 : index")
     e("  %olane = index.add %ow, %oL : index")
-    for nm, v in (("i1", 1), ("i23", 23), ("iemask", 0x7F800000), ("ib260", (260 << 23) - 2 ** 32),
-                  ("ione", 0x800000), ("i0", 0)):
-        e(f"  %{nm} = scalar.constant {v} : i32")
-    e("  %f1275 = scalar.constant 127.5 : f32")
-    e("  %magic = scalar.constant 12582912.0 : f32")
 
 
-def _frame_loads(e, kpv, t, ind):
+def _frame_loads(e, kpv, t, ind, pbal=False):
     """Phase kpv's row group and tensor: %<t>pq (the pass, K / 256 super-block), %<t>tt (0 gate, 1 up; workgroup
     uniform), %<t>g16 (row group in the tensor: rows 16 g16 + r16)."""
     x = lambda s: e(ind + s)
     x(f"%{t}pq = index.div {kpv}, %c2 : index")
-    x(f"%{t}pp = index.rem {kpv}, %c2 : index")
+    x(f"%{t}pp = index.add %hq, %c0 : index" if pbal else f"%{t}pp = index.rem {kpv}, %c2 : index")
     x(f"%{t}q = index.add %G2, %{t}pp : index")
     x(f"%{t}tt = index.div %{t}q, %c512 : index")
     x(f"%{t}g16 = index.rem %{t}q, %c512 : index")
@@ -146,16 +164,51 @@ class IQ4XS:
         x(f"%{t}qp = vector.bitcast %{t}qv : vector<8xi8> to vector<2xi32>")
         return [(f"%{t}hp", "vector<2xi32>"), (f"%{t}qp", "vector<2xi32>")]
 
+    carry_types = ("f32", "f32", "i32", "i32")   # (pbal) s 2^24, -128 s and the qs words >> 4 to the odd phase
+
+    def _x(self, e, ind, t, keep=()):
+        p = self.p
+        local = re.compile(r"%(?!(?:whi|jp|c0|i0|i1|" + "|".join(
+            [f"{p}{c}" for c in ("i2", "i3", "i15", "i16", "i32", "im00ff", "f2p24", "fm128", "m15v", "kvtu")]
+            + [k.lstrip("%") for k in keep]) + r")\b)([A-Za-z_]\w*)")
+        return lambda s: e(ind + local.sub(lambda m: "%" + t + m.group(1), s))
+
     def decode(self, e, carried, ind, t=""):
         """The 8 weights (f32 names, exact) of k-block 32 %pq + 4 jp + 2 whi + bb from the carried header and qs;
         every local name tagged with t, prologue names with the payload prefix."""
-        p = self.p
-        local = re.compile(r"%(?!(?:whi|jp|c0|i0|i1|" + "|".join(
-            f"{p}{c}" for c in ("i2", "i3", "i15", "i16", "i32", "im00ff", "f2p24", "fm128", "m15v", "kvtu"))
-            + r")\b)([A-Za-z_]\w*)")
-        x = lambda s: e(ind + local.sub(lambda m: "%" + t + m.group(1), s))
+        x = self._x(e, ind, t)
         hd, qd = carried
         x("%phi = index.add %whi, %c0 : index")
+        self._scale(x, e, ind, t, hd)
+        # 8 nibbles of this k-block: the low or high nibbles of the carried 8 bytes
+        x("%phii = index.cast %phi : index to i32")
+        x(f"%nsh = scalar.shli %phii, %{self.p}i2 : i32")
+        e(ind + f"%{t}qx0 = vector.extract {qd}[0] : vector<2xi32> -> i32")
+        e(ind + f"%{t}qx1 = vector.extract {qd}[1] : vector<2xi32> -> i32")
+        x("%qy0 = scalar.shrui %qx0, %nsh : i32")
+        x("%qy1 = scalar.shrui %qx1, %nsh : i32")
+        return self._weights(x, t, "%qy0", "%qy1", "%s24", "%nb")
+
+    def decode_lo(self, e, carried, ind, t=""):
+        """(pbal, even phase) the low-nibble k-block 32 %pq + 4 jp + bb; returns (weights, the carry's names)."""
+        x = self._x(e, ind, t)
+        hd, qd = carried
+        self._scale(x, e, ind, t, hd)
+        e(ind + f"%{t}qx0 = vector.extract {qd}[0] : vector<2xi32> -> i32")
+        e(ind + f"%{t}qx1 = vector.extract {qd}[1] : vector<2xi32> -> i32")
+        ws = self._weights(x, t, "%qx0", "%qx1", "%s24", "%nb")
+        x("%i4 = scalar.constant 4 : i32")
+        x("%hqs0 = scalar.shrui %qx0, %i4 : i32")
+        x("%hqs1 = scalar.shrui %qx1, %i4 : i32")
+        return ws, [f"%{t}s24", f"%{t}nb", f"%{t}hqs0", f"%{t}hqs1"]
+
+    def decode_hi(self, e, carry, ind, t=""):
+        """(pbal, odd phase) the high-nibble k-block 32 %pq + 4 jp + 2 + bb from decode_lo's carry."""
+        x = self._x(e, ind, t, keep=carry)
+        return self._weights(x, t, carry[2], carry[3], carry[0], carry[1])
+
+    def _scale(self, x, e, ind, t, hd):
+        p = self.p
         # scale of sub-block j': ((scales_l >> 4 j') & 15 | ((scales_h >> 2 j') & 3) << 4) - 32, times d
         e(ind + f"%{t}hw0 = vector.extract {hd}[0] : vector<2xi32> -> i32")
         e(ind + f"%{t}hw1 = vector.extract {hd}[1] : vector<2xi32> -> i32")
@@ -176,14 +229,11 @@ class IQ4XS:
         x("%s = scalar.mulf %d, %scf : f32")
         x(f"%s24 = scalar.mulf %s, %{p}f2p24 : f32")
         x(f"%nb = scalar.mulf %s, %{p}fm128 : f32")
-        # 8 nibbles of this k-block: the low or high nibbles of the carried 8 bytes
-        x("%phii = index.cast %phi : index to i32")
-        x(f"%nsh = scalar.shli %phii, %{p}i2 : i32")
-        e(ind + f"%{t}qx0 = vector.extract {qd}[0] : vector<2xi32> -> i32")
-        e(ind + f"%{t}qx1 = vector.extract {qd}[1] : vector<2xi32> -> i32")
-        x("%qy0 = scalar.shrui %qx0, %nsh : i32")
-        x("%qy1 = scalar.shrui %qx1, %nsh : i32")
-        x("%nw = vector.from_elements %qy0, %qy1 : vector<2xi32>")
+
+    def _weights(self, x, t, q0, q1, s24, nb):
+        """The 8 weights s kv from qs words q0, q1 (their low nibbles) and s 2^24, -128 s."""
+        p = self.p
+        x(f"%nw = vector.from_elements {q0}, {q1} : vector<2xi32>")
         x("%nc = vector.bitcast %nw : vector<2xi32> to vector<8xi8>")
         x(f"%nb8 = vector.andi %nc, %{p}m15v : vector<8xi8>")
         x(f"%cu = vector.table.lookup %{p}kvtu[%nb8] : vector<16xi8>, vector<8xi8> -> vector<8xi8>")
@@ -204,7 +254,7 @@ class IQ4XS:
                     j = 4 * w + 2 * half + hh                            # byte b = 2 half + hh of word w
                     x(f"%yh{j} = vector.extract %ch{w}_{hh}[{half}] : vector<2xf16> -> f16")
                     x(f"%y{j} = scalar.extf %yh{j} : f16 to f32")
-                    x(f"%w{j} = scalar.fmaf %s24, %y{j}, %nb : f32")    # s kv, exact
+                    x(f"%w{j} = scalar.fmaf {s24}, %y{j}, {nb} : f32")    # s kv, exact
                     ws[j] = f"%{t}w{j}"
         return ws
 
@@ -220,10 +270,10 @@ def _bufname(b):
     return b[0] if isinstance(b, tuple) else b
 
 
-def _loads(e, pays, kpv, t, ind):
+def _loads(e, pays, kpv, t, ind, pbal=False):
     """Phase kpv's carried values (names, types): one payload's loads, or the gate's / up's under an scf.if on the
     workgroup-uniform tensor index (their carried types must match)."""
-    _frame_loads(e, kpv, t, ind)
+    _frame_loads(e, kpv, t, ind, pbal)
     if len(pays) == 1:
         got = pays[0].loads(e, kpv, t, ind)
         return [nm for nm, _ in got], [ty for _, ty in got]
@@ -246,11 +296,11 @@ def _loads(e, pays, kpv, t, ind):
     return names, tys
 
 
-def _record(x, got, t, FMF):
+def _record(x, got, t, FMF, pbal=None):
     """The 9-byte record of phase %kp from 8 exact weights (the shared bfp rounding) or a payload's own (E, words);
-    stored at its slab offset. Local names tagged with t."""
+    stored at its slab offset. Local names tagged with t. pbal: the half (0, 1): row group %hq, the record 288 h on."""
     if isinstance(got, tuple):   # the payload's own E (i32) and mantissa words fma(w, jq, magic) as i32
-        e1, ms = got[0], list(got[1])
+        e1, ms, ws = got[0], list(got[1]), None
     else:
         ws = list(got)
 
@@ -268,6 +318,28 @@ def _record(x, got, t, FMF):
             return vs[0]
         pm = tree("maxnumf", list(ws), "px")    # max |w| = max(max w, -min w): no fabs
         nm = tree("minnumf", list(ws), "nx")
+        if pbal is not None and not PBAL_CMPF:
+            # the bump as integer math: ps = pm 2^(133 - E) >= 127.5 exactly when pm is in max |w|'s binade with
+            # mantissa >= 0x7F0000, i.e. when bits(pm) + 0x10000 carries into the next exponent; so E' = exponent(
+            # max_i32(bits(pm) + 0x10000, bits(-nm))) and 2^(133 - E') follow without a compare or select
+            x(f"%{t}pmb = scalar.bitcast {pm} : f32 to i32")
+            x(f"%{t}k64k = scalar.constant {0x10000} : i32")
+            x(f"%{t}pmc = scalar.addi %{t}pmb, %{t}k64k : i32")
+            x(f"%{t}nn = scalar.negf {nm} : f32")
+            x(f"%{t}nnb = scalar.bitcast %{t}nn : f32 to i32")
+            x(f"%{t}amb = scalar.maxsi %{t}pmc, %{t}nnb : i32")
+            x(f"%{t}eb = scalar.andi %{t}amb, %iemask : i32")
+            x(f"%{t}jqb = scalar.subi %ib260, %{t}eb : i32")
+            x(f"%{t}jq = scalar.bitcast %{t}jqb : i32 to f32")
+            x(f"%{t}E1 = scalar.shrui %{t}amb, %i23 : i32")
+            ms = []
+            for j in range(8):
+                x(f"%{t}m{j} = scalar.fmaf {ws[j]}, %{t}jq, %magic : f32")
+                x(f"%{t}mb{j} = scalar.bitcast %{t}m{j} : f32 to i32")
+                ms.append(f"%{t}mb{j}")
+            e1 = f"%{t}E1"
+            ws = None
+    if ws is not None:
         x(f"%{t}nn = scalar.negf {nm} : f32")
         x(f"%{t}amx = scalar.maxnumf{FMF} {pm}, %{t}nn : f32")
         x(f"%{t}amb = scalar.bitcast %{t}amx : f32 to i32")
@@ -304,17 +376,29 @@ def _record(x, got, t, FMF):
         x(f"%{t}o{w} = vector.extract %{t}pmw{w}[0] : vector<2xi32> -> i32")
         words.append(f"%{t}o{w}")
     # the record: slab ((blk 20 + P) 4 + slab) SB + 288 w + 9 L, blk = g16 / 2, slab = 2 t + g16 % 2 of q = 2 G + p % 2
-    for ln in ("%sp = index.rem %kp, %c2 : index", "%sq = index.add %G2, %sp : index",
+    sp = "%sp = index.rem %kp, %c2 : index" if pbal is None else "%sp = index.add %hq, %c0 : index"
+    for ln in (sp, "%sq = index.add %G2, %sp : index",
                "%stt = index.div %sq, %c512 : index", "%sg = index.rem %sq, %c512 : index",
                "%sblk = index.div %sg, %c2 : index", "%sl0 = index.rem %sg, %c2 : index",
                "%sl1 = index.mul %stt, %c2 : index", "%sslab = index.add %sl1, %sl0 : index",
                "%s0 = index.mul %sblk, %c20 : index", "%s1 = index.add %s0, %pq : index",
                "%s2 = index.mul %s1, %c4 : index", "%s3 = index.add %s2, %sslab : index",
-               "%s4 = index.mul %s3, %csb : index", "%rd = index.add %s4, %olane : index",
+               "%s4 = index.mul %s3, %csb : index",
+               "%rd = index.add %s4, %olane : index" if not pbal else "%rd = index.add %s4, %olane288 : index",
                "%rec = index.min %rd, %stmax : index", "%rec1 = index.add %rec, %c1 : index"):
         x(re.sub(r"%(sp|sq|stt|sg|sblk|sl0|sl1|sslab|s0|s1|s2|s3|s4|rd|rec|rec1)\b", lambda m: f"%{t}" + m.group(1), ln))
     x(f"%{t}eb8 = scalar.trunci {e1} : i32 to i8")
     x(f"%{t}ev = vector.from_elements %{t}eb8 : vector<1xi8>")
+    # (pbal) no %act guard: the 64 clamped workgroups rewrite workgroup 511's 184 KB of records with the same bytes
+    # (L2 / MALL absorb them). Guarded (R5_PBAL_ACT=1, diag), the compiler moves the stores out of line past s_endpgm.
+    if pbal is not None and os.environ.get("R5_PBAL_ACT") == "1":
+        x(f"%{t}mw = vector.from_elements {words[0]}, {words[1]} : vector<2xi32>")
+        x(f"%{t}mv = vector.bitcast %{t}mw : vector<2xi32> to vector<8xi8>")
+        x("scf.if %act {")
+        x(f"  vector.store %{t}ev, %ov[%{t}rec] : vector<1xi8>, view<[%nout]xi8>")
+        x(f"  vector.store %{t}mv, %ov[%{t}rec1] : vector<8xi8>, view<[%nout]xi8>")
+        x("}")
+        return
     x(f"vector.store %{t}ev, %ov[%{t}rec] : vector<1xi8>, view<[%nout]xi8>")
     x(f"%{t}mw = vector.from_elements {words[0]}, {words[1]} : vector<2xi32>")
     x(f"%{t}mv = vector.bitcast %{t}mw : vector<2xi32> to vector<8xi8>")
@@ -379,9 +463,10 @@ def fuse(text, n, nwg, lanes, pay=None):
     for p in pays:
         extra += [_bufname(b) for b in p.buffers if _bufname(b) not in extra]
     if len(pays) == 1 or not VERSION_PAIRS:
-        return _fuse(text, n, pays, nin, extra)
-    g = _fuse(text, n, pays[:1], nin, extra, mark=True).rstrip("\n").split("\n")
-    u = _fuse(text, n, pays[1:], nin, extra, mark=True).rstrip("\n").split("\n")
+        return _fuse(text, n, pays, nin, extra, pbal=len(pays) == 1 and PBAL and hasattr(pays[0], "decode_lo"))
+    pbal = PBAL and all(hasattr(p, "decode_lo") for p in pays)   # (one lane map for both copies)
+    g = _fuse(text, n, pays[:1], nin, extra, mark=True, pbal=pbal).rstrip("\n").split("\n")
+    u = _fuse(text, n, pays[1:], nin, extra, mark=True, pbal=pbal).rstrip("\n").split("\n")
     mg, mu = g.index(MARK), u.index(MARK)
     tail = 2 if g[-2].strip().startswith("kernel.return") else 1   # (the launch's end stays outside the copies)
     assert g[:mg] == u[:mu] and g[-tail:] == u[-tail:] and g[-1] == "}", "copies share the frame prologue and the end"
@@ -395,10 +480,23 @@ def fuse(text, n, nwg, lanes, pay=None):
 
 
 VERSION_PAIRS = os.environ.get("R5_PAIRIF") != "1"
+# A payload with decode_lo / decode_hi (a record pair sharing its loads: IQ4_XS's low and high nibbles) can run the
+# balanced map (R5_PBAL=1, off by default): every wave decodes at every phase, its row group fixed (2 G + w / 8); the
+# even phase loads the bytes, decodes the low record and carries the payload's carry_types to the odd phase's high
+# record. Bit-exact. Measured 11-20 with lh/carrier_ab.py v3 (IQ4_XS carrier vs plain, one -bench job each, median
+# 95% CI): delete-mq4's PBAL build tcpb200 +1.86% (+1.71..+2.21) and +2.02% (+1.73..+2.25); this port's builds +5.8%
+# (every-phase loads, VGPR_TRY 204) and +6.3% (R5_PBAL_LDIF=1, its source = tcpb200's up to line order). The gap is
+# the compiler's placement of the GEMM's next-step weight loads (%nx_*): issued 90 instructions before the next
+# phase's first vmcnt(0) in tcpb200, 46 in the port (thread trace: 74k vs 402k idle cycles at that use). Line order and
+# the VGPR budget move it; R5_NXEARLY did not pin it (200 / 204: 91 v_movs; 208: back at the loop end).
+PBAL = os.environ.get("R5_PBAL", "0") == "1"
+PBAL_LDIF = os.environ.get("R5_PBAL_LDIF") == "1"   # the balanced map's loads under scf.if on the parity (as tcpb200)
+PBAL_CMPF = os.environ.get("R5_PBAL_CMPF") == "1"   # (diag) the balanced map's records round with cmpf / select
+NXEARLY = os.environ.get("R5_NXEARLY") == "1"   # (diag) the GEMM's next-step loads before the last WMMA group
 MARK = "  // r5: frame prologue end"
 
 
-def _fuse(text, n, pays, nin, extra, mark=False):
+def _fuse(text, n, pays, nin, extra, mark=False, pbal=False):
     """fuse's body for one payload or a per-phase pair; mark: MARK after the frame prologue (the versioned pair's
     split point)."""
     nout = out_bytes()
@@ -415,11 +513,13 @@ def _fuse(text, n, pays, nin, extra, mark=False):
              + ", buffer" * (2 + len(extra)))
     ki = next(i for i, ln in enumerate(L) if "= scf.for %kp = [" in ln)
     P = []
-    _frame_prologue(P.append, n, nin, nout)
+    _frame_prologue(P.append, n, nin, nout, pbal)
     if mark:
         P.append(MARK)
     for p in pays:
         p.prologue(P.append, n, nin, nout)
+    if pbal:
+        return _fuse_pbal(L, ki, pays[0], P)
     init, tys = _loads(P.append, pays, "%c0", "p", "  ")
     P, init = _pre(P), _pre(init)
     cur = ["%dz_ch", "%dz_cq"] if len(init) == 2 else [f"%dz_cc{i}" for i in range(len(init))]
@@ -448,26 +548,102 @@ def _fuse(text, n, pays, nin, extra, mark=False):
     return "\n".join(L) + "\n"
 
 
-def lane_records(n, lanes=LANES):
+def _fuse_pbal(L, ki, pay, P):
+    """_fuse for one payload with decode_lo / decode_hi: loads at the even phase's top (zeros at the odd), the decode
+    after the decoder block under scf.if on the phase parity, the carry through the K loop."""
+    cty = list(pay.carry_types)
+    P.append("  %bz = scalar.constant 0.0 : f32")
+    P.append("  %olane288 = index.add %olane, %c288 : index")
+    P = _pre(P)
+    zero = {"f32": "%dz_bz", "i32": "%dz_i0"}
+    cin = [f"%dz_bc{i}" for i in range(len(cty))]
+    f = L[ki]
+    f = f.replace(" = scf.for %kp", "".join(f", %dz_bo{i}" for i in range(len(cty))) + " = scf.for %kp", 1)
+    f = f.replace(") -> (", "".join(f", {c} = {zero[ty]} : {ty}" for c, ty in zip(cin, cty)) + ") -> (", 1)
+    f = re.sub(r"\)\s*\{\s*$", "".join(f", {ty}" for ty in cty) + ")  {", f)
+    L[ki] = f
+    yi = next(i for i in range(ki, len(L)) if L[i].strip().startswith("scf.yield %r0"))
+    ops, ytypes = L[yi].split(" : ", 1)
+    L[yi] = ops + "".join(f", %dz_bn{i}" for i in range(len(cty))) + " : " + ytypes + "".join(f", {ty}" for ty in cty)
+    NX = ["    %pkpar = index.rem %kp, %c2 : index", "    %pev = index.cmp eq, %pkpar, %c0 : index"]
+    L1 = []
+    cur, tys = _loads(L1.append, (pay,), "%kp", "u", "      ", pbal=True)
+    for ty in tys:
+        assert re.fullmatch(r"vector<\d+xi32>", ty), ty
+    if PBAL_LDIF:   # (diag) the loads under scf.if on the parity: the wait for the GEMM's own prefetch then drains them
+        NX += [f"    %pz{i} = vector.splat %i0 : {ty}" for i, ty in enumerate(tys)]
+        pc = [f"%pc{i}" for i in range(len(tys))]
+        NX.append(f"    {', '.join(pc)} = scf.if %pev -> ({', '.join(tys)}) {{")
+        NX += L1 + [f"      scf.yield {', '.join(cur)} : {', '.join(tys)}", "    } else {",
+                    f"      scf.yield {', '.join(f'%pz{i}' for i in range(len(tys)))} : {', '.join(tys)}", "    }"]
+    else:   # every phase loads super-block kp / 2's bytes (the odd phase: the even phase's, cached)
+        NX += [ln[2:] for ln in L1]
+        pc = [c.replace("%dz_", "%") for c in cur]
+    NX = _pre(NX)
+    b2 = [i for i in range(ki, yi) if L[i].strip().startswith("kernel.barrier")][1]
+    assert L[b2 - 1].strip() == "}"
+    FMF = "<nnan|nsz>"
+    ct = ", ".join(cty)
+    D = ["    %pq = index.div %kp, %c2 : index",
+         f"    {', '.join(f'%bn{i}' for i in range(len(cty)))} = scf.if %pev -> ({ct}) {{"]
+    y = lambda s: D.append("      " + s)
+    ws, carry = pay.decode_lo(y, pc, "")
+    _record(y, ws, "", FMF, pbal=0)
+    y(f"scf.yield {', '.join(carry)} : {ct}")
+    D.append("    } else {")
+    bc = [c.replace("%dz_", "%") for c in cin]
+    _record(y, pay.decode_hi(y, bc, "", "hi_"), "hi_", FMF, pbal=1)
+    y(f"scf.yield {', '.join(bc)} : {ct}")
+    D.append("    }")
+    D = _pre(D)
+    L = L[:ki] + P + L[ki:ki + 1] + NX + L[ki + 1:b2] + D + L[b2:]   # (after the decoder block: results escape)
+    if NXEARLY:
+        L = _nx_early(L, ki)
+    return "\n".join(L) + "\n"
+
+
+def _nx_early(L, ki):
+    """The GEMM's next-step weight loads (%kp_n0 .. the %nx_* bitcasts, before %kk_n; they read only %kp and loop
+    invariants) moved just ahead of the last WMMA group's activation loads (%stc<last>_0), so that group's own wait
+    covers them. Left at the loop's end, the compiler may issue them only a few dozen instructions before the next
+    phase's first vmcnt(0) (pbl204: 46, tcpb200: 90), which then waits out their latency (ATT: 402k idle cycles at
+    the first use vs 74k). Ahead of the whole WMMA section they delay every group's in-order wait instead."""
+    a = next(i for i in range(ki, len(L)) if L[i].strip().startswith("%kp_n0 = index.add %kp, %c1"))
+    k = next(i for i in range(a, len(L)) if L[i].strip().startswith("%kk_n = "))
+    blk = L[a:k]
+    L = L[:a] + L[k:]
+    g = max(i for i in range(ki, a) if re.match(r"\s*%stc\d+_0 = ", L[i]))
+    return L[:g] + blk + L[g:]
+
+
+def lane_records(n, lanes=LANES, pbal=False):
     """Every (lane, phase) record offset and raw load address of the kernel's index math, unclamped (numpy): the
-    bounds and the coverage before any run. Returns (records, header loads, qs loads), each [NACT][PHASES]."""
+    bounds and the coverage before any run. Returns (records, header loads, qs loads), each [NACT][PHASES]. pbal: the
+    balanced map (row group 2 G + w / 8, sub-block w % 8, half p % 2)."""
     import numpy as np
     import bfp16_check as BC
     Lv = np.arange(NACT)
     Gw, tl = Lv // lanes, Lv % lanes
     ww, Ll = tl // 32, tl % 32
     bb, r16 = Ll // 16, Ll % 16
-    jp, whi = ww // 2, ww % 2
     p = np.arange(PHASES)
-    q = 2 * Gw[:, None] + (p % 2)[None, :]
+    if pbal:
+        jp, whi = (ww % 8)[:, None], (p % 2)[None, :]
+        q = 2 * Gw[:, None] + (ww // 8)[:, None] + 0 * p[None, :]
+        ww = 2 * jp + whi
+        jp, whi = jp[:, 0], whi
+    else:
+        jp, whi = ww // 2, ww % 2
+        q = 2 * Gw[:, None] + (p % 2)[None, :]
+        ww, whi = ww[:, None], whi[:, None]
     tt, g16 = q // 512, q % 512
     Pp = (p // 2)[None, :]
     row = 16 * g16 + r16[:, None]
     blk, slab = g16 // 2, 2 * tt + g16 % 2
-    rec = ((blk * 20 + Pp) * 4 + slab) * SB + 288 * ww[:, None] + 9 * Ll[:, None]
+    rec = ((blk * 20 + Pp) * 4 + slab) * SB + 288 * ww + 9 * Ll[:, None]
     ha = tt * n * RBG + (n - F) * RBG + row * RBG + Pp * 136
     qa = ha + 8 + 16 * jp[:, None] + 8 * bb[:, None]
-    kbv = 32 * Pp + 4 * jp[:, None] + 2 * whi[:, None] + bb[:, None]
+    kbv = 32 * Pp + 4 * jp[:, None] + 2 * whi + bb[:, None]
     g8 = row // 8
     sg = 8 * (g8 // 4) + 4 * tt + g8 % 4
     off = BC.offsets("act", 2 * F, [KS], PASSES, TILE, True)
