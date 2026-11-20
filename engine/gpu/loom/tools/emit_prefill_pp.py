@@ -923,6 +923,10 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 # wgt p1k); dispatch.txt "npurswap <F>", "npubytes_ffnswap". The engine uses them with YAH_NPU_RSWAP=1 only.
 RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT") == "1"
 RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.py's, checked)
+# YAH_NPU_RSWAP_NB=<n> (with RSWAP_EMIT): the swap image's weight M blocks (64 stream rows) a call, a multiple of 32
+# (today's 1024 features a call); the engine reads it from npubytes_ffnswap's A bytes. 128: 2 calls a token panel
+# at F 8192, so a job loads each panel twice instead of 8 times (<= 63 blocks a row a call: 252)
+RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "32"))
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0")   # (no fill at fuse 0)
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
@@ -1536,7 +1540,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 if RSWAP_EMIT and fmt == "iq4xs" and not np5 and hord == "P4":
                     assert B == 2048 and FS % 1024 == 0 and all(u[2] % 4 == 0 for u in ffnblk_units(FS))
-                    jobs.append((GN.Config(NPU_COLS, B // 64, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
+                    assert RSWAP_NB % 32 == 0 and RSWAP_NB <= 252 and FS // 32 % RSWAP_NB == 0, RSWAP_NB
+                    jobs.append((GN.Config(NPU_COLS, RSWAP_NB, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
                                            rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
                                  "npu_ffnswap_iq4xs", 4))
                     QJOB_ENV["npu_ffnswap_iq4xs"] = dict(RSWAP_ENV)

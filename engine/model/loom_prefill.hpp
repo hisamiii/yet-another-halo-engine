@@ -177,7 +177,7 @@ class LoomPrefill {
     }
     if (RSwapOn()) {   // (YAH_NPU_RSWAP) the swap's weight stream at A's end (SwapA), its token panel at W's start
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
-      p.a_bytes = (p.a_bytes + 4095) / 4096 * 4096 + (R5Fuse() ? 2 : 1) * (geom_.at("npurswap").tokens / 1024 * bw.a);
+      p.a_bytes = (p.a_bytes + 4095) / 4096 * 4096 + (R5Fuse() ? 2 : 1) * SwapStream();
       p.w_bytes = std::max(p.w_bytes, std::size_t{B_} / 512 * bw.w);
     }
     if (const auto it = geom_.find("npugate"); it != geom_.end())
@@ -1191,8 +1191,19 @@ class LoomPrefill {
       if (kv.first.size() > sfx.size() && kv.first.compare(kv.first.size() - sfx.size(), sfx.size(), sfx) == 0) return true;
     return false;
   }
+  // the swap image's weight M blocks (64 stream rows of 5120 x 9 / 8 B) a call: 32 = 1024 features (emit_prefill_pp
+  // YAH_NPU_RSWAP_NB); a token panel's calls each take SwapNb() / 32 of today's 1024-feature blocks
+  std::uint32_t SwapNb() const {
+    const std::size_t a = NpuBytesOf("npubytes_ffnswap").a, blk = std::size_t{64} * 5120 * 9 / 8;
+    const std::uint32_t F = geom_.at("npurswap").tokens;
+    if (a % blk || a / blk % 32 || F / 32 % (a / blk)) throw LoomError("prefill: npubytes_ffnswap's A is not whole blocks");
+    return static_cast<std::uint32_t>(a / blk);
+  }
+  std::size_t SwapStream() const {   // one layer's swap weight stream: F / 32 blocks, F / (32 SwapNb()) calls' A
+    return std::size_t{geom_.at("npurswap").tokens} / 32 / SwapNb() * NpuBytesOf("npubytes_ffnswap").a;
+  }
   std::size_t SwapA(std::uint32_t half = 0) const {   // the swap's weight stream in A: its last F / 1024 calls' streams
-    const std::size_t r = geom_.at("npurswap").tokens / 1024 * NpuBytesOf("npubytes_ffnswap").a;
+    const std::size_t r = SwapStream();
     return npu_->A().size - (R5Fuse() ? 2 : 1) * r + half * r;
   }
   // the pk (Q4_K order) stream's start in A (npu_plan dcol: A holds the p4 stream, then the pk one): the middle of A
@@ -1200,7 +1211,7 @@ class LoomPrefill {
   // each stream was written right before its job, not once the double buffer keeps one across layers)
   std::size_t PkA() const {
     std::size_t s = npu_->A().size;
-    if (RSwapOn()) s -= (R5Fuse() ? 2 : 1) * (geom_.at("npurswap").tokens / 1024 * NpuBytesOf("npubytes_ffnswap").a);
+    if (RSwapOn()) s -= (R5Fuse() ? 2 : 1) * SwapStream();
     return s / 2;
   }
   struct R5Layer {
@@ -1477,7 +1488,9 @@ class LoomPrefill {
     if (rswap) {
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
       const std::size_t sa = SwapA(R5Fuse() ? r5k % 2 : 0);
-      if (R5Fuse() && F / 1024 * bw.a != std::size_t{F} * 5120 * 9 / 4)
+      const std::uint32_t nbc = SwapNb(), bpc = nbc / 32;   // (a call's 64-row blocks; today's 1024-feature b's)
+      if (nbc / 8 > qc || qc % (nbc / 8)) throw LoomError("prefill: a swap call's H spans more than a down part");
+      if (R5Fuse() && SwapStream() != std::size_t{F} * 5120 * 9 / 4)
         throw LoomError("prefill: the swap stream is not gen_r5fuse's (2 F K / 8 records of 9 B)");
       for (const auto& [h, t] : {std::pair<const char*, const core::TensorInfo*>{"npu_swdec_iq4xs_g.hal", tg},
                                  {"npu_swdec_iq4xs_u.hal", tu}}) {
@@ -1491,12 +1504,18 @@ class LoomPrefill {
       const Geom& gp = geom_.at("npu_swpanel.hal");
       Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1, gp.rowgrp,
                1, 1, {Ref(*normt_), {npu_->W().handle, 0, gp.tt}}, 2);
-      for (std::uint32_t t = 0; t < B_ / 512; ++t)
-        for (std::uint32_t b = 0; b < F / 1024; ++b) {
-          const std::uint32_t j = 4 * b;
-          csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs.xdna", {sa + b * bw.a, bw.a}, {t * bw.w, bw.w},
+      // (diag) YAH_NPU_RSWAP_BOUTER=1: calls b-outer, t-inner (a weight block's token panels back to back: its reads
+      // after the first can hit the MALL; the panel changes every call); the default t-outer keeps a panel 8 / bpc calls
+      static const bool bouter = std::getenv("YAH_NPU_RSWAP_BOUTER") != nullptr;
+      // (diag, wrong output) YAH_NPU_RSWAP_DIAG=a0: every call reads weight block 0's A (a bound on fresh-stream reads)
+      static const bool a0 = [] { const char* e = std::getenv("YAH_NPU_RSWAP_DIAG"); return e && std::strcmp(e, "a0") == 0; }();
+      const std::uint32_t nt = B_ / 512, nbk = F / 1024 / bpc;
+      for (std::uint32_t i = 0; i < nt * nbk; ++i) {
+        const std::uint32_t t = bouter ? i % nt : i / nbk, b = bouter ? i / nt : i % nbk;   // (call b: blocks bpc b ..)
+          const std::uint32_t j = 4 * bpc * b;
+          csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs.xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a}, {t * bw.w, bw.w},
                                        {j / qc * qpart + std::size_t{j % qc} * 18432 + std::size_t{8} * t * qc * 18432,
-                                        std::size_t{7 * qc + 4} * 18432}));
+                                        std::size_t{7 * qc + nbc / 8} * 18432}));
         }
     }
     for (std::uint32_t j = 0; j < F / fc && !cpair && !rswap; ++j)   // (np5: a call's rows span 4 x 256 + 64)
