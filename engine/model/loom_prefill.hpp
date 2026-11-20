@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <initializer_list>
@@ -301,7 +302,26 @@ class LoomPrefill {
       if (host_ids_[t] >= kVocab)
         throw LoomError("token id " + std::to_string(host_ids_[t]) + " is outside the vocabulary");
     }
-    if (embed_rows_) {   // token_embd stays on the host: the chunk's rows staged, the embed reads row t for token t
+    FinishEmbed();   // (a gather still running from an Embed with no RunLayers after it)
+    // YAH_EMBED_OVERLAP=1: the rows' gather runs on a thread while RunLayers records the chunk (neither reads the
+    // other's data); the first graph launch joins it and streams the rows (FinishEmbed). Off: gathered here.
+    static const bool overlap = std::getenv("YAH_EMBED_OVERLAP") && !std::strcmp(std::getenv("YAH_EMBED_OVERLAP"), "1");
+    if (embed_rows_ && overlap) {
+      gather_ids_.assign(host_ids_.begin(), host_ids_.end());
+      gather_.t = std::thread([this] {
+        try {
+          const auto e0 = std::chrono::steady_clock::now();
+          LoomDevice::WaitFor(rows_copied_);
+          const auto e1 = std::chrono::steady_clock::now();
+          gguf_.Rows(*Find("token_embd.weight"), gather_ids_.data(), B_, host_rows_.data());
+          gather_ms_[0] = std::chrono::duration<double, std::milli>(e1 - e0).count();
+          gather_ms_[1] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e1).count();
+        } catch (...) {
+          gather_error_ = std::current_exception();
+        }
+      });
+      for (std::uint32_t t = 0; t < B_; ++t) host_ids_[t] = t;
+    } else if (embed_rows_) {   // token_embd stays on the host: the chunk's rows staged, the embed reads row t for token t
       // (the slot's staging is rewritten once its last copy landed: the GPU a whole chunk behind the host waits here)
       std::vector<std::uint8_t>& rows = host_rows_;
       const auto e0 = std::chrono::steady_clock::now();
@@ -350,7 +370,12 @@ class LoomPrefill {
     // YAH_HOST_TIMES=1 (diag): the host's recording and launch times per chunk
     static const bool host_times = std::getenv("YAH_HOST_TIMES") != nullptr;
     const auto h0 = std::chrono::steady_clock::now();
-    RecordLayers(ci, hook);
+    try {
+      RecordLayers(ci, hook);
+    } catch (...) {
+      gather_.Join();
+      throw;
+    }
     const auto h1 = std::chrono::steady_clock::now();
     split_layer_ = 0, split_armed_ = false;
     // (with the NPU split: a thread polls the first job's ready word, which the GPU stores after its first kernels)
@@ -384,6 +409,7 @@ class LoomPrefill {
   // The recorded chunk's graph to the GPU, its NPU jobs to the NPU.
   void LaunchChunk() {
     graph_ = nullptr;
+    FinishEmbed();
     std::vector<NpuSplit::Queued> jobs;
     // YAH_NPU_CPU=1 (safe test of the NPU host path): the host stands in for the GPU, which runs nothing; it stores
     // each job's ready word, waits up to 1 s for its done word and reports the first job that stalls or fails
@@ -2144,6 +2170,7 @@ class LoomPrefill {
   // records. Stream order runs the new graph after the whole old one: no dependencies cross.
   void SplitGraph() {
     split_armed_ = false;
+    FinishEmbed();
     chunk_graph_->Launch();
     NewGraph();
   }
@@ -2947,6 +2974,29 @@ class LoomPrefill {
   LoomBuffer* embed_rows_ = nullptr;
   std::vector<std::uint8_t> host_rows_;          // the chunk's staged token_embd rows
   hrx_timeline_point_t rows_copied_ = {};        // when their last copy landed
+  // YAH_EMBED_OVERLAP: the gather thread (joined before host_rows_ goes: declared after it), its ids, error and times
+  struct Joined {
+    std::thread t;
+    void Join() {
+      if (t.joinable()) t.join();
+    }
+    ~Joined() { Join(); }
+  } gather_;
+  std::vector<std::uint32_t> gather_ids_;
+  std::exception_ptr gather_error_;
+  double gather_ms_[2] = {};
+  // The overlapped gather's end: join it, stream the rows (in stream order before the graph that reads them)
+  void FinishEmbed() {
+    if (!gather_.t.joinable()) return;
+    gather_.Join();
+    if (gather_error_) std::rethrow_exception(std::exchange(gather_error_, nullptr));
+    const auto e2 = std::chrono::steady_clock::now();
+    rows_copied_ = gpu_.StreamH2D(*embed_rows_, host_rows_.data(), host_rows_.size());
+    if (std::getenv("YAH_HOST_TIMES"))
+      std::fprintf(stderr, "host: embed wait %.2f ms, gather %.2f ms (%zu B, overlapped), stream %.2f ms\n",
+                   gather_ms_[0], gather_ms_[1], host_rows_.size(),
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e2).count());
+  }
   hrx_buffer_ref_t EmbedTable() const { return embed_rows_ ? Ref(*embed_rows_) : TRef(*Find("token_embd.weight")); }
   static constexpr std::size_t kWaitLogSlots = 65536;
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
