@@ -2008,6 +2008,8 @@ def fuse_decode(L, cfg, dp, cov, helper=None):
     assert D.OUT_B == 16 * 144
     for ln in D.leaf_inline(nsb, dec_tag(cfg), vroll=bool((helper or "")[:1] == "M" and cfg.hvroll), tonce=tonce, rec=rec,
                              q3roll=bool(cfg.q3roll)):
+        if not QFCYC and "dqcy" in ln:   # (diag DQ_CYC: a leaf GN_QCYCSKIP left without %qfc drops the hot loop's probe)
+            continue
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
@@ -2234,6 +2236,8 @@ def qf_split_r1(L, cfg):
                D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
                              vroll=qf_vroll(cfg),   # (the halves rolled, program memory)
                              rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
+        if not QFCYC and "dqcy" in ln:   # (diag DQ_CYC: a leaf GN_QCYCSKIP left without %qfc drops the hot loop's probe)
+            continue
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     e("  %rzpn = storage_address %rzs : low.storage<private> -> reg<aie2p.ep>")
@@ -2524,6 +2528,8 @@ def qf_decode(L, cfg, dp):
                D.leaf_inline(1, dec_tag(cfg), tonce=tonce, q3roll=bool(cfg.q3roll),
                              vroll=qf_vroll(cfg),   # (the halves rolled, program memory)
                              rec=(lambda h: (h, h + 1) if h is not None else None)(qfhalf()))):
+        if not QFCYC and "dqcy" in ln:   # (diag DQ_CYC: a leaf GN_QCYCSKIP left without %qfc drops the hot loop's probe)
+            continue
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if qfdec:

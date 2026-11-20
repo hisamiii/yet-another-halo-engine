@@ -397,7 +397,29 @@ def leaf(name="dec"):
     import npu_lsched as lsched
     WIN = int(os.environ.get("DQ_WIN", "4"))
 
+    cyr = os.environ.get("DQ_CYCRUN", "") if DQCYC else ""   # (diag: scheduled section i's / all cycles into byte 28)
+    cyn = [0]
+
     def run(streams, window_=None, tails=None, ext=(0, 0, 0), hv=None, full=GRID):   # full: lsched VEC_FULL / ACC_FULL
+        i_ = cyn[0]
+        cyn[0] += 1
+        on = cyr == "all" or cyr.rstrip("n") == str(i_)
+        if on and cyr.endswith("n"):   # (count mode: + 1 a run)
+            e.L += [f"%dqcyr{i_}p = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                    f"%dqcyr{i_}s = lda %dqcyr{i_}p, 28", f"%dqcyr{i_}n = add %dqcyr{i_}s, 1",
+                    f"st %dqcyr{i_}n, %dqcyr{i_}p, 28"]
+            on = False
+        if on:
+            e.L += [f"%dqcyr{i_}a = mov.cycles", f"%dqcyr{i_}b = slice %dqcyr{i_}a[0] : reg<aie2p.er x2> -> reg<aie2p.er>"]
+        run_(streams, window_, tails, ext, hv, full)
+        if on:
+            e.L += [f"%dqcyr{i_}c = mov.cycles", f"%dqcyr{i_}d = slice %dqcyr{i_}c[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                    f"%dqcyr{i_}e = sub %dqcyr{i_}d, %dqcyr{i_}b",
+                    f"%dqcyr{i_}p = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                    f"%dqcyr{i_}s = lda %dqcyr{i_}p, 28", f"%dqcyr{i_}n = add.rr %dqcyr{i_}s, %dqcyr{i_}e",
+                    f"st %dqcyr{i_}n, %dqcyr{i_}p, 28"]
+
+    def run_(streams, window_=None, tails=None, ext=(0, 0, 0), hv=None, full=GRID):
         if os.environ.get("DQ_LS", "1") == "1":
             e.L += lsched.schedule([x.L for x in streams], window_ or WIN, tails, ext=ext, full=full,
                                    hard=(hv or int(os.environ.get("DQ_HV", "24")), 20, int(os.environ.get("DQ_PH", "4" if GRID else "3"))))
@@ -2690,9 +2712,16 @@ def leaf(name="dec"):
                         flush(pt)                          # every 8 pushes (SLU: the iteration-end flush too)
                 tails.append(pt.L)
     if frags:
+        gcy = DQCYC and GF and not Q2K and not cyr   # (diag, as I4MOD's: the K hot section's cycles into %qfc byte 28)
+        if gcy:
+            e.L += ["%dqcy0w = mov.cycles", "%dqcy0 = slice %dqcy0w[0] : reg<aie2p.er x2> -> reg<aie2p.er>"]
         run(frags, int(os.environ.get("DQ_WINH", "3" if Q3K or GF else "6")), tails,
             hv=int(os.environ.get("DQ_HHV", "20" if XSL else "24")),   # IQ2_XS: X (4 vec256) per G stream, 8 T rows per C
             full=False)                                     # (the full unit table slows the IQ2_XS hot loop)
+        if gcy:
+            e.L += ["%dqcy1w = mov.cycles", "%dqcy1 = slice %dqcy1w[0] : reg<aie2p.er x2> -> reg<aie2p.er>",
+                    "%dqcyd = sub %dqcy1, %dqcy0", "%dqcyp = storage_address %qfc : low.storage<private> -> reg<aie2p.ep>",
+                    "%dqcys = lda %dqcyp, 28", "%dqcyn = add.rr %dqcys, %dqcyd", "st %dqcyn, %dqcyp, 28"]
     if SLU:
         e(f"%spc0 = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if 2 * NPARTS * 64 <= 448:
