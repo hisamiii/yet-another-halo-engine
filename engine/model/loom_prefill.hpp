@@ -445,6 +445,10 @@ class LoomPrefill {
         // the job's time from its ready store to its done word (its command's setup and image switch included)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "npu cpu-driven: job %zu %s layer %u %.3f ms\n", i, jobs[i].tag.c_str(), jobs[i].layer, ms);
+        if (std::getenv("YAH_NPU_CPU_TS"))   // (diag) the job's ready store and done, CLOCK_MONOTONIC s (df counter series)
+          std::fprintf(stderr, "npu cpu-driven: ts %zu %s %u %.6f %.6f\n", i, jobs[i].tag.c_str(), jobs[i].layer,
+                       std::chrono::duration<double>(t0.time_since_epoch()).count(),
+                       std::chrono::duration<double>(t0.time_since_epoch()).count() + ms / 1e3);
         if (std::getenv("YAH_NPU_CPU_GO"))   // (diag) the job's go record: [ready value, status, polls, -]
           std::fprintf(stderr, "npu cpu-driven: go %08x %u %u %08x\n", npu_->HostLoad(w.ready + 32),
                        npu_->HostLoad(w.ready + 33), npu_->HostLoad(w.ready + 34), npu_->HostLoad(w.ready + 35));
@@ -501,8 +505,32 @@ class LoomPrefill {
       if (j < flagged_.size())
         npu_->DiagDumpC(flagged_[j].words.done, flagged_[j].words.gate, std::size_t{16} << 20, d);
     }
+    static const bool fake = npu_ && std::getenv("YAH_NPU_FAKE");
+    if (fake && !na_jobs_.empty()) throw LoomError("YAH_NPU_FAKE: not with NPU attention jobs");
     chunk_graph_->Launch();
     jobs.swap(flagged_);
+    // YAH_NPU_FAKE=1 (diag, wrong output): no NPU work; a host thread stands in for the NPU, storing each job's done
+    // word as soon as the GPU stores its ready word (in job order), so the GPU runs its exact split share with no NPU
+    // memory traffic (GPU time without contention). Not with NPU attention.
+    if (fake) {
+      fake_npu_.Join();
+      std::vector<NpuSplit::Job> words;
+      for (const auto& q : jobs) words.push_back(q.words);
+      fake_npu_.t = std::thread([this, words] {
+        for (std::size_t i = 0; i < words.size(); ++i) {
+          const auto t0 = std::chrono::steady_clock::now();
+          while (npu_->HostLoad(words[i].ready) != words[i].gate)
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+              std::fprintf(stderr, "npu fake: job %zu's ready word never came (gate %08x)\n", i, words[i].gate);
+              npu_->HostStore(words[i].done, NpuSplit::kGateFailed | words[i].gate);   // the GPU waits fail at once
+              return;
+            }
+          npu_->HostStore(words[i].done, words[i].gate);
+        }
+        std::fprintf(stderr, "npu fake: %zu jobs answered\n", words.size());
+      });
+      return;
+    }
     if (npu_ && npu_->Prof() && !jobs.empty() && prof_tags_.empty())   // the first NPU chunk's jobs (ReportNpuProf)
       for (const auto& q : jobs) prof_tags_.push_back(q.tag), prof_layers_.push_back(q.layer);
     // in recording order: each attention job after the GEMM jobs recorded before it (the two NPU contexts run in the
@@ -2938,6 +2966,14 @@ class LoomPrefill {
              *kdeq_ = nullptr, *vdeq_ = nullptr, *kscale_ = nullptr, *ids_ = nullptr,
              *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
+  // YAH_NPU_FAKE's stand-in thread, joined before the members it reads go away (the last member: destroyed first)
+  struct FakeNpu {
+    std::thread t;
+    void Join() {
+      if (t.joinable()) t.join();
+    }
+    ~FakeNpu() { Join(); }
+  } fake_npu_;
 };
 
 }  // namespace yah::model
