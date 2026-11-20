@@ -303,9 +303,9 @@ class LoomPrefill {
         throw LoomError("token id " + std::to_string(host_ids_[t]) + " is outside the vocabulary");
     }
     FinishEmbed();   // (a gather still running from an Embed with no RunLayers after it)
-    // YAH_EMBED_OVERLAP=1: the rows' gather runs on a thread while RunLayers records the chunk (neither reads the
-    // other's data); the first graph launch joins it and streams the rows (FinishEmbed). Off: gathered here.
-    static const bool overlap = std::getenv("YAH_EMBED_OVERLAP") && !std::strcmp(std::getenv("YAH_EMBED_OVERLAP"), "1");
+    // The rows' gather runs on a thread while RunLayers records the chunk (neither reads the other's data); the
+    // first graph launch joins it and streams the rows (FinishEmbed). YAH_EMBED_OVERLAP=0: gathered here.
+    static const bool overlap = !(std::getenv("YAH_EMBED_OVERLAP") && !std::strcmp(std::getenv("YAH_EMBED_OVERLAP"), "0"));
     if (embed_rows_ && overlap) {
       gather_ids_.assign(host_ids_.begin(), host_ids_.end());
       gather_.t = std::thread([this] {
