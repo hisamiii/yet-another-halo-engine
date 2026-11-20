@@ -457,6 +457,7 @@ class LoomNpu {
   void RunOnce(const std::string& path, const std::string& entry, const std::vector<View>& views) {
     Kernel& k = Load(path, entry, views, false);
     DumpInvocations(k, Call{});
+    if (std::getenv("NPU_RUN_DUMP_ONLY")) return;   // (diag) the bytes only: nothing submitted (e.g. a hung image)
     program_.Forget();   // a whole program load: the array holds nothing the gated paths know
     ++epoch_;
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(run)");
