@@ -487,6 +487,10 @@ class LoomNpu {
     Kernel& k = Load(path, entry, views, true);
     program_.Forget();
     ++epoch_;
+    if (std::getenv("NPU_RUN_DUMP_ONLY")) {   // (diag) the bytes only: not even the setup is submitted
+      DumpInvocations(k, Snapshot(k));
+      return {};
+    }
     YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k.first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
     // (diag) NPU_RUN_SETUP_SLEEP_US=<us>: the host waits that long between the setup's end and the job's submit
     if (const char* d = std::getenv("NPU_RUN_SETUP_SLEEP_US"))
