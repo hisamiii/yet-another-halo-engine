@@ -78,10 +78,11 @@ JOBS = int(os.environ.get("YAH_EMIT_JOBS", "16"))
 _pool, _pending, _latest, _lock, _lc = None, {}, {}, threading.Lock(), None
 
 
-def emit(loomfile, configs, outname, outdir, env=None, gate=None):
+def emit(loomfile, configs, outname, outdir, env=None, gate=None, vtry=None):
     """Compile one Loom source (relative to engine/gpu/loom, or absolute) at one config to <outdir>/<outname>, and its
     envelopes to <outname>.fp. env: extra environment for this compile (per-kernel compiler options, e.g. LOOM_EXP_LICM).
     gate: footprint_gate.py's arguments after the source, run first (a refusal fails the emit; a pass is cached).
+    vtry: this kernel's YAH_VGPR_TRY (a str), over the environment's.
     The source is read now, so the caller may overwrite it once this returns."""
     global _pool, _lc
     sys.path.insert(0, LOOM)
@@ -98,7 +99,7 @@ def emit(loomfile, configs, outname, outdir, env=None, gate=None):
     # Every other kernel first allocates within YAH_VGPR_TRY VGPRs (default 192, 8 waves; "0": off) and keeps that
     # unless it spills. HRX main's allocator spreads an unbudgeted kernel past what it needs: the IQ4_XS fused ffn at
     # 232 VGPRs (6 waves) allocates in 176 without spills, as on the old pin, and npu8x2's GEMMs ran 7-12% slower.
-    vtry = os.environ.get("YAH_VGPR_TRY", "192")
+    vtry = vtry or os.environ.get("YAH_VGPR_TRY", "192")
     vtry = vtry if (vtry != "0" and "LOOM_EXP_BUDGET" not in ce
                     and not os.path.basename(outname).startswith(ROLE_SPLIT)) else None
     tgt = ce.get("YAH_LOOM_TARGET", "gfx1151")

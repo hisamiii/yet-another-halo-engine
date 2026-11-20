@@ -177,7 +177,7 @@ class LoomPrefill {
     }
     if (RSwapOn()) {   // (YAH_NPU_RSWAP) the swap's weight stream at A's end (SwapA), its token panel at W's start
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
-      p.a_bytes = (p.a_bytes + 4095) / 4096 * 4096 + geom_.at("npurswap").tokens / 1024 * bw.a;
+      p.a_bytes = (p.a_bytes + 4095) / 4096 * 4096 + (R5Fuse() ? 2 : 1) * (geom_.at("npurswap").tokens / 1024 * bw.a);
       p.w_bytes = std::max(p.w_bytes, std::size_t{B_} / 512 * bw.w);
     }
     if (const auto it = geom_.find("npugate"); it != geom_.end())
@@ -253,6 +253,7 @@ class LoomPrefill {
     const std::uint32_t n = n_;
     n_ = B_, npu_on_ = true, npu_planning_ = true;
     npu_job_ = 0;
+    r5_.clear();
     NewGraph();
     RecordLayers(0, {});
     npu_->EndBinding();
@@ -1179,9 +1180,34 @@ class LoomPrefill {
     static const bool on = [] { const char* e = std::getenv("YAH_NPU_RSWAP"); return e && std::strcmp(e, "1") == 0; }();
     return on && geom_.count("npurswap") != 0;
   }
-  std::size_t SwapA() const {   // the swap's weight stream in A: its last F / 1024 calls' streams
-    return npu_->A().size - geom_.at("npurswap").tokens / 1024 * NpuBytesOf("npubytes_ffnswap").a;
+  // (row 5) the swap layers' GPU gate / up split decodes the next swap layer's NPU gate / up rows into the other half
+  // of a double-buffered stream: dispatch.txt "<split>.af.to.r5.npu.hal" (emit_prefill_pp RSWAP_EMIT, gen_r5fuse; its
+  // two buffers after the GEMM's: the next layer's gate + up tensors, the stream half); a chunk's first swap layer, and
+  // one after a layer that could not carry it, decode with npu_swdec_iq4xs_g / _u
+  bool R5Fuse() const {
+    if (!RSwapOn()) return false;
+    static const std::string sfx = ".af.to.r5.npu.hal";
+    for (const auto& kv : geom_)
+      if (kv.first.size() > sfx.size() && kv.first.compare(kv.first.size() - sfx.size(), sfx.size(), sfx) == 0) return true;
+    return false;
   }
+  std::size_t SwapA(std::uint32_t half = 0) const {   // the swap's weight stream in A: its last F / 1024 calls' streams
+    const std::size_t r = geom_.at("npurswap").tokens / 1024 * NpuBytesOf("npubytes_ffnswap").a;
+    return npu_->A().size - (R5Fuse() ? 2 : 1) * r + half * r;
+  }
+  // the pk (Q4_K order) stream's start in A (npu_plan dcol: A holds the p4 stream, then the pk one): the middle of A
+  // before the swap's streams at its end (A's size / 2 put it inside the swap's stream since RSwapOn; harmless while
+  // each stream was written right before its job, not once the double buffer keeps one across layers)
+  std::size_t PkA() const {
+    std::size_t s = npu_->A().size;
+    if (RSwapOn()) s -= (R5Fuse() ? 2 : 1) * (geom_.at("npurswap").tokens / 1024 * NpuBytesOf("npubytes_ffnswap").a);
+    return s / 2;
+  }
+  struct R5Layer {
+    std::string pre;
+    bool fits;   // its gate / up fit the fused kernel (gen_r5fuse: 17408 x 5120 IQ4_XS, up after gate, F 8192, no rseg)
+  };
+  std::vector<R5Layer> r5_;   // (R5Fuse) the swap layers in order, recorded by the planning pass
   std::uint32_t FfnBlkF() const {
     const auto it = geom_.find("npuffnblk");
     return it == geom_.end() ? 0 : it->second.tokens;
@@ -1430,11 +1456,32 @@ class LoomPrefill {
     // calls 4 b .. 4 b + 3) and writes H where they do, its 8 M blocks qc x 18432 B apart (gen_npu_q GN_QSWHT)
     const bool rswap = RSwapOn() && !pair && !np5 && qffn && !bmix && std::strcmp(f.name, "iq4xs") == 0 &&
                        hord == "_p4" && apass == 0 && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
+    // (R5Fuse) this swap layer's index k, its stream half k % 2; carry: its split decodes swap layer k + 1
+    std::size_t r5k = 0;
+    bool carry = false, carried = false;
+    const std::string r5h = sh.size() > 14 ? sh.substr(0, sh.size() - 14) + ".af.to.r5.npu.hal" : "";
+    if (rswap && R5Fuse()) {
+      const bool fits = M == 17408 && F == 8192 && tg->dims[0] == 5120 && !weights_.RSegOf(*tg) &&
+                        tu->offset == tg->offset + tg->bytes && sh.size() > 14 &&
+                        sh.compare(sh.size() - 14, 14, ".af.to.npu.hal") == 0 && geom_.count(r5h) != 0;
+      if (npu_planning_) {
+        r5_.push_back({pre, fits});
+        if (fits) Exe(r5h);   // (loaded here: the timed pass's first carry would load it)
+      }
+      r5k = std::find_if(r5_.begin(), r5_.end(), [&](const R5Layer& x) { return x.pre == pre; }) - r5_.begin();
+      if (r5k < r5_.size()) {
+        carry = fits && r5k + 1 < r5_.size() && r5_[r5k + 1].fits;
+        carried = fits && r5k > 0 && r5_[r5k - 1].fits;
+      }
+    }
     if (rswap) {
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
-      const std::size_t sa = SwapA();
+      const std::size_t sa = SwapA(R5Fuse() ? r5k % 2 : 0);
+      if (R5Fuse() && F / 1024 * bw.a != std::size_t{F} * 5120 * 9 / 4)
+        throw LoomError("prefill: the swap stream is not gen_r5fuse's (2 F K / 8 records of 9 B)");
       for (const auto& [h, t] : {std::pair<const char*, const core::TensorInfo*>{"npu_swdec_iq4xs_g.hal", tg},
                                  {"npu_swdec_iq4xs_u.hal", tu}}) {
+        if (carried) break;
         const Geom& gd = geom_.at(h);
         hrx_buffer_ref_t wr = TRef(*t);
         wr.offset += f0 * rb, wr.length = F * rb;
@@ -1532,8 +1579,20 @@ class LoomPrefill {
       const std::size_t first = b.size();
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
       const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
-      Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(sh).rowgrp, tt, 1,
-               32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+      std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
+      if (carry) {   // (R5Fuse) swap layer k + 1's NPU gate / up rows into the other stream half
+        const std::string& np = r5_[r5k + 1].pre;
+        const auto* tgn = Find(np + "ffn_gate.weight");
+        const auto* tun = Find(np + "ffn_up.weight");
+        hrx_buffer_ref_t wn = TRef(*tgn);
+        wn.length = static_cast<std::size_t>(tgn->bytes + tun->bytes);
+        b.push_back(wn);
+        b.push_back(AView({SwapA((r5k + 1) % 2), std::size_t{F} * 5120 * 9 / 4}));
+        wmask |= std::uint64_t{1} << (b.size() - 1);
+      }
+      const std::string& gh = carry ? r5h : sh;
+      Dispatch(Exe(gh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(gh).rowgrp, tt, 1,
+               32, 1, 1, b, wmask);
     }
     // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
     // GPU waits for the NPU's down here anyway), so the sum after the NPU's down reads one f32 tensor less
@@ -1605,7 +1664,7 @@ class LoomPrefill {
       if (mode != NormOut::kTiled) b.push_back(Ref(*scratch_));
       if (mode != NormOut::kRow) b.push_back(Ref(*normt_));
       b.push_back({npu_->A().handle, 0, a});
-      if (pk) b.push_back({npu_->A().handle, npu_->A().size / 2, a});
+      if (pk) b.push_back({npu_->A().handle, PkA(), a});
       const LoomExecutable& exe = Exe(UnormRr(pk, mode));
       Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, b,
                ~std::uint64_t{0} << 3);
@@ -1622,7 +1681,7 @@ class LoomPrefill {
     std::vector<hrx_buffer_ref_t> b{CView(std::exchange(ffn_pending_, {})), Ref(*hidden_),
                                     {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, TRef(*Find(wname)),
                                     Ref(*hidden2_), {npu_->A().handle, 0, a}};
-    if (pk) b.push_back({npu_->A().handle, npu_->A().size / 2, a});
+    if (pk) b.push_back({npu_->A().handle, PkA(), a});
     const LoomExecutable& exe = Exe(pk ? "npu_unorm_pk.hal" : "npu_unorm.hal");
     Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, b,
              pk ? 0b1110000 : 0b110000);
@@ -1721,7 +1780,7 @@ class LoomPrefill {
             : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*normnil_), TRef(*Find(wname)), Ref(*normnil_),
                                             Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)};
     if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
-    if (wpk) b.push_back({npu_->A().handle, npu_->A().size / 2, NpuK(5120).a});
+    if (wpk) b.push_back({npu_->A().handle, PkA(), NpuK(5120).a});
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1, b);
   }
   // NPU column split (EnableNpu, emit_prefill_pp.npu_split). A site's NPU rows in this chunk (0: GPU only).
@@ -1827,7 +1886,7 @@ class LoomPrefill {
     wrote.clear();
     const std::uint32_t site_k = NpuSiteK(site);
     std::vector<NpuView> views;
-    std::size_t off = pk ? npu_->A().size / 2 : 0;
+    std::size_t off = pk ? PkA() : 0;
     for (std::size_t c = 0; c < chunks.size(); ++c) {
       const std::size_t bytes = NpuK(chunks[c].second).a;
       const auto [k0, K] = chunks[c];

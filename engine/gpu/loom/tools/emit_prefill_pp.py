@@ -22,6 +22,7 @@ import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_decode_misc  # noqa: E402
 import gen_gemv  # noqa: E402
+import gen_r5fuse  # noqa: E402
 import gen_kvq  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 import npu_prof  # noqa: E402
@@ -1074,8 +1075,9 @@ def npu_split(rows, combos, B, outdir):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
 
-    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B):
-        """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride, over tokens."""
+    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B, wrap=None):
+        """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride, over tokens.
+        wrap(text, n, nwg, lanes): a transform of the GEMM's text that adds buffers (gen_r5fuse.fuse)."""
         mtg = mt - nn // 16
         tf = fit_rowgrp(t, mtg)
         if tf is not t and persist is not None:   # the persistent kres keeps its row blocks: the tiled form runs instead
@@ -1086,11 +1088,14 @@ def npu_split(rows, combos, B, outdir):
             gen = lambda f, k: gen_kres_persist.persist(TG.gen(f, "kres", persist, False),
                                                        TG.gen(f, "kstore", dataclasses.replace(persist, respre=0), False),
                                                        tokens // tf.bn, place=persist.pslice)
+        elif wrap is not None:
+            gen = lambda f, k: wrap(TG.gen(f, k, tf, False), mt * 16, mtg // tf.rowgrp * (tokens // tf.bn), tf.lanes)
         else:
             gen = lambda f, k: TG.gen(f, k, tf, False)
         try:
             out.append(_emit_gen(gen, tf.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu.hal", outdir, kind, tf.rowgrp,
-                                 ostride=mt * 16))
+                                 ostride=mt * 16, extra="_wrap" if wrap is not None else "",
+                                 vtry=gen_r5fuse.VGPR_TRY if wrap is not None else None))
         except (SystemExit, RuntimeError, ValueError) as ex:
             if tf is t:
                 raise
@@ -1506,6 +1511,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
                 for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), FS)
+                    if RSWAP_EMIT and fmt == "iq4xs" and sfx == ".af.to.hal" and FS == gen_r5fuse.F and kb == 20:
+                        # (row 5 swap) the same split decoding another layer's NPU gate / up rows into the swap's
+                        # stream ("<hal>.af.to.r5.npu.hal", gen_r5fuse)
+                        split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d.af.to.r5.hal" % (fmt, mt, kb), FS,
+                              wrap=gen_r5fuse.fuse)
                     if sw5 and fmt == "iq4xs":   # (the row-segmented layers' GPU rows: their up rows F rows on)
                         try:
                             TG.FFUP = FS
@@ -1786,10 +1796,13 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0):
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, kfull=0, extra="",
+              vtry=None):
     """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU split's GPU share);
     f16 output then follows the full shape (O16_MT).
-    kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN)."""
+    kfull: a K window's whole-row k_blocks (gen_gemm_tile.KWIN).
+    extra: gen adds buffers past the GEMM's (its own source file; footprint_gate does not model them: the caller
+    states and checks their bounds, e.g. gen_r5fuse.lane_records). vtry: emit_prefill.emit's."""
     if B % tile and not masked:
         return None
     import gen_gemm_tile as _TG
@@ -1798,7 +1811,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     tt = -(-B // tile)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
-    src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
+    src = os.path.join(tmp, "yah_sgemm_%s_%s%s.loom" % (fmt, kind, extra))
     try:
         with open(src, "w") as fh, kseg_for(fmt, mt, kfull or kb):
             fh.write(gen(fmt, kind))
@@ -1810,7 +1823,7 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
         + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []) \
         + (["rseg"] if _TG.RSEG else [])
     E.emit(src, ["%s.m_tiles=%d" % (sym, mt), "%s.k_blocks=%d" % (sym, kb), "%s.token_tiles=%d" % (sym, tt)]
-           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir, gate=gate)
+           + (["%s.tokens=%d" % (sym, B)] if masked else []), out, outdir, gate=None if extra else gate, vtry=vtry)
     return (out, tile, rowgrp, tt)
 
 
