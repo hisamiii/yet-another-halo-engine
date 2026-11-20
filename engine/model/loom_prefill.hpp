@@ -160,7 +160,8 @@ class LoomPrefill {
       return q;
     };
     const NpuPlan qkv = need("qkv"), gate = need("gate");   // (C: qkv's + gate's of either family, an upper bound)
-    for (const NpuPlan& q : {NpuPlan{std::max(qkv.a_bytes, gate.a_bytes), 0, qkv.c_bytes + gate.c_bytes},
+    // (out: a DeltaNet layer's out C follows its qkv and gate C)
+    for (const NpuPlan& q : {NpuPlan{std::max(qkv.a_bytes, gate.a_bytes), 0, qkv.c_bytes + gate.c_bytes + need("out").c_bytes},
                              need("q"), need("out")})
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
@@ -1878,6 +1879,7 @@ class LoomPrefill {
   // GPU work an NPU job does not read, recorded right after that job's release (RunDeltaNet's postnorm part b)
   std::function<void()> after_release_;
   NpuView gc_read_{};   // (gc) the gate's C range a deferred postnorm part still reads
+  std::size_t dn_c_end_ = 0;   // the end of a DeltaNet layer's qkv + gate C: its out job's C starts there
   void RunAfterRelease() {
     if (after_release_) std::exchange(after_release_, nullptr)();
   }
@@ -2519,14 +2521,16 @@ class LoomPrefill {
       const std::string sh = nn ? NpuHal(fused) : "";
       if (!sh.empty()) {
         const auto a = NpuEncode(site, input, af, NpuPk(wname));
-        std::size_t c_off = OutCAfterH() && !std::strcmp(site, "out") ? FfnBlkDown() : 0;   // (PanelQ)
+        // (PanelQ) after the FFN block's H; a DeltaNet layer's after its qkv and gate C (dn_c_end_), the later of both
+        const std::size_t dn_end = std::exchange(dn_c_end_, 0);
+        std::size_t c_off = std::max(OutCAfterH() && !std::strcmp(site, "out") ? FfnBlkDown() : 0, dn_end);
         const auto w = NpuRawRows(site, wname, nn);
         std::vector<std::uint32_t> calls;
         const NpuView c = NpuCalls(site, a, w, c_off, calls, wname);
         // (gc) part b of the DeltaNet postnorm, deferred past this job's release, still reads the gate's C
         if (gc_read_.length && c.offset < gc_read_.offset + gc_read_.length && gc_read_.offset < c.offset + c.length)
           throw LoomError("prefill: the out job's C overlaps the gate's C that the postnorm reads (" + wname + ")");
-        NpuEnqueue(std::move(calls), site);
+        NpuEnqueue(std::move(calls), site, {{Ref(npu_->A())}, CView(c)});   // (its own C: not after other C readers)
         RunAfterRelease();
         const Geom gs = GeomOf(sh);
         const std::string kname = std::string("yah_ffn_gemm_") + f.name + "_kres";
@@ -2814,6 +2818,7 @@ class LoomPrefill {
       const std::uint32_t qkv_job = NpuEnqueue(std::exchange(calls, {}), "qkv");
       cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
       gate_job = NpuEnqueue(std::move(calls), "gate");
+      dn_c_end_ = c_off;   // (the out job's C goes after qkv's and gate's: dnc parts read qkv's, postnorm b gate's)
       RunPendingNorm();
       RunAlphaBeta(pre, ab_t);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
