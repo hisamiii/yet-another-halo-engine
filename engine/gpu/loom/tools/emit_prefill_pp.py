@@ -952,7 +952,8 @@ RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.p
 # at F 8192, so a job loads each panel twice instead of 8 times (<= 63 blocks a row a call: 252)
 RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "32"))
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
-                 GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0")   # (no fill at fuse 0)
+                 GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
+                 GN_QSWPAIR=os.environ.get("GN_QSWPAIR", "1"))   # 8 A streams (gen_npu_q; 11-20: -53.8 ms pp2048)
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
 
 
