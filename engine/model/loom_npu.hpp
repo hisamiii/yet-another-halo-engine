@@ -1225,6 +1225,20 @@ class LoomNpu {
     // per column, the packet lane's memory tile and core switches stay set from the last setup with packets (no image
     // uses those ports; a setup without packets clears the cores' master 18 by its zero blocks)
     std::array<bool, kCols> lane{};
+    // the memory tile and core stream switch masters (register addresses) the images' setups left enabled
+    std::set<std::uint32_t> masters;
+    static bool IsMaster(std::uint32_t a) {
+      const std::uint32_t col = a >> 25, row = (a >> 20) & 31, off = a & 0xFFFFF;
+      return col < kCols && ((row == 1 && off >= 0xB0000 && off < 0xB0048) ||
+                             (row >= 2 && row < 2 + kRows && off >= 0x3F000 && off < 0x3F060));
+    }
+    // the memory tile and core DMA channels (control register addresses) the images' setups queued tasks on
+    std::set<std::uint32_t> queued;
+    static bool IsQueue(std::uint32_t a) {   // a channel's start queue (its control register + 4)
+      const std::uint32_t col = a >> 25, row = (a >> 20) & 31, off = a & 0xFFFFF;
+      return col < kCols && ((row == 1 && off >= 0xA0604 && off <= 0xA065C && (off - 0xA0604) % 8 == 0) ||
+                             (row >= 2 && row < 2 + kRows && off >= 0x1DE04 && off <= 0x1DE1C && (off - 0x1DE04) % 8 == 0));
+    }
     static std::array<std::uint32_t, kCols> AllS5() {
       std::array<std::uint32_t, kCols> a{};
       a.fill(0x3FFFF8u & ~(1u << 17));   // masters 3-21 but the lane's 17 (2: the token route)
@@ -1235,6 +1249,8 @@ class LoomNpu {
       for (auto& r : rodata) r.clear();
       s5 = AllS5();
       lane.fill(false);
+      masters.clear();
+      queued.clear();
     }
   };
   // A setup (transaction) with its program loads cut to the words the array does not hold already and its read-only
@@ -1247,13 +1263,66 @@ class LoomNpu {
   // chunk a packet [control header, 4 words] that shim MM2S0 streams up lane 5 (no image uses it) to the tile's
   // TILE_CONTROL port. The microcontroller writes ~0.7 GB/s; the shim DMAs stream the packets while it runs the rest
   // of the setup. See ControlPackets.
-  std::vector<std::uint8_t> DeltaSetup(const std::uint8_t* src, std::size_t length, bool packets) {
+  //
+  // Stream switch masters of the memory tiles and cores that an earlier image enabled and this one never writes keep
+  // their routes. Where one reads a slave the new image feeds, the new stream forks into a branch nobody drains and
+  // the job stalls. Likewise a DMA channel an earlier image queued a task on (out: memory tile MM2S3 at BD 32, S2MM4 at
+  // BD 10) keeps it pending after its job; a new image that never queues that channel rewrites the BDs for its own
+  // channels, and the old task then runs on them and takes the new image's locks (11-20: out -> ffnswap stalled at its
+  // first calls, NPU timeout). A family switch (`switching`) first resets those channels (control reset bit 1, then
+  // 0) and writes those masters 0; their columns' packet lanes are set again (ControlPackets).
+  std::vector<std::uint8_t> DeltaSetup(const std::uint8_t* src, std::size_t length, bool packets, bool switching) {
     if (program_lost_.exchange(false)) program_.Forget();
     std::uint32_t n = 0, size = 0;
     std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
     if (size != length || size < 16) throw LoomError("npu: unexpected setup header");
     std::vector<std::uint8_t> out(src, src + 16);
     std::uint32_t ops = 0;
+    {
+      std::map<std::uint32_t, std::uint32_t> wrote;   // this setup's master writes: address -> last value
+      std::set<std::uint32_t> queues;                  // the channels (control registers) this setup queues on
+      for (std::size_t o = 16; o < size;) {
+        std::uint32_t len = src[o] == 0 ? 24 : src[o] == 3 ? 28 : 0, addr = 0;
+        if (src[o] == 1) std::memcpy(&len, src + o + 12, 4);
+        else if (src[o] == 128) std::memcpy(&len, src + o + 4, 4);
+        if (len < 16 || o + len > size) break;   // (the loop below reports it)
+        std::memcpy(&addr, src + o + 8, 4);
+        const std::uint32_t nw = src[o] == 1 ? (len - 16) / 4 : src[o] == 0 || src[o] == 3 ? 1 : 0;
+        for (std::uint32_t q = 0; q < nw; ++q) {
+          const std::uint32_t a = addr + 4 * q;
+          if (ProgramState::IsQueue(a)) queues.insert(a - 4);
+          if (!ProgramState::IsMaster(a)) continue;
+          std::uint32_t v = 0, m = ~0u;
+          std::memcpy(&v, src + o + 16 + 4 * q, 4);
+          if (src[o] == 3) std::memcpy(&m, src + o + 20, 4);
+          const auto it = wrote.find(a);
+          wrote[a] = ((it == wrote.end() ? 0 : it->second) & ~m) | (v & m);
+        }
+        o += len;
+      }
+      auto w32 = [&](std::uint32_t a, std::uint32_t v) {
+        std::uint8_t w[24] = {};   // write32 a, v
+        const std::uint32_t bl = 24;
+        std::memcpy(w + 8, &a, 4), std::memcpy(w + 16, &v, 4), std::memcpy(w + 20, &bl, 4);
+        out.insert(out.end(), w, w + 24), ++ops;
+      };
+      if (switching) {
+        for (const std::uint32_t c : program_.queued)
+          if (!queues.count(c)) w32(c, 2), w32(c, 0);   // the channel's reset: asserted, released
+        program_.queued.clear();
+        for (const std::uint32_t a : program_.masters) {
+          if (wrote.count(a)) continue;
+          w32(a, 0);
+          program_.lane[a >> 25] = false;
+        }
+        program_.masters.clear();
+      }
+      program_.queued.insert(queues.begin(), queues.end());
+      for (const auto& [a, v] : wrote) {
+        if (v >> 31) program_.masters.insert(a);
+        else program_.masters.erase(a);
+      }
+    }
     std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> rodata(program_.rodata.size());
     std::vector<std::uint8_t> touched(program_.rodata.size());
     PacketSetup ps;
@@ -1707,7 +1776,7 @@ class LoomNpu {
         static const bool nopk = std::getenv("YAH_NPU_NOPACKETS") != nullptr;
         const bool packets = !lane_lost_ && !nopk;
         {
-          std::vector<std::uint8_t> ds = DeltaSetup(k0->setup.data(), k0->setup.size(), packets);
+          std::vector<std::uint8_t> ds = DeltaSetup(k0->setup.data(), k0->setup.size(), packets, true);
           static const bool swlog = std::getenv("YAH_NPU_SWLOG") != nullptr;   // (diag) each switch's setup by op kind
           if (swlog) {
             std::uint32_t n[4] = {}, blkb = 0, blkcore = 0, blkmem = 0, blkoth = 0;
@@ -1759,7 +1828,7 @@ class LoomNpu {
           if (pend) append(pend->wait), pend = nullptr;
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
           // mid-job (a gate's tasks live on columns 1-2): no packets
-          append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false));
+          append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false, false));
           dec = c.k->dec, since = 0;
         }
         if (pend && since > 0 && !c.push_pre[since & 1].empty()) {   // (early push)
