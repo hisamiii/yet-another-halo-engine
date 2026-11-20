@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom: pair an f16 register's mixed FMA halves in place
+
+A vector.from_elements whose two f16 halves of one 32-bit register are v_fma_mix results reading the low and the high half of the same f16 pair register (and the high one reads it nowhere else): the low packet ties to that register (its high half survives), the high packet reads the high half from the low packet's result. No zeroed accumulator and no copy of the pair.
+---
+
+--- a/loom/src/loom/target/arch/amdgpu/lower/arithmetic.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/arithmetic.c
+@@ -1280,9 +1280,35 @@
+   return iree_ok_status();
+ }
+ 
++iree_status_t loom_amdgpu_lookup_fma_mix_packet_source(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_fma_mix_plan_t* plan, uint32_t source_index,
++    loom_value_id_t* out_register) {
++  *out_register =
++      loom_low_lower_lookup_value(context, plan->sources[source_index]);
++  IREE_RETURN_IF_ERROR(loom_amdgpu_extract_fma_mix_register_unit(
++      context, source_op, *out_register,
++      plan->source_register_offsets[source_index], out_register));
++  if (loom_amdgpu_fma_mix_source_is_f16(plan->source_kinds[source_index])) {
++    IREE_RETURN_IF_ERROR(loom_amdgpu_materialize_low_vgpr_b32(
++        context, source_op, *out_register, out_register));
++  }
++  return iree_ok_status();
++}
++
+ iree_status_t loom_amdgpu_emit_tied_fma_mix_packet(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     const loom_amdgpu_fma_mix_plan_t* plan, loom_value_id_t accumulator,
++    loom_type_t result_type, loom_value_id_t* out_result) {
++  return loom_amdgpu_emit_tied_fma_mix_packet_with_source(
++      context, source_op, plan, accumulator, UINT32_MAX, LOOM_VALUE_ID_INVALID,
++      result_type, out_result);
++}
++
++iree_status_t loom_amdgpu_emit_tied_fma_mix_packet_with_source(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_fma_mix_plan_t* plan, loom_value_id_t accumulator,
++    uint32_t override_index, loom_value_id_t override_register,
+     loom_type_t result_type, loom_value_id_t* out_result) {
+   *out_result = LOOM_VALUE_ID_INVALID;
+   loom_value_id_t sources[LOOM_AMDGPU_FMA_MIX_SOURCE_COUNT] = {
+@@ -1296,6 +1322,9 @@
+   IREE_RETURN_IF_ERROR(loom_amdgpu_prepare_fma_mix_packet_sources(
+       context, source_op, plan, result_type, sources, attrs, &source_count,
+       &attr_count));
++  if (override_index < source_count) {
++    sources[override_index] = override_register;
++  }
+   loom_value_id_t operands[1 + LOOM_AMDGPU_FMA_MIX_SOURCE_COUNT] = {
+       accumulator,
+       sources[0],
+--- a/loom/src/loom/target/arch/amdgpu/lower/arithmetic.h
++++ b/loom/src/loom/target/arch/amdgpu/lower/arithmetic.h
+@@ -99,6 +99,20 @@
+     const loom_amdgpu_fma_mix_plan_t* plan, loom_value_id_t accumulator,
+     loom_type_t result_type, loom_value_id_t* out_result);
+ 
++// As loom_amdgpu_emit_tied_fma_mix_packet, with source |override_index| (a, b,
++// c order) read from |override_register| instead of the plan's value.
++iree_status_t loom_amdgpu_emit_tied_fma_mix_packet_with_source(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_fma_mix_plan_t* plan, loom_value_id_t accumulator,
++    uint32_t override_index, loom_value_id_t override_register,
++    loom_type_t result_type, loom_value_id_t* out_result);
++
++// The 32-bit register a mixed FMA packet reads for source |source_index|.
++iree_status_t loom_amdgpu_lookup_fma_mix_packet_source(
++    loom_low_lower_context_t* context, const loom_op_t* source_op,
++    const loom_amdgpu_fma_mix_plan_t* plan, uint32_t source_index,
++    loom_value_id_t* out_register);
++
+ // Lowers a packed vector ternary op to one AMDGPU packet per lane pair.
+ iree_status_t loom_amdgpu_lower_vector_packed_ternary(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+--- a/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
++++ b/loom/src/loom/target/arch/amdgpu/lower/value/vector_construct.c
+@@ -1420,6 +1420,30 @@
+                                     lane_type, out_register);
+ }
+ 
++// True when the two half-result packets of one register read the low and the
++// high half of the same f16 pair register as one source, and the high packet
++// reads that register nowhere else (the low packet overwrites its low half).
++static bool loom_amdgpu_fma_mix_pair_shares_f16_source(
++    const loom_amdgpu_fma_mix_plan_t* low,
++    const loom_amdgpu_fma_mix_plan_t* high, uint32_t* out_index) {
++  for (uint32_t i = 0; i < LOOM_AMDGPU_FMA_MIX_SOURCE_COUNT; ++i) {
++    if (low->source_kinds[i] != LOOM_AMDGPU_FMA_MIX_SOURCE_F16LO ||
++        high->source_kinds[i] != LOOM_AMDGPU_FMA_MIX_SOURCE_F16HI ||
++        low->sources[i] != high->sources[i] ||
++        low->source_register_offsets[i] != high->source_register_offsets[i]) {
++      continue;
++    }
++    bool other_use = false;
++    for (uint32_t j = 0; j < LOOM_AMDGPU_FMA_MIX_SOURCE_COUNT; ++j) {
++      if (j != i && high->sources[j] == high->sources[i]) other_use = true;
++    }
++    if (other_use) continue;
++    *out_index = i;
++    return true;
++  }
++  return false;
++}
++
+ static iree_status_t loom_amdgpu_emit_vector_from_elements_fma_mix_lane(
+     loom_low_lower_context_t* context, const loom_op_t* source_op,
+     const loom_amdgpu_vector_from_elements_plan_t* plan, uint32_t lane_index,
+@@ -1487,6 +1511,26 @@
+         !high_lane_uses_fma_mix) {
+       IREE_RETURN_IF_ERROR(loom_amdgpu_pack_16bit_lane_pair_with_permute(
+           context, source_op, plan, &permute, lane_base, lane_type, &packed));
++      registers[register_index] = packed;
++      continue;
++    }
++    uint32_t shared_source = UINT32_MAX;
++    if (low_lane_uses_fma_mix && high_lane_uses_fma_mix &&
++        loom_amdgpu_fma_mix_pair_shares_f16_source(
++            &plan->fma_mix_half_results[lane_base],
++            &plan->fma_mix_half_results[lane_base + 1u], &shared_source)) {
++      // Both halves read one f16 pair register (low half, high half): the low
++      // packet ties to it (its high half survives), the high packet reads that
++      // high half from the low packet's result. No zeroed accumulator.
++      loom_value_id_t pair = LOOM_VALUE_ID_INVALID;
++      IREE_RETURN_IF_ERROR(loom_amdgpu_lookup_fma_mix_packet_source(
++          context, source_op, &plan->fma_mix_half_results[lane_base],
++          shared_source, &pair));
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_vector_from_elements_fma_mix_lane(
++          context, source_op, plan, lane_base, pair, lane_type, &packed));
++      IREE_RETURN_IF_ERROR(loom_amdgpu_emit_tied_fma_mix_packet_with_source(
++          context, source_op, &plan->fma_mix_half_results[lane_base + 1u],
++          packed, shared_source, packed, lane_type, &packed));
+       registers[register_index] = packed;
+       continue;
+     }
