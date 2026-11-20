@@ -1382,12 +1382,13 @@ class LoomPrefill {
   }
   // H's units a 64-token M block when F's parts differ in padded size (H one [M block][units] layout, a part's A a
   // window of it), else 0 (H in parts, [part][M block][its units]).
-  static std::uint32_t FfnBlkApass(std::uint32_t F) {
+  // ("npuhapass", emit_prefill_pp hapass: a swap call's H spans both K parts) H [M block][units] for equal parts too
+  std::uint32_t FfnBlkApass(std::uint32_t F) const {
     const auto us = FfnBlkUnits(F);
     std::uint32_t sum = 0;
     bool same = true;
     for (const FfnPart& u : us) sum += u.p, same = same && u.p == us[0].p;
-    return same ? 0 : sum;
+    return same && !geom_.count("npuhapass") ? 0 : sum;
   }
   // A down part image's tag (emit_prefill_pp dn_tag): "npu_ffndn<tag>_<fmt>", "npubytes_ffndn<tag>"
   static std::string DnTag(const FfnPart& u, std::uint32_t apass) {
@@ -1462,6 +1463,7 @@ class LoomPrefill {
     const std::string sw = bmix ? dir_ + "/npu_ffnsw_bfp" + hord : mix ? mixed : dir_ + "/npu_ffnsw_" + f.name + hord;
     const auto parts = FfnBlkUnits(F);
     const std::uint32_t apass = FfnBlkApass(F);
+    const bool hap = apass && geom_.count("npuhapass");   // (equal parts, H [M block][units]: the swap's nb 256)
     std::vector<std::string> dn;
     for (const FfnPart& u : parts) {
       dn.push_back(dir_ + "/npu_ffndn" + DnTag(u, apass) + "_" + fd.name);
@@ -1481,7 +1483,7 @@ class LoomPrefill {
     // (row 5 swap) this layer swaps (rswap below, checked equal); panel: its FFN norm writes the swap's token panel
     // into W ("<norm>_pn.hal", gen_half_norm PANEL) and the swap skips npu_swpanel.hal
     const bool rsw0 = RSwapOn() && (!pair || mix) && (pair || !geom_.count("npuffnsw5")) && geom_.count("npuffnq") &&
-                      !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && apass == 0 &&
+                      !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && (apass == 0 || hap) &&
                       geom_.at("npurswap").tokens == F && B_ % 512 == 0 && parts[0].p % 4 == 0;
     const bool panel = rsw0 && !dfr && PanelNorm();
     const bool panelq = panel && PanelQ();   // (the norm runs below, once the swap's calls are bound)
@@ -1554,8 +1556,9 @@ class LoomPrefill {
     for (const FfnPart& u : parts) g5 = g5 && u.r % 5 == 0;
     if (np5 && (!qffn || !g5 || weights_.RSegOf(*tg) != F || weights_.RSegOf(*tu) != F))
       throw LoomError("prefill: the NP 5 FFN gate / up needs Q' parts of whole groups and its rows in row segments of F");
-    const std::uint32_t qc = parts[0].p;   // (Q': a part's calls; its H bytes qpart)
-    const std::size_t qpart = std::size_t{B_ / 64} * parts[0].p * 18432;
+    // (Q': a part's calls; its H bytes qpart; hap: H [M block][qu units], qu = both parts' units, one "part")
+    const std::uint32_t qc = parts[0].p, qu = hap ? apass : qc;
+    const std::size_t qpart = std::size_t{B_ / 64} * qu * 18432;
     for (const FfnPart& u : parts)
       if (qffn && (u.p != parts[0].p || u.r != u.p) && !np5)
         throw LoomError("prefill: the Q' FFN block's K parts differ in size");
@@ -1572,7 +1575,7 @@ class LoomPrefill {
         while (u >= parts[ci].u0 + parts[ci].r) ++ci;
         return NpuView{hbase(ci) + std::size_t{u - parts[ci].u0} * 18432 + (j % 4) * 8 * 144, bs.c};
       }
-      return NpuView{qffn ? j / qc * qpart + std::size_t{j % qc} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144,
+      return NpuView{qffn ? j / qu * qpart + std::size_t{j % qu} * 4 * 4608 : (j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144,
                      bs.c};
     };
     // (a column's raw view: 256 rows from row r0, its last record over-read)
@@ -1584,7 +1587,7 @@ class LoomPrefill {
     // calls 4 b .. 4 b + 3) and writes H where they do, its 8 M blocks qc x 18432 B apart (gen_npu_q GN_QSWHT)
     // (a single format's layer or a mixed pair's: the image reads bfp16 only, the GPU decodes each tensor's format)
     const bool rswap = RSwapOn() && (!pair || mix) && !np5 && qffn && !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) &&
-                       hord == "_p4" && apass == 0 && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
+                       hord == "_p4" && (apass == 0 || hap) && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
     if (rswap != rsw0) throw LoomError("prefill: " + pre + " swap decided differently before the norm");
     for (std::uint32_t j = 0; j < F / 256 && cpair && !rswap; ++j)
       csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
@@ -1634,7 +1637,7 @@ class LoomPrefill {
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
       const std::size_t sa = SwapA(R5Fuse() ? r5k % 2 : 0);
       const std::uint32_t nbc = SwapNb(), bpc = nbc / 32;   // (a call's 64-row blocks; today's 1024-feature b's)
-      if (nbc / 8 > qc || qc % (nbc / 8)) throw LoomError("prefill: a swap call's H spans more than a down part");
+      if (nbc / 8 > qu || qu % (nbc / 8)) throw LoomError("prefill: a swap call's H spans more than a down part");
       if (R5Fuse() && SwapStream() != std::size_t{F} * 5120 * 9 / 4)
         throw LoomError("prefill: the swap stream is not gen_r5fuse's (2 F K / 8 records of 9 B)");
       for (const auto& [t, x, gu] : {std::tuple<const core::TensorInfo*, const Fmt*, const char*>{tg, &f, "g"},
@@ -1667,8 +1670,8 @@ class LoomPrefill {
         const std::uint32_t t = bouter ? i % nt : i / nbk, b = bouter ? i / nt : i % nbk;   // (call b: blocks bpc b ..)
           const std::uint32_t j = 4 * bpc * b;
           csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs.xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a}, {t * bw.w, bw.w},
-                                       {j / qc * qpart + std::size_t{j % qc} * 18432 + std::size_t{8} * t * qc * 18432,
-                                        std::size_t{7 * qc + nbc / 8} * 18432}));
+                                       {j / qu * qpart + std::size_t{j % qu} * 18432 + std::size_t{8} * t * qu * 18432,
+                                        std::size_t{7 * qu + nbc / 8} * 18432}));
         }
     }
     for (std::uint32_t j = 0; j < F / fc && !cpair && !rswap; ++j)   // (np5: a call's rows span 4 x 256 + 64)

@@ -953,7 +953,8 @@ RSWAP_KQ = {"q4k": "Q4_K", "q5k": "Q5_K", "q3k": "Q3_K", "iq3s": "IQ3_S", "iq3xx
 RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.py's, checked)
 # YAH_NPU_RSWAP_NB=<n> (with RSWAP_EMIT): the swap image's weight M blocks (64 stream rows) a call, a multiple of 32
 # (today's 1024 features a call); the engine reads it from npubytes_ffnswap's A bytes. 128: 2 calls a token panel
-# at F 8192, so a job loads each panel twice instead of 8 times (<= 63 blocks a row a call: 252)
+# at F 8192, so a job loads each panel twice instead of 8 times; 256: one call a token panel, each panel loaded once
+# (11-21: -0.65 M a job in the gated checker, H in the same down layout)
 RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "128"))
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
@@ -992,7 +993,13 @@ def ffnblk_apass(F):
     part's A a window of it (gen_npu_gemm apass; the gate / up image's hpass); else 0: H in parts, [part][M block][its
     units]."""
     us = ffnblk_units(F)
-    return sum(u[2] for u in us) if len({u[2] for u in us}) > 1 else 0
+    return sum(u[2] for u in us) if len({u[2] for u in us}) > 1 or hapass(us) else 0
+
+
+def hapass(us):
+    """(row 5 swap) a swap call's H spans more than a K part's units (RSWAP_NB 256: one call a token panel, 32 units a
+    64-token M block): H one layout [M block][units] (apass) for parts of one size too ("npuhapass")."""
+    return RSWAP_EMIT and RSWAP_NB // 8 > us[0][2]
 
 
 def dn_tag(r, p, ap):
@@ -1669,7 +1676,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 if RSWAP_EMIT and fmt == "iq4xs" and not np5 and hord == "P4":
                     assert B == 2048 and FS % 1024 == 0 and all(u[2] % 4 == 0 for u in ffnblk_units(FS))
-                    assert RSWAP_NB % 32 == 0 and RSWAP_NB <= 252 and FS // 32 % RSWAP_NB == 0, RSWAP_NB
+                    assert RSWAP_NB % 32 == 0 and RSWAP_NB <= 256 and FS // 32 % RSWAP_NB == 0, RSWAP_NB
                     jobs.append((GN.Config(NPU_COLS, RSWAP_NB, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
                                            rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
                                  "npu_ffnswap_iq4xs", 4))
@@ -1747,7 +1754,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         go = lambda f: "GF" if f == "q4k" else "P4"
         if NPU_Q and colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (Q' column pairs: H as the qsw image's)
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=kb * 256,
-                            fmt=gu_fmt(gf), gord=go(gf), rawdma=1, qsw=True, dgu=0, swcol=32, hpass=qcalls, hord=hord,
+                            fmt=gu_fmt(gf), gord=go(gf), rawdma=1, qsw=True, dgu=0, swcol=32, hpass=qcallss if hapass(ffnblk_units(FS)) else qcalls, hord=hord,
                             ufmt=gu_fmt(uf), ugord=go(uf))
             QJOB_ENV["npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower())] = dict(GN_QFEGR2="0")
         elif colpair({"ffn_gate": (gf,), "ffn_up": (uf,)}):   # (column pairs; Q4_K in P4 order: gen_npu_dec "GF")
@@ -1756,7 +1763,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         elif NPU_Q:   # (Q': one format, the qsw image as above)
             blk = GN.decoder(gu_fmt(gf)).BLK
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=kb * 256,
-                            fmt=DCOL_FMTS[gf][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=qcalls,
+                            fmt=DCOL_FMTS[gf][0], rawdma=1, qsw=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=qcallss if hapass(ffnblk_units(FS)) else qcalls,
                             hord=hord)
             QJOB_ENV["npu_ffnsw_%s_%s_%s" % (gf, uf, hord.lower())] = dict(GN_QFEGR2="0")
         else:   # (mixed)
@@ -1900,6 +1907,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(("npurswap", FS, 0, 0))
         if PANEL:
             out.append(("npupanel", FS // 32 // RSWAP_NB, 0, 0))
+        if hapass(ffnblk_units(FS)):
+            out.append(("npuhapass", 1, 0, 0))
         with GN.np_override(4):
             out.append(("npubytes_ffnswap",) + tuple(GN.stream_bytes(swj[0])))
     if NPU_Q:
