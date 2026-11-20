@@ -223,6 +223,16 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights) {
         const std::uintptr_t lo = a & ~std::uintptr_t{4095};
         ::madvise(reinterpret_cast<void*>(lo), a + s.bytes - lo, MADV_RANDOM);
       }
+      // YAH_ROWS_WILLNEED=1: every row's pages queued for reading at once before the copy (the model file mostly sits
+      // outside the page cache: 16 threads faulting one row each took 7-16 ms for a cold 2048-row chunk, 1.7-3.6 ms
+      // queued first; Scratch/yah-fanout/tile/rowfault.cc)
+      static const bool willneed = std::getenv("YAH_ROWS_WILLNEED") && !std::strcmp(std::getenv("YAH_ROWS_WILLNEED"), "1");
+      if (willneed)
+        for (std::size_t i = 0; i < n; ++i) {
+          const auto r = reinterpret_cast<std::uintptr_t>(st->src.Data(s) + std::size_t{rows[i]} * sb);
+          const std::uintptr_t rl = r & ~std::uintptr_t{4095};
+          ::madvise(reinterpret_cast<void*>(rl), r + sb - rl, MADV_WILLNEED);
+        }
       // rows [r0, r1): each row on its own (a prefill chunk's 2048 Q8_0 rows took ~54 ms on one thread)
       const auto run = [&](std::size_t r0, std::size_t r1) {
         std::vector<float> buf(k);
