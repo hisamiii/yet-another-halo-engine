@@ -921,7 +921,11 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 # into A, 512 tokens a call as its panel in W, H in today's down A layout), the GPU decoders of the NPU's rows
 # ("npu_swdec_iq4xs_<g|u>.hal", gen_iq4xs_bfp stream) and the token panel encode ("npu_swpanel.hal", gen_bfp16_encode
 # wgt p1k); dispatch.txt "npurswap <F>", "npubytes_ffnswap". The engine uses them with YAH_NPU_RSWAP=1 only.
+# The Q' pairs' other gate / up formats get their decoders into the same stream too ("npu_swdec_<fmt>_<g|u>.hal",
+# gen_kq_bfp stream): the swap image reads bfp16 only, so it serves every format.
 RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT") == "1"
+RSWAP_KQ = {"q4k": "Q4_K", "q5k": "Q5_K", "q3k": "Q3_K", "iq3s": "IQ3_S", "iq3xxs": "IQ3_XXS", "iq2xs": "IQ2_XS",
+            "iq2s": "IQ2_S"}   # (gen_kq_bfp's formats)
 RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.py's, checked)
 # YAH_NPU_RSWAP_NB=<n> (with RSWAP_EMIT): the swap image's weight M blocks (64 stream rows) a call, a multiple of 32
 # (today's 1024 features a call); the engine reads it from npubytes_ffnswap's A bytes. 128: 2 calls a token panel
@@ -1751,6 +1755,14 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             open(src, "w").write(gen_iq4xs_bfp.gen(FS, 5120, dict(st_, up=up_)))
             E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
             out.append((nm_ + ".hal", gen_iq4xs_bfp.items(FS, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(FS, 5120, st_)))
+        import gen_kq_bfp
+        for fm_ in sorted({l[t_][0] for l in pairs for t_ in ("ffn_gate", "ffn_up")} & RSWAP_KQ.keys()):
+            for up_, g_ in ((0, "g"), (1, "u")):
+                nm_ = "npu_swdec_%s_%s" % (fm_, g_)
+                src = os.path.join(tmp, nm_ + ".loom")
+                open(src, "w").write(gen_kq_bfp.gen(RSWAP_KQ[fm_], FS, 5120, dict(st_, up=up_)))
+                E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+                out.append((nm_ + ".hal", gen_kq_bfp.items(FS, 5120), gen_kq_bfp.WG, gen_kq_bfp.out_bytes(FS, 5120, st_)))
         src = os.path.join(tmp, "npu_swpanel.loom")
         open(src, "w").write(GE.gen("wgt", B, RSWAP_KS, RSWAP_PASSES, 64, True, True, p1k=True))
         E.emit(src, ["nop=0"], "npu_swpanel.hal", outdir)

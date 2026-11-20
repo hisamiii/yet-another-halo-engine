@@ -193,13 +193,18 @@ def restage(e, words):
         e(f"    %rs_cr{r} = index.constant {32 * r} : index")
         e(f"    %rs_ch{r} = index.add %rs_lane, %rs_cr{r} : index")
         e(f"    %rs_cb{r} = index.mul %rs_ch{r}, %rs_c16 : index")
+        cb = f"%rs_cb{r}"
         if r == 4:   # chunks 128 .. 143: lanes 0 .. 15
             e(f"    %rs_cl = index.constant {WAVE_B} : index")
             e(f"    %rs_ok = index.cmp ult, %rs_cb4, %rs_cl : index")
+            # the footprint analysis ignores the guard: the clamp (a no-op for lanes 0 .. 15) keeps the .fp at nout
+            e(f"    %rs_cm = index.constant {WAVE_B - 16} : index")
+            e(f"    %rs_cb4c = index.min %rs_cb4, %rs_cm : index")
+            cb = "%rs_cb4c"
             e("    scf.if %rs_ok {")
-        e(f"    %rs_la{r} = index.add %rs_wl, %rs_cb{r} : index")
+        e(f"    %rs_la{r} = index.add %rs_wl, {cb} : index")
         e(f"    %rs_v{r} = vector.load %lv[%rs_la{r}] : view<{nl}xi8> -> vector<16xi8>")
-        e(f"    %rs_gx{r} = index.add %rs_gb, %rs_cb{r} : index")
+        e(f"    %rs_gx{r} = index.add %rs_gb, {cb} : index")
         e(f"    %rs_ga{r} = index.assume %rs_gx{r} [range(%rs_gx{r}, 0, %rs_nl16)] : index")
         e(f"    vector.store %rs_v{r}, %ov[%rs_ga{r}] : vector<16xi8>, view<[%nout]xi8>")
         if r == 4:

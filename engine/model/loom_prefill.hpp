@@ -1175,10 +1175,21 @@ class LoomPrefill {
   // (npuffnrem_<fmt>.hal, f32), then npu_unpack_ffnblk.hal writes hidden + that + the partials. Returns false if the
   // layer does not qualify.
   // (row 5 stepping stone) YAH_NPU_RSWAP=1 on a set with dispatch.txt "npurswap" (emit_prefill_pp RSWAP_EMIT): the
-  // IQ4_XS FFN block layers' gate / up run the swapped image (RunFfnBlock)
+  // FFN block layers' gate / up run the swapped image (RunFfnBlock) when RSwapFmt takes both formats
   bool RSwapOn() const {
     static const bool on = [] { const char* e = std::getenv("YAH_NPU_RSWAP"); return e && std::strcmp(e, "1") == 0; }();
     return on && geom_.count("npurswap") != 0;
+  }
+  // A gate / up format the swap decodes: the set has its decoders npu_swdec_<fmt>_g / _u.hal, and YAH_NPU_RSWAP_FMTS
+  // (a comma list, unset: all) names it.
+  bool RSwapFmt(const char* fmt) const {
+    static const std::string only = [] {
+      const char* e = std::getenv("YAH_NPU_RSWAP_FMTS");
+      return e ? "," + std::string(e) + "," : std::string();
+    }();
+    const std::string n(fmt);
+    return geom_.count("npu_swdec_" + n + "_g.hal") && geom_.count("npu_swdec_" + n + "_u.hal") &&
+           (only.empty() || only.find("," + n + ",") != std::string::npos);
   }
   // (row 5) the swap layers' GPU gate / up split decodes the next swap layer's NPU gate / up rows into the other half
   // of a double-buffered stream: dispatch.txt "<split>.af.to.r5.npu.hal" (emit_prefill_pp RSWAP_EMIT, gen_r5fuse; its
@@ -1457,22 +1468,24 @@ class LoomPrefill {
     const auto col_bytes = [&](const ColRows& c, const auto* t, const Fmt& x) {
       return 255 * c.rb + 16 * (c.rb * 256 / static_cast<std::size_t>(t->dims[0])) + RecordRow(x.name);
     };
-    for (std::uint32_t j = 0; j < F / 256 && cpair; ++j)
+    // (row 5 stepping stone, RSwapOn) the swapped image: the GPU decodes the NPU's gate / up rows into A's stream and
+    // encodes the norm's tiled copy into W's token panel; call (t, b) takes tokens 512 t .., features 1024 b .. (today's
+    // calls 4 b .. 4 b + 3) and writes H where they do, its 8 M blocks qc x 18432 B apart (gen_npu_q GN_QSWHT)
+    // (a single format's layer or a mixed pair's: the image reads bfp16 only, the GPU decodes each tensor's format)
+    const bool rswap = RSwapOn() && (!pair || mix) && !np5 && qffn && !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) &&
+                       hord == "_p4" && apass == 0 && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
+    for (std::uint32_t j = 0; j < F / 256 && cpair && !rswap; ++j)
       csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), ag,
                                       cg.p + (f0 + 256 * j) * cg.rb, col_bytes(cg, tg, f),
                                       cu.p + (f0 + 256 * j) * cu.rb, col_bytes(cu, tu, fu), c_sw(j),
                                       "ffnsw" + hord + (qffn ? std::string("_") + f.name + "_" + fu.name : "")));
-    // (row 5 stepping stone, RSwapOn) the swapped image: the GPU decodes the NPU's gate / up rows into A's stream and
-    // encodes the norm's tiled copy into W's token panel; call (t, b) takes tokens 512 t .., features 1024 b .. (today's
-    // calls 4 b .. 4 b + 3) and writes H where they do, its 8 M blocks qc x 18432 B apart (gen_npu_q GN_QSWHT)
-    const bool rswap = RSwapOn() && !pair && !np5 && qffn && !bmix && std::strcmp(f.name, "iq4xs") == 0 &&
-                       hord == "_p4" && apass == 0 && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
     // (R5Fuse) this swap layer's index k, its stream half k % 2; carry: its split decodes swap layer k + 1
     std::size_t r5k = 0;
     bool carry = false, carried = false;
     const std::string r5h = sh.size() > 14 ? sh.substr(0, sh.size() - 14) + ".af.to.r5.npu.hal" : "";
     if (rswap && R5Fuse()) {
-      const bool fits = M == 17408 && F == 8192 && tg->dims[0] == 5120 && !weights_.RSegOf(*tg) &&
+      const bool fits = !pair && std::strcmp(f.name, "iq4xs") == 0 && M == 17408 && F == 8192 &&
+                        tg->dims[0] == 5120 && !weights_.RSegOf(*tg) &&
                         tu->offset == tg->offset + tg->bytes && sh.size() > 14 &&
                         sh.compare(sh.size() - 14, 14, ".af.to.npu.hal") == 0 && geom_.count(r5h) != 0;
       if (npu_planning_) {
@@ -1492,14 +1505,21 @@ class LoomPrefill {
       if (nbc / 8 > qc || qc % (nbc / 8)) throw LoomError("prefill: a swap call's H spans more than a down part");
       if (R5Fuse() && SwapStream() != std::size_t{F} * 5120 * 9 / 4)
         throw LoomError("prefill: the swap stream is not gen_r5fuse's (2 F K / 8 records of 9 B)");
-      for (const auto& [h, t] : {std::pair<const char*, const core::TensorInfo*>{"npu_swdec_iq4xs_g.hal", tg},
-                                 {"npu_swdec_iq4xs_u.hal", tu}}) {
+      for (const auto& [t, x, gu] : {std::tuple<const core::TensorInfo*, const Fmt*, const char*>{tg, &f, "g"},
+                                     {tu, &fu, "u"}}) {
         if (carried) break;
+        const std::string h = "npu_swdec_" + std::string(x->name) + "_" + gu + ".hal";
         const Geom& gd = geom_.at(h);
+        const std::size_t trb = static_cast<std::size_t>(t->bytes) / M;
         hrx_buffer_ref_t wr = TRef(*t);
-        wr.offset += f0 * rb, wr.length = F * rb;
-        Dispatch(Exe(h), "yah_iq4xs_bfp", (gd.tokens + gd.rowgrp - 1) / gd.rowgrp, 1, 1, gd.rowgrp, 1, 1,
-                 {wr, AView({sa, gd.tt})}, 2);
+        wr.offset += f0 * trb, wr.length = F * trb;
+        // (gen_kq_bfp: a grid format's grid is its second buffer, the GEMMs' first table)
+        std::vector<hrx_buffer_ref_t> db = {wr};
+        if (const auto gw = GemmWeights(*t, *x); gw.size() > 1) db.push_back(gw[1]);
+        db.push_back(AView({sa, gd.tt}));
+        const bool iq4 = std::strcmp(x->name, "iq4xs") == 0;
+        Dispatch(Exe(h), iq4 ? "yah_iq4xs_bfp" : "yah_kq_bfp", (gd.tokens + gd.rowgrp - 1) / gd.rowgrp, 1, 1,
+                 gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
       }
       const Geom& gp = geom_.at("npu_swpanel.hal");
       Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1, gp.rowgrp,
