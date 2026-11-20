@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit the GPU Q4_K / Q5_K -> NPU bfp16ebs8 weight decoder: the NPU decoder's exact values and rounding, on the GPU
+"""Emit the GPU Q4_K / Q5_K / IQ3_S -> NPU bfp16ebs8 weight decoder: the NPU decoder's exact values and rounding, on the GPU
 (row 5 swap: the GPU decodes a pair layer's gate / up into the swap's weight stream).
 
 Input: rows [rows][K / 256][144 B] (block_q4_K) or [176 B] (block_q5_K). Output: as gen_iq4xs_bfp (fragments of 8 rows
@@ -8,6 +8,8 @@ Values: gen_npu_dec.weights() of the gather-free path (Q4_K's "GF" order, the pa
 sub-block T = d sc and M = -dmin m, each split into two bf16 parts (RNE, then the RNE of the remainder); X = 128 + q
 (q = nibble + 16 h, h = 0 for Q4_K); in f32, in the NPU kernel's order: w = M0 + M1, + T0 (-128), + T1 (-128), + T0 X,
 + T1 X. Every product is exact (8-bit T part times a <= 8-bit X), so a fused multiply-add rounds as the kernel does.
+IQ3_S (110 B blocks): w = d (1 + 2 sc) grid[qs | qh bit << 8][j] (-1)^sign, exact in f32; the 512-word grid
+(tables/grid_iq3s.bin, 4 u8 values a word) is a second input buffer, read through the cache.
 E / m: npu_dec_emit.bfp_hw, as gen_iq4xs_bfp (the exponent of max |w|, + 1 when the largest value rounds to 128).
 """
 import sys
@@ -15,7 +17,7 @@ import sys
 import gen_iq4xs_bfp as I
 
 WG = I.WG
-BLK = {"Q4_K": 144, "Q5_K": 176}
+BLK = {"Q4_K": 144, "Q5_K": 176, "IQ3_S": 110}
 QS = {"Q4_K": 16, "Q5_K": 48}   # the qs bytes' offset in a block (Q5_K: qh 32 B at 16 first)
 
 
@@ -43,11 +45,16 @@ def gen(fmt, rows, K, stream=None):
     e(f"  %wgs = index.constant {(n + WG - 1) // WG} : index")
     e(f"  %wgsz = index.constant {WG} : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%wgsz, %unit, %unit) : index")
-    e("} launch(%w: buffer, %out: buffer) {")
+    grid = fmt == "IQ3_S"
+    e("} launch(%w: buffer, %grid: buffer, %out: buffer) {" if grid else "} launch(%w: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
     e(f"  %nin = index.constant {nin} : index")
     e(f"  %nout = index.constant {nout} : index")
-    e("  %w_na, %out_na = buffer.assume.noalias %w, %out : buffer, buffer")
+    if grid:
+        e("  %w_na, %grid_na, %out_na = buffer.assume.noalias %w, %grid, %out : buffer, buffer, buffer")
+        e("  %gv = buffer.view %grid_na[%base] : buffer -> view<512xi32>")
+    else:
+        e("  %w_na, %out_na = buffer.assume.noalias %w, %out : buffer, buffer")
     e("  %wv = buffer.view %w_na[%base] : buffer -> view<[%nin]xi8>")
     e("  %ov = buffer.view %out_na[%base] : buffer -> view<[%nout]xi8>")
     e("  %wg = kernel.workgroup.id<x> : index")
@@ -151,6 +158,11 @@ def row(e, src, fmt, r):
         e(f"    %wt{m} = scalar.fmaf %Tp{n}_0, %X{m}, %wzb{n} : f32")
         e(f"    %wv{m} = scalar.fmaf %Tp{n}_1, %X{m}, %wt{m} : f32")
         ws.append(f"%wv{m}")
+    bfp_tail(e, src, n, ws)
+
+
+def bfp_tail(e, src, n, ws):
+    """Row n's 8 f32 values ws -> its E source and 8 mantissa sources (npu_dec_emit.bfp_hw), appended to src."""
     # E: the exponent of max |w|; the bump: the largest value rounds to 128 (only a positive one can leave int8)
     am, pm = None, None
     for j, w in enumerate(ws):
@@ -181,7 +193,97 @@ def row(e, src, fmt, r):
         src.append(f"%yb{n}_{j}")
 
 
+def row_iq3s(e, src, r):
+    """IQ3_S row r: its block at %blk{r}; k-block kbl of the super-block: d @0, qs bytes 2 + 2 kbl (two grid words),
+    qh byte 66 + kbl / 4 (bits 2 (kbl % 4), + 1), sign byte 74 + kbl (bit j: value j), scale byte 106 + kbl / 8."""
+    n = f"{r}"
+    e(f"    %dv{n} = vector.load %wv[%blk{n}] : view<[%nin]xi8> -> vector<2xi8>")
+    e(f"    %dw{n} = vector.bitcast %dv{n} : vector<2xi8> to vector<1xi16>")
+    e(f"    %d16_{n} = vector.extract %dw{n}[0] : vector<1xi16> -> i16")
+    e(f"    %dh{n} = scalar.bitcast %d16_{n} : i16 to f16")
+    e(f"    %d{n} = scalar.extf %dh{n} : f16 to f32")
+    e(f"    %qa{n} = index.add %blk{n}, %qso : index")
+    e(f"    %qv{n} = vector.load %wv[%qa{n}] : view<[%nin]xi8> -> vector<2xi8>")
+    e(f"    %qw{n} = vector.bitcast %qv{n} : vector<2xi8> to vector<1xi16>")
+    e(f"    %q16_{n} = vector.extract %qw{n}[0] : vector<1xi16> -> i16")
+    e(f"    %q32_{n} = scalar.extui %q16_{n} : i16 to i32")
+    for nm, off in (("qh", "%qho"), ("sg", "%sgo"), ("sc", "%sco")):
+        e(f"    %{nm}a{n} = index.add %blk{n}, {off} : index")
+        e(f"    %{nm}b{n} = view.load %wv[%{nm}a{n}] : view<[%nin]xi8> -> i8")
+        e(f"    %{nm}{n} = scalar.extui %{nm}b{n} : i8 to i32")
+    e(f"    %scs{n} = scalar.shrui %sc{n}, %nsh : i32")
+    e(f"    %scn{n} = scalar.andi %scs{n}, %i15 : i32")
+    e(f"    %sc2_{n} = scalar.shli %scn{n}, %i1 : i32")
+    e(f"    %sc1_{n} = scalar.addi %sc2_{n}, %i1 : i32")
+    e(f"    %scf{n} = scalar.sitofp %sc1_{n} : i32 to f32")
+    e(f"    %s{n} = scalar.mulf %d{n}, %scf{n} : f32")          # d (1 + 2 sc), exact (11 x 5 bits)
+    e(f"    %qhs{n} = scalar.shrui %qh{n}, %hsh : i32")
+    gws = []
+    for h in range(2):
+        e(f"    %gl{n}_{h} = scalar.bitfield.extractu %q32_{n} {{offset = {8 * h}, width = 8}} : i32 -> i32")
+        e(f"    %gh{n}_{h} = scalar.bitfield.extractu %qhs{n} {{offset = {h}, width = 1}} : i32 -> i32")
+        e(f"    %gi{n}_{h} = scalar.fmai %gh{n}_{h}, %i256, %gl{n}_{h} : i32")
+        e(f"    %gq{n}_{h} = index.cast %gi{n}_{h} : i32 to index")
+        e(f"    %gd{n}_{h} = index.assume %gq{n}_{h} [range(%gq{n}_{h}, 0, 511)] : index")
+        e(f"    %gw{n}_{h} = view.load %gv[%gd{n}_{h}] : view<512xi32> -> i32")
+        gws.append(f"%gw{n}_{h}")
+    ws = []
+    for j in range(8):
+        m = f"{n}_{j}"
+        e(f"    %g{m} = scalar.bitfield.extractu {gws[j // 4]} {{offset = {8 * (j % 4)}, width = 8}} : i32 -> i32")
+        e(f"    %sb{m} = scalar.bitfield.extractu %sg{n} {{offset = {j}, width = 1}} : i32 -> i32")
+        e(f"    %sn{m} = scalar.subi %i0, %sb{m} : i32")
+        e(f"    %gx{m} = scalar.xori %g{m}, %sn{m} : i32")
+        e(f"    %gs{m} = scalar.addi %gx{m}, %sb{m} : i32")      # (-1)^sign g
+        e(f"    %gf{m} = scalar.sitofp %gs{m} : i32 to f32")
+        e(f"    %wv{m} = scalar.mulf %s{n}, %gf{m} : f32")        # exact (16 x 8 bits)
+        ws.append(f"%wv{m}")
+    bfp_tail(e, src, n, ws)
+
+
+def body_iq3s(rows, K, stream=None):
+    rb = K // 256 * 110
+    L = []
+    e = L.append
+    I.prologue(e, rows, K, rb, 0, stream, blk=110)
+    e("    %sb = index.div %kbi, %c32 : index")
+    e("    %kbl = index.rem %kbi, %c32 : index")
+    e("    %kq = index.rem %kbl, %c4 : index")
+    e("    %k4 = index.div %kbl, %c4 : index")
+    e("    %k8 = index.div %kbl, %c8 : index")
+    e("    %k4h = index.rem %k4, %c2 : index")
+    for nm, v in (("c66", 66), ("c74", 74), ("c106", 106)):
+        e(f"    %{nm} = index.constant {v} : index")
+    e("    %kbl2 = index.mul %kbl, %c2 : index")
+    e("    %qso = index.add %kbl2, %c2 : index")
+    e("    %qho = index.add %k4, %c66 : index")
+    e("    %sgo = index.add %kbl, %c74 : index")
+    e("    %sco = index.add %k8, %c106 : index")
+    e("    %sbo = index.mul %sb, %c136 : index")      # (c136: the block size, prologue's blk)
+    e("    %row0 = index.mul %g8, %c8 : index")
+    e("    %rb0 = index.mul %row0, %crb : index")
+    e("    %blkb = index.add %rb0, %sbo : index")
+    e("    %kq_i = index.cast %kq : index to i32")
+    e("    %k4h_i = index.cast %k4h : index to i32")
+    for nm, v in (("i0", 0), ("i1", 1), ("i2", 2), ("i15", 15), ("i23", 23), ("i256", 256), ("i260", 260)):
+        e(f"    %{nm} = scalar.constant {v} : i32")
+    e("    %hsh = scalar.shli %kq_i, %i1 : i32")       # qh bits 2 (kbl % 4), + 1
+    e("    %nsh = scalar.shli %k4h_i, %i2 : i32")      # the scale nibble: 4 ((kbl / 4) % 2)
+    e("    %f127 = scalar.constant 127.0 : f32")
+    e("    %magic = scalar.constant 12582912.0 : f32")
+    src = []
+    for r in range(8):
+        e(f"    %ro{r} = index.constant {r * rb} : index")
+        e(f"    %blk{r} = index.add %blkb, %ro{r} : index")
+        row_iq3s(e, src, r)
+    I.st(e, I.pack(e, src), "%frag")
+    e("  }")
+    return L
+
+
 def body(fmt, rows, K, stream=None):
+    if fmt == "IQ3_S":
+        return body_iq3s(rows, K, stream)
     rb = K // 256 * BLK[fmt]
     L = []
     e = L.append
@@ -233,7 +335,7 @@ def body(fmt, rows, K, stream=None):
 
 def main():
     if len(sys.argv) != 4:
-        sys.exit("usage: gen_kq_bfp.py <Q4_K|Q5_K> <rows> <K>")
+        sys.exit("usage: gen_kq_bfp.py <Q4_K|Q5_K|IQ3_S> <rows> <K>")
     sys.stdout.write(gen(sys.argv[1], int(sys.argv[2]), int(sys.argv[3])))
 
 
