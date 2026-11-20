@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit the GPU Q4_K / Q5_K / IQ3_S -> NPU bfp16ebs8 weight decoder: the NPU decoder's exact values and rounding, on the GPU
+"""Emit the GPU Q4_K / Q5_K / Q3_K / IQ3_S -> NPU bfp16ebs8 weight decoder: the NPU decoder's exact values and rounding, on the GPU
 (row 5 swap: the GPU decodes a pair layer's gate / up into the swap's weight stream).
 
 Input: rows [rows][K / 256][144 B] (block_q4_K) or [176 B] (block_q5_K). Output: as gen_iq4xs_bfp (fragments of 8 rows
@@ -10,6 +10,7 @@ sub-block T = d sc and M = -dmin m, each split into two bf16 parts (RNE, then th
 + T1 X. Every product is exact (8-bit T part times a <= 8-bit X), so a fused multiply-add rounds as the kernel does.
 IQ3_S (110 B blocks): w = d (1 + 2 sc) grid[qs | qh bit << 8][j] (-1)^sign, exact in f32; the 512-word grid
 (tables/grid_iq3s.bin, 4 u8 values a word) is a second input buffer, read through the cache.
+Q3_K (110 B blocks): w = d (sc - 32) (crumb + 4 hbit - 4), exact in f32.
 E / m: npu_dec_emit.bfp_hw, as gen_iq4xs_bfp (the exponent of max |w|, + 1 when the largest value rounds to 128).
 """
 import sys
@@ -17,7 +18,7 @@ import sys
 import gen_iq4xs_bfp as I
 
 WG = I.WG
-BLK = {"Q4_K": 144, "Q5_K": 176, "IQ3_S": 110}
+BLK = {"Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "Q3_K": 110}
 QS = {"Q4_K": 16, "Q5_K": 48}   # the qs bytes' offset in a block (Q5_K: qh 32 B at 16 first)
 
 
@@ -281,7 +282,106 @@ def body_iq3s(rows, K, stream=None):
     return L
 
 
+def row_q3k(e, src, r):
+    """Q3_K row r: its block at %blk{r}; k-block kbl: hmask 8 B at 8 (kbl % 4) (bit %hbs), qs 8 B at 32 + 32 (kbl / 16)
+    + 8 (kbl % 4) (crumb %qcs), sub-block i = kbl / 2: scale bytes 96 + i % 8 (nibble 4 (i / 8)) and 104 + i % 4
+    (crumb 2 (i / 4)), d @108."""
+    n = f"{r}"
+    e(f"    %da{n} = index.add %blk{n}, %c108 : index")
+    e(f"    %dv{n} = vector.load %wv[%da{n}] : view<[%nin]xi8> -> vector<2xi8>")
+    e(f"    %dw{n} = vector.bitcast %dv{n} : vector<2xi8> to vector<1xi16>")
+    e(f"    %d16_{n} = vector.extract %dw{n}[0] : vector<1xi16> -> i16")
+    e(f"    %dh{n} = scalar.bitcast %d16_{n} : i16 to f16")
+    e(f"    %d{n} = scalar.extf %dh{n} : f16 to f32")
+    for nm, off in (("sl", "%slo"), ("sh", "%sho")):
+        e(f"    %{nm}a{n} = index.add %blk{n}, {off} : index")
+        e(f"    %{nm}b{n} = view.load %wv[%{nm}a{n}] : view<[%nin]xi8> -> i8")
+        e(f"    %{nm}{n} = scalar.extui %{nm}b{n} : i8 to i32")
+    e(f"    %sls{n} = scalar.shrui %sl{n}, %lsh : i32")
+    e(f"    %sln{n} = scalar.andi %sls{n}, %i15 : i32")
+    e(f"    %shs{n} = scalar.shrui %sh{n}, %hsh2 : i32")
+    e(f"    %shn{n} = scalar.andi %shs{n}, %i3 : i32")
+    e(f"    %scv{n} = scalar.fmai %shn{n}, %i16, %sln{n} : i32")
+    e(f"    %scm{n} = scalar.subi %scv{n}, %i32 : i32")
+    e(f"    %scf{n} = scalar.sitofp %scm{n} : i32 to f32")
+    e(f"    %s{n} = scalar.mulf %d{n}, %scf{n} : f32")          # d (sc - 32), exact (11 x 6 bits)
+    words = {}
+    for nm, off, sh in (("hm", "%hmo", "%hbs"), ("qs", "%qso", "%qcs")):
+        e(f"    %{nm}a{n} = index.add %blk{n}, {off} : index")
+        e(f"    %{nm}v{n} = vector.load %wv[%{nm}a{n}] : view<[%nin]xi8> -> vector<8xi8>")
+        e(f"    %{nm}w{n} = vector.bitcast %{nm}v{n} : vector<8xi8> to vector<2xi32>")
+        for h in range(2):
+            e(f"    %{nm}x{n}_{h} = vector.extract %{nm}w{n}[{h}] : vector<2xi32> -> i32")
+            e(f"    %{nm}y{n}_{h} = scalar.shrui %{nm}x{n}_{h}, {sh} : i32")
+        words[nm] = [f"%{nm}y{n}_{h}" for h in range(2)]
+    ws = []
+    for j in range(8):
+        m = f"{n}_{j}"
+        o = 8 * (j % 4)
+        e(f"    %cr{m} = scalar.bitfield.extractu {words['qs'][j // 4]} {{offset = {o}, width = 2}} : i32 -> i32")
+        e(f"    %hb{m} = scalar.bitfield.extractu {words['hm'][j // 4]} {{offset = {o}, width = 1}} : i32 -> i32")
+        e(f"    %qq{m} = scalar.fmai %hb{m}, %i4, %cr{m} : i32")
+        e(f"    %qm{m} = scalar.subi %qq{m}, %i4 : i32")
+        e(f"    %qf{m} = scalar.sitofp %qm{m} : i32 to f32")
+        e(f"    %wv{m} = scalar.mulf %s{n}, %qf{m} : f32")        # exact (17 x 3 bits)
+        ws.append(f"%wv{m}")
+    bfp_tail(e, src, n, ws)
+
+
+def body_q3k(rows, K, stream=None):
+    rb = K // 256 * 110
+    L = []
+    e = L.append
+    I.prologue(e, rows, K, rb, 0, stream, blk=110)
+    e("    %sb = index.div %kbi, %c32 : index")
+    e("    %kbl = index.rem %kbi, %c32 : index")
+    for nm, v in (("c96", 96), ("c104", 104), ("c108", 108), ("c16i", 16)):
+        e(f"    %{nm} = index.constant {v} : index")
+    e("    %kq = index.rem %kbl, %c4 : index")
+    e("    %kh = index.div %kbl, %c16i : index")     # value half (e / 128)
+    e("    %k16 = index.rem %kbl, %c16i : index")
+    e("    %kc = index.div %k16, %c4 : index")       # crumb (e % 128) / 32
+    e("    %si = index.div %kbl, %c2 : index")       # sub-block of 16
+    e("    %si8 = index.rem %si, %c8 : index")
+    e("    %siq = index.div %si, %c8 : index")
+    e("    %si4 = index.rem %si, %c4 : index")
+    e("    %sid = index.div %si, %c4 : index")
+    e("    %kqo = index.mul %kq, %c8 : index")
+    e("    %hmo = index.add %kqo, %c0i : index")
+    e("    %kho = index.mul %kh, %c32 : index")
+    e("    %qs0 = index.add %kho, %kqo : index")
+    e("    %qso = index.add %qs0, %c32 : index")
+    e("    %slo = index.add %si8, %c96 : index")
+    e("    %sho = index.add %si4, %c104 : index")
+    e("    %sbo = index.mul %sb, %c136 : index")      # (c136: the block size, prologue's blk)
+    e("    %row0 = index.mul %g8, %c8 : index")
+    e("    %rb0 = index.mul %row0, %crb : index")
+    e("    %blkb = index.add %rb0, %sbo : index")
+    for nm in ("kh", "kc", "siq", "sid"):
+        e(f"    %{nm}_i = index.cast %{nm} : index to i32")
+    for nm, v in (("i0", 0), ("i1", 1), ("i2", 2), ("i3", 3), ("i4", 4), ("i15", 15), ("i16", 16), ("i23", 23),
+                  ("i32", 32), ("i260", 260)):
+        e(f"    %{nm} = scalar.constant {v} : i32")
+    e("    %kh4 = scalar.shli %kh_i, %i2 : i32")
+    e("    %hbs = scalar.addi %kh4, %kc_i : i32")       # hmask bit 4 (e / 128) + (e % 128) / 32
+    e("    %qcs = scalar.shli %kc_i, %i1 : i32")        # crumb shift 2 ((e % 128) / 32)
+    e("    %lsh = scalar.shli %siq_i, %i2 : i32")       # scale nibble 4 (i / 8)
+    e("    %hsh2 = scalar.shli %sid_i, %i1 : i32")      # scale crumb 2 (i / 4)
+    e("    %f127 = scalar.constant 127.0 : f32")
+    e("    %magic = scalar.constant 12582912.0 : f32")
+    src = []
+    for r in range(8):
+        e(f"    %ro{r} = index.constant {r * rb} : index")
+        e(f"    %blk{r} = index.add %blkb, %ro{r} : index")
+        row_q3k(e, src, r)
+    I.st(e, I.pack(e, src), "%frag")
+    e("  }")
+    return L
+
+
 def body(fmt, rows, K, stream=None):
+    if fmt == "Q3_K":
+        return body_q3k(rows, K, stream)
     if fmt == "IQ3_S":
         return body_iq3s(rows, K, stream)
     rb = K // 256 * BLK[fmt]
@@ -335,7 +435,7 @@ def body(fmt, rows, K, stream=None):
 
 def main():
     if len(sys.argv) != 4:
-        sys.exit("usage: gen_kq_bfp.py <Q4_K|Q5_K|IQ3_S> <rows> <K>")
+        sys.exit("usage: gen_kq_bfp.py <Q4_K|Q5_K|Q3_K|IQ3_S> <rows> <K>")
     sys.stdout.write(gen(sys.argv[1], int(sys.argv[2]), int(sys.argv[3])))
 
 
