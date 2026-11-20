@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom: coalesce a concat source through tied chains
+
+Concat-source coalescing follows up to 4 hard tied hops (e.g. perm -> fma_mixlo -> fma_mixhi -> a ds_store tuple), not one: the chain's register is the tuple's. LOOM_EXP_TIED_CHAIN=0 keeps one hop.
+---
+
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -1821,6 +1821,51 @@
+   return iree_ok_status();
+ }
+ 
++// Follows hard tied results from |tied| (a composed source-to-intermediate
++// tied relation) through up to |depth_left| further tied hops; the first
++// concat the chain reaches that coalescing handles decides |out_result|.
++static iree_status_t loom_low_allocation_coalescing_assign_tied_chain_source(
++    loom_low_allocation_coalescing_context_t* context,
++    const loom_liveness_interval_t* interval,
++    const loom_low_placement_relation_t* tied, uint32_t depth_left,
++    loom_low_allocation_concat_source_result_t* out_result) {
++  const loom_low_placement_relation_range_t range =
++      loom_low_placement_relation_range_for_source_value_ordinal(
++          context->placement, tied->result_ordinal);
++  for (uint32_t i = 0; i < range.count; ++i) {
++    const loom_low_placement_relation_t* next =
++        &context->placement->relations
++             [context->placement->relation_indices_by_source_ordinal
++                  [range.start + i]];
++    loom_low_placement_relation_t composed;
++    if (loom_low_placement_relation_compose_tied_concat_source(tied, next,
++                                                               &composed)) {
++      IREE_RETURN_IF_ERROR(
++          loom_low_allocation_coalescing_assign_concat_source_relation(
++              context, interval, &composed,
++              /*source_has_unique_affinity_path=*/false, out_result));
++      if (*out_result != LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_UNHANDLED) {
++        return iree_ok_status();
++      }
++      continue;
++    }
++    if (depth_left == 0 ||
++        next->cause != LOOM_LOW_PLACEMENT_CAUSE_TIED_RESULT ||
++        !iree_all_bits_set(next->flags,
++                           LOOM_LOW_PLACEMENT_RELATION_FLAG_HARD |
++                               LOOM_LOW_PLACEMENT_RELATION_FLAG_CAN_ALIAS_STORAGE) ||
++        !loom_low_placement_relation_compose(tied, next, &composed)) {
++      continue;
++    }
++    IREE_RETURN_IF_ERROR(loom_low_allocation_coalescing_assign_tied_chain_source(
++        context, interval, &composed, depth_left - 1, out_result));
++    if (*out_result != LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_UNHANDLED) {
++      return iree_ok_status();
++    }
++  }
++  return iree_ok_status();
++}
++
+ iree_status_t loom_low_allocation_coalescing_assign_concat_source_interval(
+     loom_low_allocation_coalescing_context_t* context,
+     const loom_liveness_interval_t* interval, bool* out_assigned) {
+@@ -1877,6 +1922,52 @@
+           loom_low_allocation_coalescing_assign_concat_source_relation(
+               context, interval, &composed_relation,
+               /*source_has_unique_affinity_path=*/false, &result));
++      if (result != LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_UNHANDLED) {
++        *out_assigned =
++            result == LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_ASSIGNED;
++        return iree_ok_status();
++      }
++    }
++  }
++  // Longer hard tied chains (LOOM_EXP_TIED_CHAIN=0: one hop only).
++  static int tied_chain = -1;
++  if (tied_chain < 0) {
++    const char* v = getenv("LOOM_EXP_TIED_CHAIN");
++    tied_chain = !(v != NULL && v[0] == '0');
++  }
++  for (uint32_t source_index = 0; tied_chain && source_index < source_range.count;
++       ++source_index) {
++    const loom_low_placement_relation_t* relation =
++        &context->placement->relations
++             [context->placement->relation_indices_by_source_ordinal
++                  [source_range.start + source_index]];
++    if (relation->cause != LOOM_LOW_PLACEMENT_CAUSE_TIED_RESULT ||
++        !iree_all_bits_set(relation->flags,
++                           LOOM_LOW_PLACEMENT_RELATION_FLAG_HARD |
++                               LOOM_LOW_PLACEMENT_RELATION_FLAG_CAN_ALIAS_STORAGE)) {
++      continue;
++    }
++    // One hop was tried above; walk the longer chains.
++    const loom_low_placement_relation_range_t next_range =
++        loom_low_placement_relation_range_for_source_value_ordinal(
++            context->placement, relation->result_ordinal);
++    for (uint32_t i = 0; i < next_range.count; ++i) {
++      const loom_low_placement_relation_t* next =
++          &context->placement->relations
++               [context->placement->relation_indices_by_source_ordinal
++                    [next_range.start + i]];
++      loom_low_placement_relation_t composed;
++      if (next->cause != LOOM_LOW_PLACEMENT_CAUSE_TIED_RESULT ||
++          !iree_all_bits_set(next->flags,
++                             LOOM_LOW_PLACEMENT_RELATION_FLAG_HARD |
++                                 LOOM_LOW_PLACEMENT_RELATION_FLAG_CAN_ALIAS_STORAGE) ||
++          !loom_low_placement_relation_compose(relation, next, &composed)) {
++        continue;
++      }
++      loom_low_allocation_concat_source_result_t result =
++          LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_UNHANDLED;
++      IREE_RETURN_IF_ERROR(loom_low_allocation_coalescing_assign_tied_chain_source(
++          context, interval, &composed, /*depth_left=*/2, &result));
+       if (result != LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_UNHANDLED) {
+         *out_assigned =
+             result == LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_ASSIGNED;

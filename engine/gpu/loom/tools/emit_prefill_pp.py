@@ -634,6 +634,11 @@ def _seg_tile(fmt, kind, mt, kb, small, light=None):
     return dataclasses.replace(d, **dict(AF_TILE, **dict(knobs, **(light or {}))))
 
 
+# Loom options for a segmented GEMM's retry when it crosses SEG_VGPR_TIER: the tied-chain coalescing (engine/hrx
+# patch 01xx) lengthens a few tuple sources' lives; IQ3_S kqg + Q5_K k / v takes 199 VGPRs with it, 192 without.
+SEG_LOOM_RETRY = {"LOOM_EXP_TIED_CHAIN": "0"}
+
+
 def seg_gemms(rows, B, outdir):
     """Emit the SEG GEMMs some layer can use; return their dispatch.txt rows."""
     import gen_gemm_tile as TG
@@ -657,7 +662,7 @@ def seg_gemms(rows, B, outdir):
     out, big = [], {}
     tt = B // AF_TILE["bn"]
 
-    def build(segs, light=None):
+    def build(segs, light=None, env=None):
         """Emit one segmented GEMM; return its dispatch.txt row."""
         texts = []
         for i, ((fmt, mt, kb), kind, small) in enumerate(segs):
@@ -680,17 +685,19 @@ def seg_gemms(rows, B, outdir):
         os.makedirs(tmp, exist_ok=True)
         src = os.path.join(tmp, name[:-4] + ".loom")
         open(src, "w").write(text)
-        E.emit(src, [], name, outdir)
+        E.emit(src, [], name, outdir, env=env)
         return name, AF_TILE["bn"], groups, tt
 
     # one VGPR tier: over 192 a WGP holds one 16-wave workgroup instead of two. A segmented GEMM the riders push over
     # it while the large GEMM alone fits loses more than it saves (11-02: IQ4_NL kqg + K-quant k / v 200, Q6_K v 204:
-    # +0.3..+1.5 M cycles per layer): those retry with SEG_RIDER_LIGHT riders, else keep the separate GEMMs
+    # +0.3..+1.5 M cycles per layer): those retry without the tied-chain coalescing (SEG_LOOM_RETRY), then with
+    # SEG_RIDER_LIGHT riders, else keep the separate GEMMs
     for segs in sorted(jobs):
         (fmt, mt, kb), kind, _ = segs[0]
         big = hal_vgprs(os.path.join(outdir, "gemm_%s_%s_%d_%d.af.hal" % (kind, fmt, mt, kb)))
-        for light in (None, SEG_RIDER_LIGHT):
-            r = build(segs, light)
+        for light, env in ((None, None), (None, SEG_LOOM_RETRY), (SEG_RIDER_LIGHT, None),
+                           (SEG_RIDER_LIGHT, SEG_LOOM_RETRY)):
+            r = build(segs, light, env)
             if hal_vgprs(os.path.join(outdir, r[0])) <= SEG_VGPR_TIER or big > SEG_VGPR_TIER:
                 out.append(r)
                 break
