@@ -162,6 +162,12 @@ def loom_env(cfg):
         env["LOOM_EXP_RING_AT"] = N.qpins()
     if cfg.fuse == 2:
         env["LOOM_EXP_RING_AT"] = N.qf_ring_at(env["LOOM_EXP_RING_AT"])
+    if N.QSWAP and os.environ.get("GN_QSWPAIR") == "1":
+        # (row 5 swap image, private HRX 0099 + 0112 + 0114, not in the pin yet) 8 A streams: each A stage's odd
+        # records ride the east column's second shim MM2S into a second ring of the stage's own memory tile; column
+        # 1's W panel shares column 0's shim MM2S0 as packets (parted at shim 0), freeing a channel for the gate's
+        # poll. 11-20: pp2048 split 1808.3 -> 1754.5 ms, same md5, ffnswap 18.16 -> 14.57 M a job.
+        env.update(LOOM_EXP_INGRESS_PAIR="2", LOOM_EXP_SHIM_SHARE="36:32")
     if os.environ.get("GN_QRELAX") == "1":   # (HRX 0087) no MMA-latency drain before the row loop's back edge
         env["LOOM_EXP_HWLOOP_TERM_RELAX"] = "1"
     if N.crelp_on():   # (HRX 0089) the pair relay's channel and the P1 tokens form a leaf-synchronized cycle
