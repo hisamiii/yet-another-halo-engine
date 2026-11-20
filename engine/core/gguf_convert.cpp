@@ -214,6 +214,13 @@ Gguf Gguf::OpenConverted(const std::string& path, bool weights) {
       const std::size_t sb = k / BlockElements(s.type) * BlockBytes(s.type), db = k / BlockElements(t.type) * BlockBytes(t.type);
       if (it->kind != Kind::kCopy && it->kind != Kind::kQ8_0)
         throw std::runtime_error("gguf: Rows of " + t.name + " from the source: not a copy or Q8_0 item");
+      // scattered rows: no readahead over the tensor (the source is mapped MADV_SEQUENTIAL for the load, and the load
+      // drops its pages, so each row faults from the file: a chunk's 2048 Q3_K rows took 37 ms with readahead, 6 without)
+      {
+        const auto a = reinterpret_cast<std::uintptr_t>(st->src.Data(s));
+        const std::uintptr_t lo = a & ~std::uintptr_t{4095};
+        ::madvise(reinterpret_cast<void*>(lo), a + s.bytes - lo, MADV_RANDOM);
+      }
       // rows [r0, r1): each row on its own (a prefill chunk's 2048 Q8_0 rows took ~54 ms on one thread)
       const auto run = [&](std::size_t r0, std::size_t r1) {
         std::vector<float> buf(k);
