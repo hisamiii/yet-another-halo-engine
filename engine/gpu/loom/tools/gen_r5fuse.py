@@ -97,13 +97,17 @@ class IQ4XS:
     buffers = []           # extra launch buffers (names, or (name, view type)), bound after the raw weights
     row_bytes = RBG        # bytes a raw row (the raw binding: gate's n rows, then up's)
 
-    def __init__(self, tensor_offset=0, prefix=""):
-        self.toff, self.p = tensor_offset, prefix   # (a pair's up: its rows after the gate's n; names prefixed)
+    def __init__(self, tensor_offset=None, prefix=""):
+        # tensor_offset: in a pair, this tensor's byte offset in the raw binding (gate 0, up n x the gate's row
+        # bytes), a constant base in place of %tt x n RBG; None: one payload for both tensors. prefix: names in a pair
+        self.toff, self.p = tensor_offset, prefix
 
     def prologue(self, e, n, nin, nout):
         p = self.p
         for nm, v in (("c136", 136), ("ctb", n * RBG), ("cr0", (n - F) * RBG), ("crb", RBG)):
             e(f"  %{p}{nm} = index.constant {v} : index")
+        if self.toff is not None:
+            e(f"  %{p}cbase = index.constant {self.toff + (n - F) * RBG} : index")
         e(f"  %{p}rbo = index.mul %r16, %{p}crb : index")
         e(f"  %{p}qj = index.mul %jp, %c16 : index")
         e(f"  %{p}qbb = index.mul %bb, %c8 : index")
@@ -124,11 +128,12 @@ class IQ4XS:
         """After _frame_loads(kpv, ft): the header and qs half of super-block %<ft>pq (t: this payload's tag)."""
         x = lambda s: e(ind + s)
         p, f = self.p, t if ft is None else ft
-        x(f"%{t}r0 = index.mul %{f}tt, %{p}ctb : index")
-        x(f"%{t}r1 = index.add %{t}r0, %{p}cr0 : index")
+        if self.toff is None:
+            x(f"%{t}r0 = index.mul %{f}tt, %{p}ctb : index")
+            x(f"%{t}r1 = index.add %{t}r0, %{p}cr0 : index")
         x(f"%{t}g16r = index.mul %{f}g16, %c16 : index")
         x(f"%{t}r2 = index.mul %{t}g16r, %{p}crb : index")
-        x(f"%{t}r3 = index.add %{t}r1, %{t}r2 : index")
+        x(f"%{t}r3 = index.add {f'%{t}r1' if self.toff is None else f'%{p}cbase'}, %{t}r2 : index")
         x(f"%{t}r4 = index.add %{t}r3, %{p}rbo : index")
         x(f"%{t}po = index.mul %{f}pq, %{p}c136 : index")
         x(f"%{t}ha = index.add %{t}r4, %{t}po : index")
