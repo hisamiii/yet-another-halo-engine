@@ -1172,6 +1172,12 @@ class LoomNpu {
   }
   // Throws if a command failed.
   NpuProf* Prof() { return prof_.get(); }
+  // (diag) YAH_NPU_PROF_MID=1: READ_REGS also after a family switch's channel resets, after its setup and after the
+  // first call's lead before the gate (records in that order, then the job's own; NpuProf::Peek reads them)
+  static bool ProfMid() {
+    static const bool on = std::getenv("YAH_NPU_PROF_MID") != nullptr;
+    return on;
+  }
   void CheckHealth() {
     std::lock_guard<std::mutex> lock(mu_);
     if (!failure_.empty()) throw LoomError(failure_);
@@ -1273,6 +1279,12 @@ class LoomNpu {
   // 0) and writes those masters 0; their columns' packet lanes are set again (ControlPackets).
   std::vector<std::uint8_t> DeltaSetup(const std::uint8_t* src, std::size_t length, bool packets, bool switching) {
     if (program_lost_.exchange(false)) program_.Forget();
+    // (diag) YAH_NPU_FULLSETUP=1: every family switch writes whole programs and read-only data (no words skipped)
+    static const bool fullsetup = std::getenv("YAH_NPU_FULLSETUP") != nullptr;
+    if (fullsetup && switching) {
+      std::fill(program_.known.begin(), program_.known.end(), 0);
+      for (auto& r : program_.rodata) r.clear();
+    }
     std::uint32_t n = 0, size = 0;
     std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
     if (size != length || size < 16) throw LoomError("npu: unexpected setup header");
@@ -1309,6 +1321,13 @@ class LoomNpu {
       if (switching) {
         for (const std::uint32_t c : program_.queued)
           if (!queues.count(c)) w32(c, 2), w32(c, 0);   // the channel's reset: asserted, released
+        if (const char* pf = std::getenv("YAH_NPU_PRESETUP")) {   // (diag) "address value" writes before the setup
+          if (std::FILE* fp = std::fopen(pf, "r")) {
+            for (unsigned a = 0, x = 0; std::fscanf(fp, "%x %x", &a, &x) == 2;) w32(a, x);
+            std::fclose(fp);
+          }
+        }
+        if (ProfMid() && prof_) out.insert(out.end(), prof_->Read().begin(), prof_->Read().end()), ++ops;
         program_.queued.clear();
         for (const std::uint32_t a : program_.masters) {
           if (wrote.count(a)) continue;
@@ -1435,6 +1454,23 @@ class LoomNpu {
     if (packets) ControlPackets(ps, out, ops);
     else program_.lane.fill(false);
     program_.s5 = s5;
+    // (diag) YAH_NPU_POSTSETUP=<file>: "address value" pairs (hex) written at the end of every family switch's setup
+    if (static const char* ps_file = std::getenv("YAH_NPU_POSTSETUP"); ps_file && switching) {
+      static const std::vector<std::pair<std::uint32_t, std::uint32_t>> extra = [] {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> v;
+        if (std::FILE* fp = std::fopen(ps_file, "r")) {
+          for (unsigned a = 0, x = 0; std::fscanf(fp, "%x %x", &a, &x) == 2;) v.emplace_back(a, x);
+          std::fclose(fp);
+        }
+        return v;
+      }();
+      for (const auto& [a, v] : extra) {
+        std::uint8_t w[24] = {};
+        const std::uint32_t bl = 24;
+        std::memcpy(w + 8, &a, 4), std::memcpy(w + 16, &v, 4), std::memcpy(w + 20, &bl, 4);
+        out.insert(out.end(), w, w + 24), ++ops;
+      }
+    }
     const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
     std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
     return out;
@@ -1804,7 +1840,33 @@ class LoomNpu {
               if (FILE* fp = std::fopen(f.c_str(), "wb")) std::fwrite(ds.data(), 1, ds.size(), fp), std::fclose(fp);
             }
           }
+          const char* sri = std::getenv("YAH_NPU_SETUPREAD_IMG");   // (diag) only that image's setups
+          if (const char* sr = std::getenv("YAH_NPU_SETUPREAD");
+              sr && prof_ && (!sri || k0->path.find(sri) != std::string::npos)) {   // (diag) READ_REGS after ops k1,k2..
+            std::vector<std::uint32_t> at;
+            for (const char* q = sr; *q;) {
+              at.push_back(static_cast<std::uint32_t>(std::strtoul(q, const_cast<char**>(&q), 10)));
+              if (*q == ',') ++q;
+            }
+            std::vector<std::uint8_t> o(ds.begin(), ds.begin() + 16);
+            std::uint32_t k = 0, added = 0;
+            for (std::size_t q = 16; q < ds.size(); ++k) {
+              std::uint32_t len = ds[q] == 0 ? 24 : ds[q] == 3 ? 28 : 0;
+              if (ds[q] == 1) std::memcpy(&len, &ds[q + 12], 4);
+              else if (ds[q] == 128 || len == 0) std::memcpy(&len, &ds[q + 4], 4);
+              o.insert(o.end(), ds.begin() + q, ds.begin() + q + len);
+              q += len;
+              if (std::find(at.begin(), at.end(), k) != at.end())
+                o.insert(o.end(), prof_->Read().begin(), prof_->Read().end()), ++added;
+            }
+            std::uint32_t n = 0;
+            std::memcpy(&n, &o[8], 4), n += added, std::memcpy(&o[8], &n, 4);
+            const std::uint32_t sz = static_cast<std::uint32_t>(o.size());
+            std::memcpy(&o[12], &sz, 4);
+            ds.swap(o);
+          }
           append(ds);
+          if (ProfMid() && prof_) append_ops(prof_->Read(), 1);
         }
         lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
@@ -1813,6 +1875,7 @@ class LoomNpu {
       const Call& c0 = *calls[0];
       const bool pre = c0.k->streamed && !c0.lead_pre.empty() && !(c0.k->swap && c0.k->dec != dec);
       if (pre) append(c0.lead_pre);
+      if (ProfMid() && prof_) append_ops(prof_->Read(), 1);
       append(calls[0]->gate);
       if (prof_) append_ops(prof_->Setup(calls[0]->k->path), prof_->SetupOps());
       if (!calls[0]->k->streamed) {
@@ -1856,6 +1919,22 @@ class LoomNpu {
       if (pend) append(pend->wait);
       for (; queued > 0; --queued) append(calls.back()->wait);
       append(calls.back()->done);
+      if (static const char* ec = std::getenv("YAH_NPU_ENDCLEAR"); ec && prof_) {   // (diag) writes before the end read
+        static const std::vector<std::uint8_t> w = [] {
+          std::vector<std::uint8_t> o;
+          if (std::FILE* fp = std::fopen(std::getenv("YAH_NPU_ENDCLEAR"), "r")) {
+            for (unsigned a = 0, x = 0; std::fscanf(fp, "%x %x", &a, &x) == 2;) {
+              std::uint8_t op[24] = {};
+              const std::uint32_t bl = 24;
+              std::memcpy(op + 8, &a, 4), std::memcpy(op + 16, &x, 4), std::memcpy(op + 20, &bl, 4);
+              o.insert(o.end(), op, op + 24);
+            }
+            std::fclose(fp);
+          }
+          return o;
+        }();
+        append_ops(w, static_cast<std::uint32_t>(w.size() / 24));
+      }
       if (prof_) append_ops(prof_->Read(), 1);
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());

@@ -422,7 +422,7 @@ class LoomPrefill {
         ~Join() { t.join(); }
       } join{enq};
       std::map<std::string, double> family_ms;
-      NpuProf* const prof = npu_->Prof();
+      NpuProf* prof = npu_->Prof();
       std::vector<double> job_ms;
       for (std::size_t i = 0; i < jobs.size(); ++i) {
         const NpuSplit::Job& w = jobs[i].words;
@@ -444,12 +444,23 @@ class LoomPrefill {
         // the job's time from its ready store to its done word (its command's setup and image switch included)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "npu cpu-driven: job %zu %s layer %u %.3f ms\n", i, jobs[i].tag.c_str(), jobs[i].layer, ms);
+        if (std::getenv("YAH_NPU_CPU_GO"))   // (diag) the job's go record: [ready value, status, polls, -]
+          std::fprintf(stderr, "npu cpu-driven: go %08x %u %u %08x\n", npu_->HostLoad(w.ready + 32),
+                       npu_->HostLoad(w.ready + 33), npu_->HostLoad(w.ready + 34), npu_->HostLoad(w.ready + 35));
         job_ms.push_back(ms);
         family_ms[jobs[i].tag] += ms;
         if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
           std::fprintf(stderr, "npu cpu-driven: job %zu (%s) stalled or failed: done %08x gate %08x\n", i,
                        jobs[i].tag.c_str(), d, w.gate);
           if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);   // e.g. an AIE status dump
+          if (NpuProf* const p = npu_->Prof(); p && std::getenv("YAH_NPU_PROF_MID")) {   // (diag) the log so far
+            const std::vector<std::uint32_t> v = p->Peek();
+            for (std::size_t r = 0; r * p->Values() < v.size(); ++r) {
+              std::fprintf(stderr, "npu prof: rec %zu", r);
+              for (std::uint32_t k = 0; k < p->Values(); ++k) std::fprintf(stderr, " %u", v[r * p->Values() + k]);
+              std::fprintf(stderr, "\n");
+            }
+          }
           for (std::uint32_t k = w.ready; k <= w.done + 16; ++k)
             if (const std::uint32_t v = npu_->HostLoad(k); v != before[k - w.ready])
               std::fprintf(stderr, "  word +%u: %08x -> %08x\n", k - w.ready, before[k - w.ready], v);
@@ -457,12 +468,22 @@ class LoomPrefill {
         }
       }
       std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+      if (prof && std::getenv("YAH_NPU_PROF_MID")) {   // (diag) every record, in log order
+        prof->Finish(0);
+        const std::vector<std::uint32_t> v = prof->Peek();
+        for (std::size_t r = 0; r * prof->Values() < v.size(); ++r) {
+          std::fprintf(stderr, "npu prof: rec %zu", r);
+          for (std::uint32_t k = 0; k < prof->Values(); ++k) std::fprintf(stderr, " %u", v[r * prof->Values() + k]);
+          std::fprintf(stderr, "\n");
+        }
+        prof = nullptr;
+      }
       if (prof) {   // one line per job: its counters (NpuProf::Finish order), for tools/npu_prof.py
         const std::vector<std::uint32_t> v = prof->Finish(jobs.size());
         std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
         for (std::size_t i = 0; i < jobs.size(); ++i) {
           std::fprintf(stderr, "npu prof: job %zu %s %.3f", i, jobs[i].tag.c_str(), job_ms[i]);
-          for (std::uint32_t k = 0; k < NpuProf::kValues; ++k) std::fprintf(stderr, " %u", v[i * NpuProf::kValues + k]);
+          for (std::uint32_t k = 0; k < prof->Values(); ++k) std::fprintf(stderr, " %u", v[i * prof->Values() + k]);
           std::fprintf(stderr, "\n");
         }
         std::vector<std::string> tags;

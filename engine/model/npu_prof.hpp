@@ -77,7 +77,17 @@ class NpuProf {
       for (std::uint32_t i = 0; i < 6; ++i) addr.push_back((1u << 20) + 0xA0660 + 4 * i);
       for (std::uint32_t i = 0; i < 6; ++i) addr.push_back((1u << 20) + 0xA0680 + 4 * i);
     }
-    addr.push_back((kRow0 << 20) + 0x340F8), addr.push_back((kRow0 << 20) + 0x340FC);   // tile (0, 2) Timer_Low / High
+    // (diag) YAH_NPU_PROF_REGS=<file>: the registers listed there (hex addresses, whitespace separated) instead
+    if (const char* f = std::getenv("YAH_NPU_PROF_REGS")) {
+      addr.clear();
+      if (std::FILE* fp = std::fopen(f, "r")) {
+        for (unsigned a = 0; std::fscanf(fp, "%x", &a) == 1;) addr.push_back(a);
+        std::fclose(fp);
+      }
+      if (addr.empty()) throw LoomError(std::string("YAH_NPU_PROF_REGS: no addresses in ") + f);
+    }
+    const std::uint32_t trow = std::getenv("YAH_NPU_PROF_SHIMTIMER") ? 0 : kRow0;   // (diag) the shim (0, 0)'s timer
+    addr.push_back((trow << 20) + 0x340F8), addr.push_back((trow << 20) + 0x340FC);   // tile (0, 2) Timer_Low / High
     nvals_ = static_cast<std::uint32_t>(addr.size());
     if (const char* e = std::getenv("YAH_NPU_PROF_MT"))
       std::sscanf(e, "%u,%u,%u,%u", &mt_[0], &mt_[1], &mt_[2], &mt_[3]);
@@ -189,17 +199,25 @@ class NpuProf {
       }
     for (std::uint32_t col = 0; col < cols_; ++col) {
       const std::uint32_t m = col << 25 | 1u << 20, sh = col << 25;
-      Write(ops, m + 0x91000, 0), Write(ops, m + 0x91004, 0), Write(ops, sh + 0x31000, 0);   // stop
-      for (std::uint32_t r = 0; r < kMt; ++r) Write(ops, m + 0x91020 + 4 * r, 0);
-      for (std::uint32_t r = 0; r < kShim; ++r) Write(ops, sh + 0x31020 + 4 * r, 0);
+      if (!ShimKeep()) Write(ops, m + 0x91000, 0), Write(ops, m + 0x91004, 0);   // stop
+      if (!ShimKeep()) Write(ops, sh + 0x31000, 0);
+      for (std::uint32_t r = 0; r < kMt && !ShimKeep(); ++r) Write(ops, m + 0x91020 + 4 * r, 0);
+      for (std::uint32_t r = 0; r < kShim && !ShimKeep(); ++r) Write(ops, sh + 0x31020 + 4 * r, 0);
       Write(ops, m + 0xA06A0, mt_sel_);
-      Write(ops, m + 0x91000, ctl(mt_[0], mt_[1])), Write(ops, m + 0x91004, ctl(mt_[2], mt_[3]));
-      Write(ops, sh + 0x31000, ctl(sh_[0], sh_[1]));
+      if (!ShimKeep()) Write(ops, m + 0x91000, ctl(mt_[0], mt_[1])), Write(ops, m + 0x91004, ctl(mt_[2], mt_[3]));
+      if (!ShimKeep()) Write(ops, sh + 0x31000, ctl(sh_[0], sh_[1]));
     }
     return ops;
   }
   std::uint32_t SetupOps() const {
-    return cols_ * kRows * (3 + kCore + kMem + 4 + 2 + 3) + cols_ * (3 + kMt + kShim + 1 + 3);
+    return cols_ * kRows * (3 + kCore + kMem + 4 + 2 + 3) + cols_ * (3 + kMt + kShim + 1 + 3) -
+           (ShimKeep() ? cols_ * (2 + kShim + 2 + kMt + 2) : 0);
+  }
+  // (diag) YAH_NPU_PROF_SHIM_KEEP=1: the jobs leave the shim and memory tile counters alone (set up elsewhere, e.g. YAH_NPU_POSTSETUP
+  // at each family switch, so they count from the switch)
+  static bool ShimKeep() {
+    static const bool on = std::getenv("YAH_NPU_PROF_SHIM_KEEP") != nullptr;
+    return on;
   }
   // words per job (kValues with the engine's 8 columns)
   std::uint32_t Values() const { return nvals_; }
@@ -225,6 +243,19 @@ class NpuProf {
       const std::uint32_t* const x = v.data() + j * Values();
       const std::uint64_t done = std::uint64_t{x[Values() - 1]} << 32 | x[Values() - 2];
       times_.push_back({done - x[0], done});
+    }
+    return v;
+  }
+  // (diag) the log as the NPU wrote it so far, without a sync (a stalled context's sync would wait behind it):
+  // whole Values() records up to the first all-zero one
+  std::vector<std::uint32_t> Peek() {
+    Flush();
+    std::vector<std::uint32_t> v;
+    for (std::uint32_t r = 0; (r + 1) * Values() <= kBytes / 4; ++r) {
+      bool any = false;
+      for (std::uint32_t k = 0; k < Values(); ++k) any |= map_[r * Values() + k] != 0;
+      if (!any) break;
+      for (std::uint32_t k = 0; k < Values(); ++k) v.push_back(std::uint32_t{map_[r * Values() + k]});
     }
     return v;
   }
