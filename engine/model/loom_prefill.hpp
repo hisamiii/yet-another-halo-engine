@@ -1184,7 +1184,8 @@ class LoomPrefill {
       if (it == geom_.end()) continue;
       const std::uint32_t bn = it->second.tokens;
       const double weight = bn >= 256 ? 1.0 : bn >= 128 ? 1.12 : 1.6;
-      const double cost = static_cast<double>((n_ + bn - 1) / bn * bn) * weight;
+      const std::size_t n = trim_row_ >= 0 && geom_.count("tailnarrow") ? 1 : n_;   // (a trimmed tail keeps one row)
+      const double cost = static_cast<double>((n + bn - 1) / bn * bn) * weight;
       if (cost < best_cost) best = h, best_cost = cost;
     }
     return best;
@@ -1202,6 +1203,7 @@ class LoomPrefill {
   // (300 tokens: 384 rows at x1.12, +2.4% with afrag). They run when their padded rows at ~0.93 the cost per row (their
   // clock-free gain) cost no more than the best of the full and the set's narrow tiles, PickGemm's untuned weights.
   bool AfChunk() const {
+    if (trim_row_ >= 0 && geom_.count("tailnarrow")) return false;   // (the trimmed tail's plain 64-token tiles)
     const auto padded = [&](std::uint32_t bn) { return static_cast<double>((n_ + bn - 1) / bn * bn); };
     double best = padded(256);
     if (std::any_of(geom_.begin(), geom_.end(),

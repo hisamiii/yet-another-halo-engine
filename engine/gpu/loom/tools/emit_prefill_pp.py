@@ -341,6 +341,10 @@ def tiles():
 # A narrow tile pads less but costs more per token row (x1.12 at 128, x1.6 at 64, measured): an 18-token prompt
 # 595 -> 404 ms with 64, a 300-token prompt 909 -> 802 ms with 128. Same values as the default tile.
 NARROW = ((128, 2), (64, 2))
+# YAH_TAIL_NARROW=1: the last layer's FFN GEMMs also get their 64-token tile ("<hal>.t64.hal"), and dispatch.txt
+# "tailnarrow 1 0 0": the trimmed tail (one kept row, LoomPrefill::Trim) runs the plain forms on one 64-token tile
+# instead of a 512-token afrag tile (layer 63 Q5_K: ffn 4.36 / down 2.24 ms at 512 tokens)
+TAIL_NARROW = os.environ.get("YAH_TAIL_NARROW", "0") == "1"
 
 
 def tkey(out):
@@ -349,7 +353,7 @@ def tkey(out):
     return re.sub(r"_rseg\d+$", "", out[:-4])
 
 
-def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
+def narrow_variants(fmt, mt, kb, B, out, outdir, kind, only=None):
     """Emit "<hal>.t<BN>.hal" for each narrow token tile of this GEMM (the tuner's "variants", else NARROW on the
     default tile), plus the tuner's per-bucket choices as "pick:<hal>:<max tokens> <max tokens> <bn> 0" rows."""
     import gen_gemm_tile as TG
@@ -358,9 +362,11 @@ def narrow_variants(fmt, mt, kb, B, out, outdir, kind):
     base, rows = TG.default_tile(fmt, kind, kb), []
     full = dataclasses.replace(base, **tiles()["tiles"].get(tkey(out), {}))
     tuned = tiles().get("variants", {}).get(tkey(out))
-    for knobs in (tuned if tuned is not None else [{"bn": bn, "wn": wn} for bn, wn in NARROW]):
+    for knobs in (tuned if tuned is not None and only is None else [{"bn": bn, "wn": wn} for bn, wn in NARROW]):
         t = dataclasses.replace(base, **knobs)
         bn = t.bn
+        if only is not None and bn != only:
+            continue
         try:
             TG.check(t)
         except ValueError:
@@ -1928,6 +1934,12 @@ def rseg_gemms(B, T, outdir):
     return out
 
 
+def last_blk(rows):
+    """The last block the prefill runs (not a next-token prediction block: one with "blk.<i>.nextn." tensors)."""
+    mtp = {nm.split(".")[1] for nm, _, _ in rows if nm.startswith("blk.") and ".nextn." in nm}
+    return max(int(nm.split(".")[1]) for nm, _, _ in rows if nm.startswith("blk.") and nm.split(".")[1] not in mtp)
+
+
 def gemm_combos(rows):
     """{(kind, fmt, port, m_tiles, k_blocks): [tensor names]} of the model's GEMM tensors; kind is kstore, residual or
     swiglu. rows: emit_prefill.parse(model)."""
@@ -2017,6 +2029,8 @@ def main():
                 geom.append(r)
                 if T > B:  # chunked sets: their last chunk may be short; a one-pass set always runs all B tokens
                     geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
+                elif TAIL_NARROW and any(t_.startswith("blk.%d.ffn_" % last_blk(rows)) for t_ in combos[(kind, fmt, port, mt, kb)]):
+                    geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k, only=64))
                 geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
             elif k == "kstore" and fmt == "q2k":
                 # Q2_K has no tile decoder; its only tensors here are the 48-row ssm_alpha / ssm_beta.
@@ -2053,7 +2067,11 @@ def main():
                 geom.append(r)
                 if T > B:
                     geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k))
+                elif TAIL_NARROW and any(t_.startswith("blk.%d.ffn_" % last_blk(rows)) for t_ in combos[(kind, fmt, port, mt, kb)]):
+                    geom.extend(narrow_variants(fmt, mt, kb, B, name(k), outdir, k, only=64))
                 geom.extend(afrag_variants(fmt, mt, kb, B, name(k), outdir, k))
+    if TAIL_NARROW and T <= B:
+        geom.append(("tailnarrow", 1, 0, 0))
     geom.extend(rseg_gemms(B, T, outdir))
 
 
