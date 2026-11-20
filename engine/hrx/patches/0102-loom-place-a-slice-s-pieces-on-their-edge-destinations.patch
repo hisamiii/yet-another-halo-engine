@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:00:00 +0100
+Subject: [PATCH] loom: place a slice's pieces on their edge destinations
+
+Edge-source coalescing composes an aliasing slice with the control-flow edge that forwards the slice's units: a loop's next-phase load lands on the loop's carried registers, without back-edge copies. Tried before the sibling fallback, a single blocker may be relocated. LOOM_EXP_NO_SLICE_EDGE=1 turns it off.
+---
+
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -5,6 +5,8 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
+ #include "loom/codegen/low/allocation/coalescing.h"
++
++#include <stdlib.h>
+ 
+ #include "loom/codegen/low/allocation/concat_affinity.h"
+ #include "loom/codegen/low/allocation/concat_reservation.h"
+@@ -2014,6 +2016,115 @@
+   }
+   return loom_low_allocation_coalescing_assign_edge_source_interval(
+       context, interval, result_ordinal, out_assigned);
++}
++
++// Places |interval| (the value |source_ordinal|) so that every unit an aliasing
++// slice of it forwards on a control-flow edge lands on that edge's already
++// assigned destination. The slice and edge relations compose into one
++// tuple-to-destination relation; the first composition that fits wins.
++static iree_status_t loom_low_allocation_coalescing_assign_slice_edge_source(
++    loom_low_allocation_coalescing_context_t* context,
++    const loom_liveness_interval_t* interval,
++    loom_value_ordinal_t source_ordinal, bool* out_assigned) {
++  *out_assigned = false;
++  // LOOM_EXP_NO_SLICE_EDGE=1: no slice-edge placement.
++  static int disabled = -1;
++  if (disabled < 0) {
++    const char* v = getenv("LOOM_EXP_NO_SLICE_EDGE");
++    disabled = v != NULL && v[0] == '1';
++  }
++  if (disabled) {
++    return iree_ok_status();
++  }
++  const loom_low_placement_relation_range_t slice_range =
++      loom_low_placement_relation_range_for_source_value_ordinal(
++          context->placement, source_ordinal);
++  for (uint32_t slice_index = 0; slice_index < slice_range.count;
++       ++slice_index) {
++    const loom_low_placement_relation_t* slice =
++        &context->placement->relations
++             [context->placement->relation_indices_by_source_ordinal
++                  [slice_range.start + slice_index]];
++    if (slice->cause != LOOM_LOW_PLACEMENT_CAUSE_LOW_SLICE ||
++        !loom_low_placement_relation_can_alias(slice)) {
++      continue;
++    }
++    const loom_low_placement_relation_range_t edge_range =
++        loom_low_placement_relation_range_for_source_value_ordinal(
++            context->placement, slice->result_ordinal);
++    for (uint32_t edge_index = 0; edge_index < edge_range.count;
++         ++edge_index) {
++      const loom_low_placement_relation_t* edge =
++          &context->placement->relations
++               [context->placement->relation_indices_by_source_ordinal
++                    [edge_range.start + edge_index]];
++      if (!loom_low_placement_cause_is_edge(edge->cause) ||
++          !loom_low_placement_relation_can_alias(edge) ||
++          edge->source_unit_offset < slice->result_unit_offset ||
++          edge->source_unit_offset + edge->unit_count >
++              slice->result_unit_offset + slice->unit_count) {
++        continue;
++      }
++      loom_low_placement_relation_t relation = *edge;
++      relation.source_ordinal = source_ordinal;
++      relation.source_unit_offset = slice->source_unit_offset +
++                                    edge->source_unit_offset -
++                                    slice->result_unit_offset;
++      if (relation.source_unit_offset + relation.unit_count >
++          interval->unit_count) {
++        continue;
++      }
++      const loom_low_allocation_assignment_t* destination_assignment =
++          loom_low_allocation_coalescing_current_assignment_for_value_ordinal(
++              context, relation.result_ordinal);
++      if (destination_assignment == NULL ||
++          !loom_low_allocation_assignment_is_register_like(
++              destination_assignment) ||
++          destination_assignment->descriptor_reg_class_id !=
++              interval->value_class.register_class_id ||
++          !loom_low_allocation_coalescing_assignment_unit_span_fits(
++              destination_assignment, relation.result_unit_offset,
++              relation.unit_count)) {
++        continue;
++      }
++      uint16_t interval_reg_class_id = LOOM_LOW_REG_CLASS_NONE;
++      IREE_RETURN_IF_ERROR(
++          loom_low_allocation_target_constraints_resolve_reg_class(
++              context->target_constraints, interval->value_class,
++              &interval_reg_class_id, NULL));
++      uint32_t source_location_base = 0;
++      if (!loom_low_allocation_storage_find_corresponding_subrange_location(
++              context->search_context->descriptor_set, interval_reg_class_id,
++              destination_assignment->location_kind, interval->unit_count,
++              relation.source_unit_offset, destination_assignment,
++              relation.result_unit_offset, relation.unit_count,
++              &source_location_base)) {
++        continue;
++      }
++      const loom_value_id_t* ignored_value_ids = NULL;
++      uint16_t ignored_value_count = 0;
++      const loom_value_id_t destination_value_id =
++          destination_assignment->value_id;
++      IREE_RETURN_IF_ERROR(
++          loom_low_allocation_coalescing_select_ignored_counterpart_value(
++              context, interval, &relation, destination_assignment,
++              &destination_value_id, relation.result_unit_offset,
++              relation.unit_count, &ignored_value_ids, &ignored_value_count));
++      IREE_RETURN_IF_ERROR(
++          loom_low_allocation_coalescing_append_interval_at_location(
++              context, interval, interval_reg_class_id,
++              destination_assignment->location_kind, source_location_base,
++              interval->unit_count, ignored_value_ids, ignored_value_count,
++              /*ignored_storage_lease_value_ids=*/NULL,
++              /*ignored_storage_lease_value_count=*/0,
++              /*may_relocate_blocker=*/true,
++              /*shared_content=*/NULL, out_assigned));
++      if (*out_assigned) {
++        return iree_ok_status();
++      }
++    }
++  }
++  return iree_ok_status();
+ }
+ 
+ static iree_status_t loom_low_allocation_coalescing_assign_edge_source_interval(
+@@ -2167,6 +2278,11 @@
+       return iree_ok_status();
+     }
+   }
++  IREE_RETURN_IF_ERROR(loom_low_allocation_coalescing_assign_slice_edge_source(
++      context, interval, source_ordinal, out_assigned));
++  if (*out_assigned) {
++    return iree_ok_status();
++  }
+   if (best_sibling_assignment != NULL) {
+     uint16_t interval_reg_class_id = LOOM_LOW_REG_CLASS_NONE;
+     IREE_RETURN_IF_ERROR(
