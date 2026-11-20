@@ -341,10 +341,11 @@ def tiles():
 # A narrow tile pads less but costs more per token row (x1.12 at 128, x1.6 at 64, measured): an 18-token prompt
 # 595 -> 404 ms with 64, a 300-token prompt 909 -> 802 ms with 128. Same values as the default tile.
 NARROW = ((128, 2), (64, 2))
-# YAH_TAIL_NARROW=1: the last layer's FFN GEMMs also get their 64-token tile ("<hal>.t64.hal"), and dispatch.txt
-# "tailnarrow 1 0 0": the trimmed tail (one kept row, LoomPrefill::Trim) runs the plain forms on one 64-token tile
-# instead of a 512-token afrag tile (layer 63 Q5_K: ffn 4.36 / down 2.24 ms at 512 tokens)
-TAIL_NARROW = os.environ.get("YAH_TAIL_NARROW", "0") == "1"
+# YAH_TAIL_NARROW (default 1; 0 = off): the last layer's FFN GEMMs also get their 64-token tile ("<hal>.t64.hal"), and
+# dispatch.txt "tailnarrow 1 0 0": the trimmed tail (one kept row, LoomPrefill::Trim) runs the plain forms on one
+# 64-token tile instead of a 512-token afrag tile (layer 63 Q5_K: 9.9 -> 4.9 ms after the last NPU wait, pp2048 layer
+# span -3 +-2 ms; logits = the 512-token form's, the unread rows of .hidden are left unwritten)
+TAIL_NARROW = os.environ.get("YAH_TAIL_NARROW", "1") == "1"
 
 
 def tkey(out):
