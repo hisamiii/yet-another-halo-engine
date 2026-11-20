@@ -1545,6 +1545,16 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = F)
         variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), F, "ffn")
         variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), F, "ffn")
+        # (GN_FFNMIXSPLIT=0: off) the fused GPU gate / up's split for the pair, AF_FFN_MIX or one AF_FFN format
+        # ("gemm_ffn_<gate>[_<up>]_<mt>_<kb>.af.to.npu.hal", ffn_fused's knobs): one GEMM instead of kstore + swiglu
+        if os.environ.get("GN_FFNMIXSPLIT", "1") != "0" and B % AF_TILE["bn"] == 0:
+            import gen_gemm_tile as TG
+            mx = (gf, uf) in AF_FFN_MIX
+            if mx or (gf == uf and gf in AF_FFN):
+                t = dataclasses.replace(TG.default_tile(gf, "swiglu", kb), **AF_TILE,
+                                        **(AF_FFN_MIX[(gf, uf)] if mx else AF_FFN[gf]), ffn=True, tout=True)
+                split(gf if gf == uf else gf + ":" + uf, "ffn", mt, kb, t,
+                      "gemm_ffn_%s_%d_%d.af.to.hal" % (gf + "_" + uf if mx else gf, mt, kb), F)
         if any(l in bsw for l in pairs if (l["ffn_gate"], l["ffn_up"]) == ((gf, mt, kb), (uf, mt, kb))):   # (BFP)
             if "npu_ffnsw_bfp_" + hord.lower() not in {j[1] for j in jobs}:
                 jobs.append((npu_cfg(B, NPU_DFR_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * 288, swcol=32,

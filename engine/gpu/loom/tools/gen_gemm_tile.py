@@ -483,7 +483,8 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %tokens = index.mul %token_tiles, %cwtok : index")
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     if OSTRIDE:
-        assert kind in ("kstore", "kres", "swiglu", "ffn", "kqg") and not MX, "the NPU column split: kstore / kres / swiglu / ffn / kqg"
+        assert kind in ("kstore", "kres", "swiglu", "ffn", "kqg") and (not MX or kind == "ffn"), \
+            "the NPU column split: kstore / kres / swiglu / ffn / kqg (mixed formats: ffn)"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
     if KWIN:
         assert kind in ("kstore", "kres") and AFRAG and t.atiled and F.get("kdiv", 1) == 1 and not (MX or OSTRIDE)
@@ -500,7 +501,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         # gate rows (bb bytes per block) then up rows (bbu)
         e(f"  %cbbs = index.constant {bb + bbu} : index")
         e("  %bprs = index.mul %k_blocks, %cbbs : index")
-        e("  %w_bytes = index.mul %m_rows, %bprs : index")
+        e(f"  %w_bytes = index.mul {orw()}, %bprs : index")   # (a split: both tensors' full rows)
         e("  %w_halfs = index.div %w_bytes, %c2 : index")
     elif ff or RSEG:
         # gate rows then up rows (RSEG: a gate / up kernel's binding over both tensors)
@@ -688,7 +689,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if MX:
         e(f"  %cbbu_i = scalar.constant {bbu} : i32")
         e("  %bpru_i = scalar.muli %k_blocks_i, %cbbu_i : i32")
-        e("  %m_rows_i = index.cast %m_rows : index to i32")
+        e(f"  %m_rows_i = index.cast {orw()} : index to i32")   # (a split: the up tensor after all gate rows)
         e("  %gate_tot_i = scalar.muli %m_rows_i, %bpr_i : i32")
         e("  %row_off_u0 = scalar.muli %grow_i, %bpru_i : i32")
         e("  %row_off_u = scalar.addi %gate_tot_i, %row_off_u0 : i32")

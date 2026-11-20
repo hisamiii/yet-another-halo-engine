@@ -1231,6 +1231,19 @@ class LoomPrefill {
     // the GPU's features: the fused ffn's split, or (pairs) gate kstore + up swiglu splits, fragment-major into ffnup_
     // (rseg: the split of that layout, its up rows F rows on, emit_prefill_pp FFUP)
     const std::string sh = pair ? "" : NpuHal(weights_.RSegOf(*tg) ? AfHal(RSegHal(GemmHal("gemm_ffn", *tg, &f), *tg), ".af.to.hal") : hal);
+    // (a pair whose gate and up rows are contiguous: the fused GPU gate / up's split when the set has it, emit_prefill_pp
+    // GN_FFNMIXSPLIT, "gemm_ffn_<gate>[_<up>]_<mt>_<kb>.af.to.npu.hal"; YAH_FFNMIXSPLIT=0: gate kstore + up swiglu)
+    static const bool mixsplit = [] { const char* e = std::getenv("YAH_FFNMIXSPLIT"); return !e || std::strcmp(e, "0"); }();
+    std::string fh;
+    if (pair && mixsplit && tu->offset == tg->offset + tg->bytes) {
+      Fmt fx{};
+      std::string b = GemmHal("gemm_ffn", *tg, &fx);
+      if (tg->type == tu->type) fh = NpuHal(AfHal(b, ".af.to.hal"));
+      if (fh.empty()) {
+        b.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
+        fh = NpuHal(AfHal(b, ".af.to.hal"));
+      }
+    }
     const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
     const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
@@ -1416,7 +1429,20 @@ class LoomPrefill {
       }
       NpuEnqueue(std::move(cdn[ci]), "ffndn" + dtag[ci]);
     }
-    if (pair) {
+    if (pair && !fh.empty()) {   // (the fused gate / up split; mixed formats bind the up format's tables after the gate's)
+      const Geom g = GeomOf(fh);
+      auto b = GemmWeights(*tg, f);
+      b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+      if (tg->type != tu->type) {
+        const auto bu = GemmWeights(*tu, fu);
+        b.insert(b.end(), bu.begin() + 1, bu.end());
+      }
+      const std::size_t first = b.size();
+      for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+      const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
+      const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (tg->type != tu->type ? "_" + std::string(fu.name) : "") + "_ffn";
+      Dispatch(Exe(fh), sym.c_str(), (M - F) / 16 / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    } else if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
       RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
     } else {

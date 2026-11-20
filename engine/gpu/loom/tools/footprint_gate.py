@@ -27,7 +27,8 @@ MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride="
 # kfull: a K window (gen_gemm_tile.KWIN) reading kb of each <kfull>-block weight row (and input row)
 KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
 # a split ffn reads the full gate tensor's rows before the up rows
-wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
+# (mixed, split: the full gate tensor's MO rows, then the up tensor's first M rows)
+wbytes = (MO * QB[fmts[0]][1] + M * QB[fmts[1]][1]) * kb if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
 # rseg (gen_gemm_tile RSEG): a gate or up kernel's weight binding over both tensors, from the gate's start
 if "rseg" in sys.argv[9:]:
     wbytes = 2 * M * KBW * bpb
