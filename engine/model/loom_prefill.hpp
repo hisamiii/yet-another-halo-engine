@@ -886,6 +886,11 @@ class LoomPrefill {
                 std::uint64_t untracked = 0) {
     if (split_armed_ && graph_ && !npu_planning_ && !warming_) SplitGraph();
     if (npu_planning_ || warming_) return;
+    // YAH_DISP_NAMES=1 (diagnostic): each recorded dispatch's HAL, kernel and grid on stderr, in record order
+    static const bool disp_names = std::getenv("YAH_DISP_NAMES") != nullptr;
+    if (disp_names)
+      for (const auto& [hal, e] : exes_)
+        if (&e == &exe) { std::fprintf(stderr, "DISPNAME %s %s %u %u %u\n", hal.c_str(), name, gx, gy, gz); break; }
     const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const std::uint32_t ws = exe.WorkgroupSize(ordinal);
     const hrx_dispatch_config_t config = LoomDevice::Config(gx, gy, gz, ws ? ws : sx, sy, sz);
