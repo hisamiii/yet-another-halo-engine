@@ -977,6 +977,14 @@ def leaf(name="dec"):
         CTP["on"] = True
     halves_s = []
     vroll = hroll or ((X2 or Q4L or VROLL[0]) and HROLL and INLINE[0])   # Q3_K, IQ2_XS, IQ2_XXS, Q4_K: the halves in a loop (program memory) instead of two interleaved streams
+    # DQ_HALFT (default 1; IQ4_XS, a K-half leaf: one record h a super-block): the T chain's lane f (the record) carries the row
+    # half instead, so one chain in half 1's stream builds record h's T for both halves (the other record's lanes were
+    # never read); its lines go where each half's record-h lines were
+    HALFT = (os.environ.get("DQ_HALFT", "1") == "1" and not vroll and FMT == "IQ4_XS" and not XXS and not GRID
+             and RREC[0] is not None and INLINE[0] == 1 and RREC[0][1] - RREC[0][0] == 1
+             and os.environ.get("DQ_T32", "1") == "1" and os.environ.get("DQ_NOTAB", "1") == "1")
+    HREC = RREC[0][0] if HALFT else 0
+    HT = {}
     if vroll:
         hv_i, _ = loop_begin("vl", 4 if Q2K else 2)   # (Q2_K: iteration 2 c + h, record c's two chains of half h)
     for h in range(1 if vroll else 2):
@@ -1190,9 +1198,23 @@ def leaf(name="dec"):
                     x(f"{LS} = vadd.8 {n2_}, {b8(33)}")
                 else:
                     x(f"{LS} = vbor {NL}, {hp}")             # ls [row][j]
-                a = lsplit(LS)
-            x(f"{hv} = vshuffle {Dv}, {Dv}, {m18}")              # d [row][f]
-            chains = [(a, hv, TC_IQ4, 0, False)]
+                a = x.t("lsr") if HALFT else lsplit(LS)
+            if HALFT:
+                lt_ = x.t("LT")
+                x(f"{lt_} = vshuffle {LS}, {LS}, {k(35)}")       # [f][s'][row]
+                if HREC:
+                    lu_ = x.t("LU")
+                    x(f"{lu_} = vshuffle {lt_}, {lt_}, {k(11)}")  # record 1 (f = 1) to the front
+                    lt_ = lu_
+                HT[h] = (lt_, Dv, pph)
+                chains = []
+                if h == 1:
+                    x(f"{a} = vshuffle {HT[0][0]}, {lt_}, {m20}")   # [s'][row][half]
+                    x(f"{hv} = vshuffle {HT[0][1]}, {Dv}, {m18}")   # d [row][half]
+                    chains = [(a, hv, TC_IQ4, 0, False)]
+            else:
+                x(f"{hv} = vshuffle {Dv}, {Dv}, {m18}")          # d [row][f]
+                chains = [(a, hv, TC_IQ4, 0, False)]
         for a, hvx, tconst, pbase, neg in chains:
             if callable(a):   # (Q2_K: the chain's ls built here)
                 a = a()
@@ -1300,7 +1322,9 @@ def leaf(name="dec"):
                         dv = x.t("dv")
                         x(f"{dv} = vshuffle {cs_[0]}, {cs_[1]}, {k(2 + f)}")
                         # Q3_K: record pbase, its lines (f, p) at 2 f + p
-                        pp_, o = x.addr(pph, (pbase * 2 * NPARTS * 64 + (2 * f + p) * 64) if Q3K or XSL else
+                        pp_, o = x.addr(HT[0][2], f * NPARTS * 64 + HREC * 2 * NPARTS * 64 + (pbase + p) * 64,
+                                        cursor="pph_w") if HALFT else x.addr(
+                                        pph, (pbase * 2 * NPARTS * 64 + (2 * f + p) * 64) if Q3K or XSL else
                                         ((pbase // 2) * 2 * NPARTS * 64 + (4 * f + 2 * (pbase % 2) + p) * 64) if Q2K
                                         else (f * 2 * NPARTS * 64 + (pbase + p) * 64), cursor="pph_w")
                         x(f"vst.512.bf16x32 {dv}, {pp_}, {o}")
