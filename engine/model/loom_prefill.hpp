@@ -1194,7 +1194,9 @@ class LoomPrefill {
   // (row 5) the swap layers' GPU gate / up split decodes the next swap layer's NPU gate / up rows into the other half
   // of a double-buffered stream: dispatch.txt "<split>.af.to.r5.npu.hal" (emit_prefill_pp RSWAP_EMIT, gen_r5fuse; its
   // two buffers after the GEMM's: the next layer's gate + up tensors, the stream half); a chunk's first swap layer, and
-  // one after a layer that could not carry it, decode with npu_swdec_iq4xs_g / _u
+  // one after a layer that could not carry it, decode with npu_swdec_<fmt>_g / _u
+  // (gen_r5kq payloads: "<split>.af.to.r5_<gate>_<up>.npu.hal" decodes a next layer of other formats; their grid
+  // tables bind between the raw weights and the stream, gate's first, each format once)
   bool R5Fuse() const {
     if (!RSwapOn()) return false;
     static const std::string sfx = ".af.to.r5.npu.hal";
@@ -1227,8 +1229,16 @@ class LoomPrefill {
   }
   struct R5Layer {
     std::string pre;
-    bool fits;   // its gate / up fit the fused kernel (gen_r5fuse: 17408 x 5120 IQ4_XS, up after gate, F 8192, no rseg)
+    std::string carrier;   // its GPU split's name before ".af.to.npu.hal" ("": it cannot carry)
+    std::string pay;       // its gate / up as a payload: "" (IQ4_XS), "_<gate>_<up>"; payok: they fit gen_r5fuse's map
+    bool payok;            // (17408 x 5120, up after gate, F 8192, no rseg)
   };
+  // (R5Fuse) layer k's split carries layer k + 1's decode: the set has that fused split
+  std::string R5Hal(std::size_t k) const {
+    if (k + 1 >= r5_.size() || r5_[k].carrier.empty() || !r5_[k + 1].payok) return "";
+    const std::string h = r5_[k].carrier + ".af.to.r5" + r5_[k + 1].pay + ".npu.hal";
+    return geom_.count(h) ? h : "";
+  }
   std::vector<R5Layer> r5_;   // (R5Fuse) the swap layers in order, recorded by the planning pass
   std::uint32_t FfnBlkF() const {
     const auto it = geom_.find("npuffnblk");
@@ -1482,22 +1492,42 @@ class LoomPrefill {
     // (R5Fuse) this swap layer's index k, its stream half k % 2; carry: its split decodes swap layer k + 1
     std::size_t r5k = 0;
     bool carry = false, carried = false;
-    const std::string r5h = sh.size() > 14 ? sh.substr(0, sh.size() - 14) + ".af.to.r5.npu.hal" : "";
+    std::string r5h;
     if (rswap && R5Fuse()) {
-      const bool fits = !pair && std::strcmp(f.name, "iq4xs") == 0 && M == 17408 && F == 8192 &&
-                        tg->dims[0] == 5120 && !weights_.RSegOf(*tg) &&
-                        tu->offset == tg->offset + tg->bytes && sh.size() > 14 &&
-                        sh.compare(sh.size() - 14, 14, ".af.to.npu.hal") == 0 && geom_.count(r5h) != 0;
+      const std::string& cs = pair ? fh : sh;   // (the carrier: the fused gate / up split)
+      const bool shape = M == 17408 && F == 8192 && tg->dims[0] == 5120 && !weights_.RSegOf(*tg);
+      const bool can = shape && cs.size() > 14 && cs.compare(cs.size() - 14, 14, ".af.to.npu.hal") == 0;
+      const bool iq4 = std::strcmp(f.name, "iq4xs") == 0 && std::strcmp(fu.name, "iq4xs") == 0;
       if (npu_planning_) {
-        r5_.push_back({pre, fits});
-        if (fits) Exe(r5h);   // (loaded here: the timed pass's first carry would load it)
+        r5_.push_back({pre, can ? cs.substr(0, cs.size() - 14) : "", iq4 ? "" : "_" + std::string(f.name) + "_" + fu.name,
+                       shape && tu->offset == tg->offset + tg->bytes});
+        if (r5_.size() > 1 && !R5Hal(r5_.size() - 2).empty())
+          Exe(R5Hal(r5_.size() - 2));   // (loaded here: the timed pass's first carry would load it)
       }
       r5k = std::find_if(r5_.begin(), r5_.end(), [&](const R5Layer& x) { return x.pre == pre; }) - r5_.begin();
       if (r5k < r5_.size()) {
-        carry = fits && r5k + 1 < r5_.size() && r5_[r5k + 1].fits;
-        carried = fits && r5k > 0 && r5_[r5k - 1].fits;
+        r5h = R5Hal(r5k);
+        carry = !r5h.empty();
+        carried = r5k > 0 && !R5Hal(r5k - 1).empty();
       }
     }
+    // (R5Fuse) the carried decode's bindings after the GEMM's: the next layer's gate + up, its grids, the stream half
+    const auto r5_bind = [&](std::vector<hrx_buffer_ref_t>& b, std::uint64_t& wmask) {
+      const std::string& np = r5_[r5k + 1].pre;
+      const auto* tgn = Find(np + "ffn_gate.weight");
+      const auto* tun = Find(np + "ffn_up.weight");
+      hrx_buffer_ref_t wn = TRef(*tgn);
+      wn.length = static_cast<std::size_t>(tgn->bytes + tun->bytes);
+      b.push_back(wn);
+      Fmt fg{}, fn{};
+      FmtOf(static_cast<std::uint32_t>(tgn->type), &fg);
+      FmtOf(static_cast<std::uint32_t>(tun->type), &fn);
+      const std::vector<hrx_buffer_ref_t> gg = GemmWeights(*tgn, fg), gn = GemmWeights(*tun, fn);
+      if (gg.size() > 1) b.push_back(gg[1]);
+      if (gn.size() > 1 && std::strcmp(fg.name, fn.name)) b.push_back(gn[1]);
+      b.push_back(AView({SwapA((r5k + 1) % 2), SwapStream()}));
+      wmask |= std::uint64_t{1} << (b.size() - 1);
+    };
     if (rswap) {
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
       const std::size_t sa = SwapA(R5Fuse() ? r5k % 2 : 0);
@@ -1607,7 +1637,9 @@ class LoomPrefill {
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
       const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
       const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (tg->type != tu->type ? "_" + std::string(fu.name) : "") + "_ffn";
-      Dispatch(Exe(fh), sym.c_str(), (M - F) / 16 / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+      std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
+      if (carry) r5_bind(b, wmask);
+      Dispatch(Exe(carry ? r5h : fh), sym.c_str(), (M - F) / 16 / g.rowgrp, tt, 1, 32, 1, 1, b, wmask);
     } else if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
       RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
@@ -1619,16 +1651,7 @@ class LoomPrefill {
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
       const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
       std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
-      if (carry) {   // (R5Fuse) swap layer k + 1's NPU gate / up rows into the other stream half
-        const std::string& np = r5_[r5k + 1].pre;
-        const auto* tgn = Find(np + "ffn_gate.weight");
-        const auto* tun = Find(np + "ffn_up.weight");
-        hrx_buffer_ref_t wn = TRef(*tgn);
-        wn.length = static_cast<std::size_t>(tgn->bytes + tun->bytes);
-        b.push_back(wn);
-        b.push_back(AView({SwapA((r5k + 1) % 2), std::size_t{F} * 5120 * 9 / 4}));
-        wmask |= std::uint64_t{1} << (b.size() - 1);
-      }
+      if (carry) r5_bind(b, wmask);   // (R5Fuse) swap layer k + 1's NPU gate / up rows into the other stream half
       const std::string& gh = carry ? r5h : sh;
       Dispatch(Exe(gh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(gh).rowgrp, tt, 1,
                32, 1, 1, b, wmask);
