@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -171,6 +172,8 @@ class LoomPrefill {
         p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls(true) *
                                                            NpuBytesOf("npubytes4_ffndn" + tag).c);
     }
+    if (OutCAfterH())   // (PanelQ: the out site's C after the FFN block's H, from FfnBlkDown)
+      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + need("out").c_bytes);
     p.dcol = geom_.count("npudcol") != 0;
     p.gfirst = geom_.count("npugfirst") != 0;
     p.depth1 = geom_.count("npudepth1") != 0;
@@ -1267,6 +1270,20 @@ class LoomPrefill {
   // (gen_r5kq payloads: "<split>.af.to.r5_<gate>_<up>.npu.hal" decodes a next layer of other formats; their grid
   // tables bind between the raw weights and the stream, gate's first, each format once)
   // (row 5 swap) the FFN norm writes the token panel: the set has its "_pn" forms; YAH_NPU_RSWAP_PANEL=0: off
+  // YAH_NPU_PANELQ=1 with a panel swap image (dispatch.txt "npupanel", npu's YAH_NPU_PANEL emit): a carried swap
+  // layer's FFN norm runs in token quarters (YAH_EMIT_PANELQ's "<pn>_q<q>.hal") and opens the swap job's panel q
+  // after quarter q (gate - 48 + 16 q, NpuSplit::NewJob's panel form; the job's own final store opens the last).
+  // The out site's C then sits after the swap's H (FfnBlkDown): panel 0's H writes must not reach the out C that
+  // quarters 1-3 still read.
+  bool PanelQ() const {
+    static const bool on = [] { const char* e = std::getenv("YAH_NPU_PANELQ"); return e && std::strcmp(e, "1") == 0; }();
+    return on && geom_.count("npupanel") != 0;
+  }
+  // (diag) YAH_NPU_OUTC_AFTER_H=1: only PanelQ's C placement (the out site's C after the FFN block's H)
+  bool OutCAfterH() const {
+    static const bool on = std::getenv("YAH_NPU_OUTC_AFTER_H") != nullptr;
+    return (on || PanelQ()) && FfnBlkF();
+  }
   bool PanelNorm() const {
     static const bool off = [] { const char* e = std::getenv("YAH_NPU_RSWAP_PANEL"); return e && std::strcmp(e, "0") == 0; }();
     if (off || !RSwapOn()) return false;
@@ -1467,7 +1484,8 @@ class LoomPrefill {
                       !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && apass == 0 &&
                       geom_.at("npurswap").tokens == F && B_ % 512 == 0 && parts[0].p % 4 == 0;
     const bool panel = rsw0 && !dfr && PanelNorm();
-    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk", false, panel);
+    const bool panelq = panel && PanelQ();   // (the norm runs below, once the swap's calls are bound)
+    if (!panelq) RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk", false, panel);
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
     // (a mixed pair of one format, emit_prefill_pp NPU_SAME_SW: up follows gate in the GGUF, like a single format's)
@@ -1682,6 +1700,10 @@ class LoomPrefill {
                                         (rows - 1) * srb(ci) + (16 + u.p - u.r) * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
       }
+    }
+    if (panelq) {   // (PanelQ) a carried layer's weights are decoded already: reserve the job, the quarters open it
+      if (carried && !npu_planning_) panel_job_ = npu_->NewJob(csw);
+      RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, "ffnblk", false, panel);
     }
     // (padded parts) H's pad units zeroed (npu_zpad_<F>.hal): the GPU's write of C orders before the job's gate store
     // (NpuEnqueue: the store writes C), after every joined job's C
@@ -1932,6 +1954,10 @@ class LoomPrefill {
           const LoomExecutable& qe = Exe(stem + "_q" + std::to_string(q) + ".hal");
           Dispatch(qe, "yah_half_norm", B_ / 16, 1, 1, qe.WorkgroupSize(qe.OrdinalOrZero("yah_half_norm")), 1, 1, ob,
                    (1u << 3) | (1u << 7) | (1u << 8));
+          if (panel_job_ && q < 3 && !npu_planning_)   // (PanelQ) panel q open: its W panel and A are written
+            graph_->AtomicStore(FlagWord(panel_job_->ready), panel_job_->gate - 3 * 16 + 16 * q,
+                                HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
+                                {Ref(npu_->A()), Ref(npu_->W())}, {Ref(npu_->C())});
         }
       } else {
         const LoomExecutable& exe = Exe(stem + ".hal");
@@ -2239,11 +2265,13 @@ class LoomPrefill {
     hrx_buffer_ref_t c;
   };
   // The job's calls; tag names it in the NPU stats. Returns its index in this chunk (NpuJoin).
+  // (PanelQ) the swap job's words, reserved before its FFN norm's quarters (the next NpuEnqueue takes them)
+  std::optional<NpuSplit::Job> panel_job_;
   std::uint32_t NpuEnqueue(std::vector<std::uint32_t> calls, std::string tag, NpuSide side = {}) {
     const std::uint32_t job = npu_job_++;
     if (npu_planning_) return job;
     if (side.a.empty()) side = {{Ref(npu_->A())}, Ref(npu_->C())};
-    const NpuSplit::Job words = npu_->NewJob(calls);
+    const NpuSplit::Job words = panel_job_ ? *std::exchange(panel_job_, std::nullopt) : npu_->NewJob(calls);
     graph_->AtomicStore(FlagWord(words.ready), words.gate, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, side.a,
                         {side.c});
     flagged_.push_back({std::move(calls), std::move(tag), words, layer_});
@@ -2487,7 +2515,7 @@ class LoomPrefill {
       const std::string sh = nn ? NpuHal(fused) : "";
       if (!sh.empty()) {
         const auto a = NpuEncode(site, input, af, NpuPk(wname));
-        std::size_t c_off = 0;
+        std::size_t c_off = OutCAfterH() && !std::strcmp(site, "out") ? FfnBlkDown() : 0;   // (PanelQ)
         const auto w = NpuRawRows(site, wname, nn);
         std::vector<std::uint32_t> calls;
         const NpuView c = NpuCalls(site, a, w, c_off, calls, wname);
