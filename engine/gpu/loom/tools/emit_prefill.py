@@ -165,6 +165,12 @@ def _spills(hal):
     return int(m.group(1)) if m else 0
 
 
+def _vgprs(hal):
+    notes = subprocess.run(["llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    m = re.search(r"\.vgpr_count:\s*(\d+)", notes)
+    return int(m.group(1)) if m else 0
+
+
 def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None, vspill=None):
     import hrx_paths
     if gate:
@@ -177,13 +183,32 @@ def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None, vspill=None)
             cmd = [hrx_paths.LOOM_COMPILE, src, "--target=amdgpu:" + tgt, "--format=amdgpu-hsaco", "--output=" + out,
                    "--compile-report=summary", "--compile-report-output=" + rep]
             r = None
-            if vtry:
-                r = subprocess.run(cmd, env={**ce, "LOOM_EXP_BUDGET": "amdgpu.vgpr=" + vtry}, capture_output=True, text=True)
+            # vtry "a,b,..": a ladder, the first budget that lands at <= 192 VGPRs within the spill cap, else the
+            # first budget's build within the cap (the r5 carriers: 208, 200, 192)
+            ladder = vtry.split(",") if vtry else []
+            first = None
+            for i, vt in enumerate(ladder):
+                o, rp = (out, rep) if len(ladder) == 1 else (out + ".vt" + vt, rep + ".vt" + vt)
+                r = subprocess.run(cmd[:-3] + ["--output=" + o, cmd[-2], "--compile-report-output=" + rp],
+                                   env={**ce, "LOOM_EXP_BUDGET": "amdgpu.vgpr=" + vt}, capture_output=True, text=True)
                 # and up to YAH_VGPR_TRY_SPILL bytes of spills (default 32): the paired kres GEMMs spill their zero
                 # accumulator init at 192 (reloads at each outer pass, none in the inner loops) and still run ~6%
                 # faster than at 216 VGPRs (7 waves), as the old pin's 190-192 did; "0": no spills
-                if (r.returncode != 0 or not os.path.exists(out) or _spills(out) > int(vspill or 0)):
+                if r.returncode != 0 or not os.path.exists(o) or _spills(o) > int(vspill or 0):
                     r = None
+                    continue
+                if len(ladder) == 1:
+                    break
+                first = first or (o, r, rp)
+                if _vgprs(o) <= 192:
+                    shutil.copyfile(o, out)
+                    shutil.copyfile(rp, rep)
+                    break
+                r = None
+            if r is None and first:
+                shutil.copyfile(first[0], out)
+                shutil.copyfile(first[2], rep)
+                r = first[1]
             if r is None:
                 r = subprocess.run(cmd, env=ce, capture_output=True, text=True)
             if r.returncode != 0 or not os.path.exists(out):
