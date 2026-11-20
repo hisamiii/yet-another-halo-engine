@@ -1828,7 +1828,15 @@ class LoomNpu {
           if (pend) append(pend->wait), pend = nullptr;
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
           // mid-job (a gate's tasks live on columns 1-2): no packets
-          append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false, false));
+          std::vector<std::uint8_t> ds =
+              DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length, false, false);
+          static int middumped = 0;   // (diag, YAH_NPU_SETUPDUMP) the first mid-job swaps' setups too
+          if (const char* sd = std::getenv("YAH_NPU_SETUPDUMP"); sd && middumped < 8) {
+            const std::string f = std::string(sd) + "/mid" + std::to_string(middumped++) + "_dec" +
+                                  std::to_string(c.k->dec) + ".delta";
+            if (FILE* fp = std::fopen(f.c_str(), "wb")) std::fwrite(ds.data(), 1, ds.size(), fp), std::fclose(fp);
+          }
+          append(ds);
           dec = c.k->dec, since = 0;
         }
         if (pend && since > 0 && !c.push_pre[since & 1].empty()) {   // (early push)
@@ -1852,6 +1860,11 @@ class LoomNpu {
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    static int cmddumped = 0;   // (diag, YAH_NPU_SETUPDUMP) the first fused commands whole
+    if (const char* sd = std::getenv("YAH_NPU_SETUPDUMP"); sd && cmddumped < 8) {
+      const std::string f = std::string(sd) + "/cmd" + std::to_string(cmddumped++) + ".bin";
+      if (FILE* fp = std::fopen(f.c_str(), "wb")) std::fwrite(bytes.data(), 1, bytes.size(), fp), std::fclose(fp);
+    }
     if (recording_) recording_->bytes.push_back(bytes);
     return {Place(bytes), dec, fam};
   }
