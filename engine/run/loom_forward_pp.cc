@@ -21,9 +21,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -265,6 +267,38 @@ int main(int argc, char** argv) {
 
     gpu.Synchronize();
     lap("pre-run");
+    // (diag, off by default) YAH_PP_SETTLE=1: the load's failed order-10 GPU allocations wake kcompactd, whose page
+    // migrations right after the load flush the NPU's SVA IOTLB (the slow NPU window). kcompactd starts only once
+    // kswapd has finished reclaiming (up to ~0.6 s after its last wake), so wait until kswapd's scans, kcompactd's
+    // wakes and the page migration count all hold still for 1 s (at most 6 s) before the timed prefill.
+    if (const char* e = std::getenv("YAH_PP_SETTLE"); e && std::strcmp(e, "1") == 0) {
+      const auto migrated = [] {
+        std::ifstream f("/proc/vmstat");
+        std::string k;
+        unsigned long long v = 0;
+        unsigned long long sum = 0, migr = 0;
+        while (f >> k >> v) {
+          if (k == "pgmigrate_success") migr = v;
+          if (k == "pgmigrate_success" || k == "pgscan_kswapd" || k == "compact_daemon_wake" ||
+              k == "compact_daemon_migrate_scanned")
+            sum += v;
+        }
+        return std::make_pair(sum, migr);
+      };
+      const auto s0 = std::chrono::steady_clock::now();
+      const auto m0 = migrated();
+      auto last = m0;
+      auto still = s0;
+      while (std::chrono::steady_clock::now() - s0 < std::chrono::seconds(6)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const auto m = migrated();
+        if (m.first != last.first) last = m, still = std::chrono::steady_clock::now();
+        else if (std::chrono::steady_clock::now() - still >= std::chrono::milliseconds(1000)) break;
+      }
+      std::fprintf(stderr, "settle: %.0f ms, %llu pages migrated meanwhile\n",
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count(),
+                   last.second - m0.second);
+    }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
     const bool chunk_ms = opt.chunk_ms;
