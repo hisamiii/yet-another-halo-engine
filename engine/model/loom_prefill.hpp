@@ -1237,10 +1237,10 @@ class LoomPrefill {
   // one before) read H and write their partials after it. Each is a job of one image family. The GPU runs the other features (the fused ffn's split) and down over them
   // (npuffnrem_<fmt>.hal, f32), then npu_unpack_ffnblk.hal writes hidden + that + the partials. Returns false if the
   // layer does not qualify.
-  // (row 5 stepping stone) YAH_NPU_RSWAP=1 on a set with dispatch.txt "npurswap" (emit_prefill_pp RSWAP_EMIT): the
-  // FFN block layers' gate / up run the swapped image (RunFfnBlock) when RSwapFmt takes both formats
+  // (row 5 stepping stone) on a set with dispatch.txt "npurswap" (emit_prefill_pp RSWAP_EMIT, default on): the FFN
+  // block layers' gate / up run the swapped image (RunFfnBlock) when RSwapFmt takes both formats; YAH_NPU_RSWAP=0: off
   bool RSwapOn() const {
-    static const bool on = [] { const char* e = std::getenv("YAH_NPU_RSWAP"); return e && std::strcmp(e, "1") == 0; }();
+    static const bool on = [] { const char* e = std::getenv("YAH_NPU_RSWAP"); return !e || std::strcmp(e, "0") != 0; }();
     return on && geom_.count("npurswap") != 0;
   }
   // A gate / up format the swap decodes: the set has its decoders npu_swdec_<fmt>_g / _u.hal, and YAH_NPU_RSWAP_FMTS

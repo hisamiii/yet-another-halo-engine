@@ -943,14 +943,18 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 # wgt p1k); dispatch.txt "npurswap <F>", "npubytes_ffnswap". The engine uses them with YAH_NPU_RSWAP=1 only.
 # The Q' pairs' other gate / up formats get their decoders into the same stream too ("npu_swdec_<fmt>_<g|u>.hal",
 # gen_kq_bfp stream): the swap image reads bfp16 only, so it serves every format.
-RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT") == "1"
+RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT", "1") != "0"   # (default on; "0": off)
+# (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
+# (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
+R5_VTRY = "208,200,192"
+R5_SKIP = {"q3k_iq3s"}
 RSWAP_KQ = {"q4k": "Q4_K", "q5k": "Q5_K", "q3k": "Q3_K", "iq3s": "IQ3_S", "iq3xxs": "IQ3_XXS", "iq2xs": "IQ2_XS",
             "iq2s": "IQ2_S"}   # (gen_kq_bfp's formats)
 RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.py's, checked)
 # YAH_NPU_RSWAP_NB=<n> (with RSWAP_EMIT): the swap image's weight M blocks (64 stream rows) a call, a multiple of 32
 # (today's 1024 features a call); the engine reads it from npubytes_ffnswap's A bytes. 128: 2 calls a token panel
 # at F 8192, so a job loads each panel twice instead of 8 times (<= 63 blocks a row a call: 252)
-RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "32"))
+RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "128"))
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
                  GN_QSWPAIR=os.environ.get("GN_QSWPAIR", "1"))   # 8 A streams (gen_npu_q; 11-20: -53.8 ms pp2048)
@@ -1104,7 +1108,7 @@ def npu_split(rows, combos, B, outdir):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
 
-    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B, wrap=None, osfx=""):
+    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B, wrap=None, osfx="", vtry=None):
         """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride, over tokens.
         wrap(text, n, nwg, lanes): a transform of the GEMM's text that adds buffers (gen_r5fuse.fuse)."""
         mtg = mt - nn // 16
@@ -1124,7 +1128,7 @@ def npu_split(rows, combos, B, outdir):
         try:
             out.append(_emit_gen(gen, tf.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu" + osfx + ".hal", outdir, kind, tf.rowgrp,
                                  ostride=mt * 16, extra="_wrap" if wrap is not None else "",
-                                 vtry=gen_r5fuse.VGPR_TRY if wrap is not None else None))
+                                 vtry=vtry or (gen_r5fuse.VGPR_TRY if wrap is not None else None)))
         except (SystemExit, RuntimeError, ValueError) as ex:
             if tf is t:
                 raise
@@ -1516,6 +1520,46 @@ def bfp_pair_rows(layers, F, outdir):
         print("bfp pair rows: %s -> %s" % (pre, path))
 
 
+def r5_carriers(by, nn, last, split):
+    """(row 5 swap, RSWAP_EMIT) the fused splits that decode the next layer's NPU gate / up rows of other formats
+    than IQ4_XS into the swap's stream: for each layer pair (L, L + 1), layer L's fused GPU gate / up split
+    (AF_FFN or AF_FFN_MIX) with layer L + 1's formats as its payload ("<split>.af.to.r5_<gate>_<up>.npu.hal",
+    gen_r5fuse.fuse with gen_r5kq / gen_r5fuse.IQ4XS payloads), at the VGPR ladder 208, 200, 192. IQ4_XS on
+    both sides is the plain ".af.to.r5" form (above); R5_SKIP carriers decode with the standalone decoders."""
+    import gen_gemm_tile as TG
+    import gen_r5kq
+    L = [by.get(str(i), {}) for i in range(last)]   # (pairs up to (last - 2, last - 1))
+    done = set()
+    for a_, b_ in zip(L, L[1:]):
+        if not (a_.get("ffn_gate") and a_.get("ffn_up") and b_.get("ffn_gate") and b_.get("ffn_up")):
+            continue
+        (gf, mt, kb), (uf, mtu, kbu) = a_["ffn_gate"], a_["ffn_up"]
+        pg, pu = b_["ffn_gate"][0], b_["ffn_up"][0]
+        if (mt, kb) != (mtu, kbu) or (mt, kb) != b_["ffn_gate"][1:] or (gf, uf, pg, pu) == ("iq4xs",) * 4:
+            continue
+        mx = (gf, uf) in AF_FFN_MIX
+        if not (mx or (gf == uf and gf in AF_FFN)) or any(f not in gen_r5kq.PAYLOADS and f != "iq4xs" for f in (pg, pu)):
+            continue
+        car = gf + "_" + uf if mx else gf
+        if car in R5_SKIP or (car, pg, pu) in done:
+            continue
+        done.add((car, pg, pu))
+        pay1 = lambda f_, toff, pre: (gen_r5fuse.IQ4XS(tensor_offset=toff, prefix=pre) if f_ == "iq4xs"
+                                      else gen_r5kq.PAYLOADS[f_](tensor_offset=toff, prefix=pre))
+        n = mt * 16
+        if pg == pu:
+            pay = None if pg == "iq4xs" else pay1(pg, None, "pa")
+        else:
+            rbg = gen_r5fuse.RBG if pg == "iq4xs" else gen_r5kq.PAYLOADS[pg].row_bytes
+            pay = (pay1(pg, 0, "pg"), pay1(pu, n * rbg, "pu"))
+        t = dataclasses.replace(TG.default_tile(gf, "swiglu", kb), **AF_TILE,
+                                **(AF_FFN_MIX[(gf, uf)] if mx else AF_FFN[gf]), ffn=True, tout=True)
+        split(gf if gf == uf else gf + ":" + uf, "ffn", mt, kb, t,
+              "gemm_ffn_%s_%d_%d.af.to.r5%s.hal" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu)), nn,
+              wrap=lambda text, n_, nwg, lanes, p_=pay: gen_r5fuse.fuse(text, n_, nwg, lanes, pay=p_),
+              vtry=R5_VTRY)
+
+
 def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split / variants: npu_split's) and its NPU images
     (returned as npu_images extra jobs); dispatch.txt "npuffnblk <F>", "npubytes_ffnsw" / "npubytes_ffndn<passes>"."""
@@ -1529,6 +1573,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         p = nm.split(".")
         if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    last = last_blk(rows)   # (r5_carriers: the last layer, the tail, does not swap)
     fmts, dfmts = FUSE_FFN_FMTS, FUSE_FFN_DOWN_FMTS
     # H's k-block order: the down decoder's (P4 but Q4_K's; Q': P4, Q4_K's down decodes in P4 order, gord "GF")
     hord_of = lambda d: "Q4K" if d == "q4k" and not NPU_Q else "P4"
@@ -1570,6 +1615,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     mixed = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
     bsw = [l for l in pairs if l not in mixed]
     bfp_pair_rows({"blk.%s." % n for n, l in by.items() if l in bsw}, F, outdir)
+    if RSWAP_EMIT and FS == gen_r5fuse.F:
+        r5_carriers(by, F, last, split)
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
