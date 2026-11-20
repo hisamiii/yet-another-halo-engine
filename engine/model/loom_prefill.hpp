@@ -143,7 +143,10 @@ class LoomPrefill {
       const auto it = geom_.find("npusplit_" + site);
       NpuPlan q;
       if (it == geom_.end()) return q;
-      const std::size_t calls = it->second.tokens / NpuCallRows();
+      std::size_t rows = it->second.tokens;   // (and the largest per-layer row, "npusplit_<site>@<L>")
+      for (auto j = geom_.lower_bound("npusplit_" + site + "@"); j != geom_.end() && j->first.rfind("npusplit_" + site + "@", 0) == 0; ++j)
+        rows = std::max<std::size_t>(rows, j->second.tokens);
+      const std::size_t calls = rows / NpuCallRows();
       for (const auto& [k0, K] : NpuChunks(site)) {
         const NpuBytes nb = NpuK(K);
         q.a_bytes += nb.a, q.c_bytes += calls * nb.c;
@@ -229,7 +232,7 @@ class LoomPrefill {
   // npu (built from npu_plan()) outlives this object.
   void EnableNpu(NpuSplit* npu) {
     for (const auto& [name, g] : geom_)
-      if (name.rfind("npusplit_", 0) == 0) npu_rows_[name.substr(9)] = g.tokens;
+      if (name.rfind("npusplit_", 0) == 0 && name.find('@') == std::string::npos) npu_rows_[name.substr(9)] = g.tokens;
       else if (name.rfind("npusplit4_", 0) == 0) npu_rows4_[name.substr(10)] = g.tokens;
     ffnblk_ = FfnBlkF();
     if (!npu || (npu_rows_.empty() && !ffnblk_)) throw LoomError("prefill: the set has no NPU split");
@@ -241,6 +244,10 @@ class LoomPrefill {
     std::size_t rem = 0;
     for (const auto& [site, rows] : npu_rows_)
       if (NpuRem(site)) rem = std::max<std::size_t>(rem, std::size_t{B_} * rows * 4);
+    for (const auto& [name, g] : geom_)   // (and the per-layer rows, "npusplit_<site>@<L>")
+      if (name.rfind("npusplit_", 0) == 0 && name.find('@') != std::string::npos &&
+          NpuRem(name.substr(9, name.find('@') - 9)))
+        rem = std::max<std::size_t>(rem, std::size_t{B_} * g.tokens * 4);
     if (rem) npurem_ = &Alloc(rem);
     if (ffnblk_ && geom_.count("npu_unpack_ffnblk.hal")) ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);   // (npuffnrem)
     if (std::getenv("YAH_NPU_WAITLOG")) {
@@ -1764,10 +1771,24 @@ class LoomPrefill {
 
   // The out site's sum (hidden + the NPU's rows' C + their K remainder; the GPU's rows are in hidden2 already) into
   // hidden(), if RunResidual left it pending.
-  std::string OnormHal() const { return out_np4_ ? "npu_onorm_4.hal" : "npu_onorm.hal"; }
+  std::string OnormHal() const { return RowsHal(out_np4_ ? "npu_onorm_4.hal" : "npu_onorm.hal", "out", out_nn_, out_np4_); }
+  // A site's row-baked HAL (unpack, out's sum) for nn NPU rows: the set's own at its rows, else the per-layer variant
+  // "<hal minus .hal>_n<nn>.hal" (emit_prefill_pp YAH_NPU_SPLIT_LAYERS)
+  std::string QkvHal2(const std::string& hal, const std::string& wqkv, std::uint32_t nq) const {
+    return RowsHal(hal, "qkv", nq, Np4(wqkv));
+  }
+  std::string QkvHal(const std::string& base, const std::string& wqkv, std::uint32_t nq) const {
+    return RowsHal(Np4Hal(base, wqkv), "qkv", nq, Np4(wqkv));
+  }
+  std::string RowsHal(const std::string& hal, const char* site, std::uint32_t nn, bool np4) const {
+    const auto& m = np4 ? npu_rows4_ : npu_rows_;
+    const auto it = m.find(site);
+    if (hal.empty() || !nn || it == m.end() || it->second == nn) return hal;
+    return hal.substr(0, hal.size() - 4) + "_n" + std::to_string(nn) + ".hal";
+  }
   void FlushOut() {
     if (!out_pending_.length) return;
-    NpuUnpack(out_np4_ ? "npu_unpack_out_4.hal" : "npu_unpack_out.hal", std::exchange(out_pending_, {}),
+    NpuUnpack(RowsHal(out_np4_ ? "npu_unpack_out_4.hal" : "npu_unpack_out.hal", "out", out_nn_, out_np4_), std::exchange(out_pending_, {}),
               {Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * out_nn_ * 4}, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
   }
@@ -1929,8 +1950,16 @@ class LoomPrefill {
     const auto it = npu_rows_.find(site);
     return npu_on_ && it != npu_rows_.end() ? it->second : 0;
   }
-  // A site's NPU rows on wname (its format's image family: Np4).
+  // A site's NPU rows on wname (its format's image family: Np4). A per-layer row (dispatch.txt "npusplit_<site>@<L>",
+  // emit_prefill_pp YAH_NPU_SPLIT_LAYERS; L from wname's "blk.<L>.") overrides the set's rows for that layer.
   std::uint32_t NpuRows(const char* site, const std::string& wname) const {
+    if (npu_on_ && wname.rfind("blk.", 0) == 0) {
+      const auto it = geom_.find(std::string("npusplit_") + site + "@" + wname.substr(4, wname.find('.', 4) - 4));
+      if (it != geom_.end()) {
+        if (it->second.tokens % NpuCallRows(Np4(wname))) throw LoomError("prefill: " + it->first + " is not whole NPU calls");
+        return it->second.tokens;
+      }
+    }
     if (!Np4(wname)) return NpuRows(site);
     const auto it = npu_rows4_.find(site);
     return npu_on_ && it != npu_rows4_.end() ? it->second : 0;
@@ -2515,7 +2544,7 @@ class LoomPrefill {
     // an afrag o-projection reads the attention output fragment-major (wmma_t)
     const bool o_af = Af("gemm_kres", pre + "attn_output.weight");
     const std::uint32_t nq = NpuOk(pre + "attn_q.weight") ? NpuRows("q", pre + "attn_q.weight") : 0;   // (a format without a decoder: GPU)
-    const std::string qs = nq ? NpuHal(KqgHal(pre + "attn_q.weight", q_af)) : "";
+    const std::string qs = nq ? RowsHal(NpuHal(KqgHal(pre + "attn_q.weight", q_af)), "q", nq, Np4(pre + "attn_q.weight")) : "";
     bool qg_fused = !qs.empty();
     if (gsig_ && qg_fused) throw LoomError("the kqg GEMM's sigmoid gate (gsig) needs the GPU kqg GEMM, not the NPU's");
     if (qsplit_ && qg_fused) throw LoomError("the kqg GEMM's split q norm (qsplit) needs the GPU kqg GEMM, not the NPU's");
@@ -2534,7 +2563,8 @@ class LoomPrefill {
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
       NpuJoin();
-      NpuUnpack(Np4Hal("npu_unpack_q", pre + "attn_q.weight"), c, {Ref(*q_), Ref(*gate_)}, 6);
+      NpuUnpack(RowsHal(Np4Hal("npu_unpack_q", pre + "attn_q.weight"), "q", nq, Np4(pre + "attn_q.weight")), c,
+                {Ref(*q_), Ref(*gate_)}, 6);
     } else {
       // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
       const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
@@ -2706,7 +2736,7 @@ class LoomPrefill {
     const std::uint32_t nq = nok ? NpuRows("qkv", pre + "attn_qkv.weight") : 0,
                         ng = nok ? NpuRows("gate", pre + "attn_gate.weight") : 0;
     const std::string wqkv = pre + "attn_qkv.weight";
-    const std::string qkv_split = nq ? NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)) : "";
+    const std::string qkv_split = nq ? QkvHal2(NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)), pre + "attn_qkv.weight", nq) : "";
     const std::string gate_split = ng ? NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)) : "";
     // conv_c: the conv reads the NPU's qkv columns straight from C ("convkq_c.hal"); the unpack writes only the conv ring
     NpuView conv_c{}, cg{};
@@ -2733,11 +2763,11 @@ class LoomPrefill {
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
       NpuJoin(qkv_job);
-      if (geom_.count(Np4Hal("convkq_c", wqkv))) {
+      if (geom_.count(QkvHal("convkq_c", wqkv, nq))) {
         conv_c = cq;
-        NpuUnpack(Np4Hal("npu_unpack_qkv_tail", wqkv), cq, {Ref(*qkv_)}, 2);
+        NpuUnpack(QkvHal("npu_unpack_qkv_tail", wqkv, nq), cq, {Ref(*qkv_)}, 2);
       } else {
-        NpuUnpack(Np4Hal("npu_unpack_qkv", wqkv), cq, {Ref(*qkv_)}, 2);
+        NpuUnpack(QkvHal("npu_unpack_qkv", wqkv, nq), cq, {Ref(*qkv_)}, 2);
       }
     } else {
       if (ab_t) throw LoomError("prefill: " + pre + " tiled alpha / beta input without the NPU split");
@@ -2768,7 +2798,7 @@ class LoomPrefill {
                0b1100000);
     };
     if (conv_c.length) {
-      const std::string hg = Np4Hal("convkq_g", wqkv), hc = Np4Hal("convkq_c", wqkv);
+      const std::string hg = QkvHal("convkq_g", wqkv, nq), hc = QkvHal("convkq_c", wqkv, nq);
       const Geom& gg = geom_.at(hg);
       const Geom& gc = geom_.at(hc);
       Dispatch(Exe(hg), "yah_ssm_conv_kq", gg.tokens, B_ / conv_tb, 1, 256, 1, 1,
@@ -2823,7 +2853,8 @@ class LoomPrefill {
     }
     if (gate_job >= 0) {   // (the conv and DeltaNet neither read gate's C nor write the A it reads)
       NpuJoin(gate_job);
-      NpuUnpack(Np4Hal("npu_unpack_gate", pre + "attn_gate.weight"), cg, {Ref(*gate_)}, 2);
+      NpuUnpack(RowsHal(Np4Hal("npu_unpack_gate", pre + "attn_gate.weight"), "gate", ng, Np4(pre + "attn_gate.weight")), cg,
+                {Ref(*gate_)}, 2);
     }
     if (tail_ == kNoRows) {  // the recurrent state is written; nothing reads this layer's output
       if (dn_done) ring();

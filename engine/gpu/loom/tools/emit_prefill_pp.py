@@ -757,6 +757,12 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
 # itself). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A> <W per call> <C per call>", and per kernel
 # "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
 NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT", "").split(",") if x))
+# YAH_NPU_SPLIT_LAYERS="<site>@<layer>=<NPU rows>,...": per-layer NPU rows of the qkv / q sites (whole NPU calls of the
+# layer's format family; qkv: v channels only, <= 6144): dispatch.txt "npusplit_<site>@<layer> <rows>", and per row
+# count the GPU's split HALs "<hal>.npu_n<rows>.hal" and the row-baked unpacks / conv split "<name>[_4]_n<rows>.hal"
+# (LoomPrefill::NpuRows, RowsHal)
+NPU_SPLIT_LAYERS = {(k.split("@")[0], int(k.split("@")[1])): int(v) for k, v in
+                    (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT_LAYERS", "").split(",") if x)}
 # The NPU image waits for each job's ready word itself (gen_npu_gemm GATE, HRX patch 0016): no host relay sits between
 # the GPU and the NPU. dispatch.txt: "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*), and npu_flag_wait.hal
 # waits for a job's done word (gen_npu_unpack.gen_flag_wait).
@@ -1090,7 +1096,7 @@ def npu_split(rows, combos, B, outdir):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
 
-    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B, wrap=None):
+    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B, wrap=None, osfx=""):
         """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride, over tokens.
         wrap(text, n, nwg, lanes): a transform of the GEMM's text that adds buffers (gen_r5fuse.fuse)."""
         mtg = mt - nn // 16
@@ -1108,7 +1114,7 @@ def npu_split(rows, combos, B, outdir):
         else:
             gen = lambda f, k: TG.gen(f, k, tf, False)
         try:
-            out.append(_emit_gen(gen, tf.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu.hal", outdir, kind, tf.rowgrp,
+            out.append(_emit_gen(gen, tf.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu" + osfx + ".hal", outdir, kind, tf.rowgrp,
                                  ostride=mt * 16, extra="_wrap" if wrap is not None else "",
                                  vtry=gen_r5fuse.VGPR_TRY if wrap is not None else None))
         except (SystemExit, RuntimeError, ValueError) as ex:
@@ -1117,13 +1123,13 @@ def npu_split(rows, combos, B, outdir):
             # a split's narrower row group may not emit (spills): the engine runs that form unsplit
             print("npu split %s: not emitted with row group %d (%s)" % (name, tf.rowgrp, str(ex)[:120]))
 
-    def variants(fmt, kind, mt, kb, base, nn, site):
+    def variants(fmt, kind, mt, kb, base, nn, site, osfx=""):
         """Every form of GEMM base the set emits (tile_kstore, afrag_variants): its split."""
         t = TG.default_tile(fmt, kind, kb)
         if base[:-4] in tiles()["tiles"]:
             t = dataclasses.replace(t, **tiles()["tiles"][base[:-4]])
         if fmt in TILE_FMTS and mt % t.rowgrp == 0:
-            split(fmt, kind, mt, kb, t, base, nn)
+            split(fmt, kind, mt, kb, t, base, nn, osfx=osfx)
         knobs = AF.get((fmt, kind, mt, kb))
         if knobs is not None and B % AF_TILE["bn"] == 0:
             knobs = dict(knobs)
@@ -1137,15 +1143,15 @@ def npu_split(rows, combos, B, outdir):
                     TG.check(ts)
                 except ValueError:
                     ts = ta
-            split(fmt, kind, mt, kb, ts, base[:-4] + ".af.hal", nn)
+            split(fmt, kind, mt, kb, ts, base[:-4] + ".af.hal", nn, osfx=osfx)
             if kind == "swiglu":
-                split(fmt, kind, mt, kb, dataclasses.replace(ta, tout=True), base[:-4] + ".af.to.hal", nn)
+                split(fmt, kind, mt, kb, dataclasses.replace(ta, tout=True), base[:-4] + ".af.to.hal", nn, osfx=osfx)
             if persist and kind == "kres" and B // ta.bn > 1 and 2 * kb >= gen_kres_persist.SLICES:
                 pt = dataclasses.replace(ta, **persist) if isinstance(persist, dict) else ta
                 # fewer row blocks than CUs: the persistent kres over all but the last token tile, run beside the tiled
                 # kres on that tile (LoomPrefill::RunResidual)
                 if B // ta.bn > 2:
-                    split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p3.hal", nn, persist=pt, tokens=B - ta.bn)
+                    split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p3.hal", nn, persist=pt, tokens=B - ta.bn, osfx=osfx)
 
     done = set()
     images, bsites, sites4 = set(), set(), set()
@@ -1188,6 +1194,23 @@ def npu_split(rows, combos, B, outdir):
                 assert nn // 16 not in O16_MT, "the remainder writes f32"
                 out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s.hal" % (site, fmt), outdir,
                                      "kstore", tr.rowgrp, kfull=kb))
+    # per-layer rows (NPU_SPLIT_LAYERS): the GPU's split HALs per (format, site, rows); the unpacks below
+    lfmt = {}
+    for nm, dims, ty in rows:
+        if nm.startswith("blk.") and E.FMT.get(ty):
+            lfmt[nm] = E.FMT[ty][0]
+    lrows = set()   # (site, rows, np4)
+    for (site, L), nn in sorted(NPU_SPLIT_LAYERS.items()):
+        assert site in ("qkv", "q") and site in NPU_SPLIT, ("YAH_NPU_SPLIT_LAYERS: qkv / q sites of the split only", site)
+        fmt = lfmt["blk.%d.attn_%s.weight" % (L, site)]
+        assert nn % (512 if np4(fmt) else NPU_ROWS) == 0 and (site != "q" or nn % 512 == 0), (site, L, nn, fmt)
+        assert site != "qkv" or nn <= 6144, ("qkv: v channels only", L, nn)
+        skind, smt, skb = NPU_SITES[site]
+        for kind, f2, port, mt, kb in sorted(combos):
+            if (f2, mt) == (fmt, smt) and kb * qk_of(fmt) == skb * 256 and kind == "kstore" and (fmt, site, nn) not in lrows:
+                variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn, site, osfx="_n%d" % nn)
+        lrows.add((fmt, site, nn))
+        out.append(("npusplit_%s@%d" % (site, L), nn, 0, 0))
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
     encs = set()
     for site in NPU_SPLIT:
@@ -1235,7 +1258,7 @@ def npu_split(rows, combos, B, outdir):
             E.emit(src, ["yah_ssm_postnorm_fp16.head_count=%d" % (DNSPLIT[0] * B)], name, outdir)
         out.append(("npupostnormbfp", 1, 0, 0))
     # unpacks (the NP 4 formats' sites: TN 64, "_4")
-    def unpacks(site, n, sfx):
+    def unpacks(site, n, sfx, row=True):
         skind, mt, kb = NPU_SITES[site]
         N = mt * 16
         f = {"qkv": dict(out16=True), "gate": dict(out16=True), "q": dict(qg=True),
@@ -1289,9 +1312,18 @@ def npu_split(rows, combos, B, outdir):
             out.append(("npu_unpack_qkv_tail%s.hal" % sfx, n // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))   # 8 tokens x n / 8 items
             out.append(("convkq_g%s.hal" % sfx, gen_conv_kq.tiles(N - n), 256, 0))
             out.append(("convkq_c%s.hal" % sfx, n // gen_conv_kq.cw(n), gen_conv_kq.cw(n), B // gen_conv_kq.TC))
-        out.append(("npusplit%s_%s" % (sfx[1:], site), n, 0, 0))
+        if row:
+            out.append(("npusplit%s_%s" % (sfx[1:], site), n, 0, 0))
     for site, n in sorted(NPU_SPLIT.items()):
         unpacks(site, n, "")
+    for site, n, f4 in sorted({(s_, n_, np4(f_)) for f_, s_, n_ in lrows}):   # (per-layer rows' row-baked forms)
+        if n == (npu_rows4(site) if f4 else NPU_SPLIT[site]):
+            continue
+        if f4:
+            with GN.np_override(4):
+                unpacks(site, n, "_4_n%d" % n, row=False)
+        else:
+            unpacks(site, n, "_n%d" % n, row=False)
     for site in sorted(sites4):
         with GN.np_override(4):
             unpacks(site, npu_rows4(site), "_4")
