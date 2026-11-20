@@ -1315,6 +1315,51 @@ def qpair_swap(e, pair, ea, ob, tag):
         ER = "reg<aie2p.er>"
         ch = int(os.environ.get("GN_QPAIRCH", "128"))   # (the copy's piece: 128 B, 16 pieces, halves its code)
         assert ch in (128, 256)
+        if os.environ.get("GN_QPAIRLOOP", "2") == "2":
+            # 1024 / ch trips, each swapping piece q of the even KB and piece q of the odd one (disjoint areas, so the
+            # same bytes land in the same places), the byte offset q ch as the loop variable, the test at the bottom, no
+            # multiplies: 16 trips of ~43 bundles (head test + its delay slots, two MULs, the copy's load-to-store wait
+            # each trip) were ~690 a swap. The copy without padda (offsets 0, 64 fit the immediates): the up cores'
+            # program memory is full
+            assert ch == 128
+            e(f"  {x}q0 = mova.i32 0")
+            e(f"  {x}kn = mov.i32 1024")
+            e(f"  {x}kch = mova.i32 {ch}")
+            if gmask:
+                e(f"  {x}lk = mov.i32 {0xFFFF & -ch}")
+            e(f"  low.br ^qxl{tag}({x}q0: {ER})")
+            e(f"^qxl{tag}({x}qo: {ER}):")
+            e(f"  {x}ld0 = add.rr {x}ea, {x}qo")
+            e(f"  {x}ld1 = add.rr {x}ld0, {x}eo")
+            e(f"  {x}ls0 = add.rr {x}se, {x}qo")
+            e(f"  {x}ls1 = add.rr {x}ls0, {x}go")
+            srcs = []
+            for k in "01":
+                if gmask:
+                    e(f"  {x}lw{k} = and {x}ls{k}, {x}lk")
+                    e(f"  {x}lv{k} = or {x}lw{k}, {x}wb")
+                srcs.append((f"{x}lv{k}" if gmask else f"{x}ls{k}", f"{x}ld{k}"))
+            for k, (sv, dv) in enumerate(srcs):
+                e(f"  {x}sa{k} = mov.scalar-to-address {sv}")
+                e(f"  {x}da{k} = mov.scalar-to-address {dv}")
+            for k in range(2):
+                for q in range(2):
+                    e(f"  {x}v{k}{q} = vlda.512.i32x16 {x}sa{k}, {64 * q}")
+                    e(f"  {x}u{k}{q} = vldb.512.i32x16 {x}da{k}, {64 * q}")
+            for k in range(2):
+                for q in range(2):
+                    e(f"  vst.512.i32x16 {x}v{k}{q}, {x}da{k}, {64 * q}")
+                    e(f"  vst.512.i32x16 {x}u{k}{q}, {x}sa{k}, {64 * q}")
+            e(f"  {x}qn = add.rr {x}qo, {x}kch")
+            e(f"  {x}lm = lt {x}qn, {x}kn")
+            e(f"  low.cond_br {x}lm, ^qxb{tag}, ^qxj{tag} : {ER}")
+            e(f"^qxb{tag}:")
+            e(f"  low.br ^qxl{tag}({x}qn: {ER})")
+            e(f"^qxj{tag}:")
+            e(f"  rel %one, {P}")
+            e(f"  acq %am1, {P}")
+            e(f"  rel %one, {P}")
+            return
         npc, lpc = 1024 // ch, (1024 // ch).bit_length() - 1
         e(f"  {x}i0 = mova.i32 0")
         e(f"  {x}k8 = mova.i32 {2 * npc}")
