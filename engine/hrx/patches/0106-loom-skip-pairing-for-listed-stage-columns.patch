@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:45:00 +0100
+Subject: [PATCH] loom: skip pairing for listed stage columns
+
+LOOM_EXP_INGRESS_PAIR_SKIP=<c,...>: stage columns that keep one shim channel (diagnosis).
+---
+
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -1371,6 +1371,20 @@
+   return iree_ok_status();
+ }
+ 
++// LOOM_EXP_INGRESS_PAIR_SKIP=<c,c,...>: stage columns that keep one shim channel
++// (e.g. 0: column 1's second memory-to-stream channel stays free for a gate poll).
++static inline bool loom_aie2p_array_ingress_pair_skips(uint32_t column) {
++  const char* spec = getenv("LOOM_EXP_INGRESS_PAIR_SKIP");
++  while (spec != NULL && *spec != 0) {
++    char* end = NULL;
++    const unsigned long value = strtoul(spec, &end, 10);
++    if (end == spec) return false;
++    if (value == column) return true;
++    spec = *end == ',' ? end + 1 : end;
++  }
++  return false;
++}
++
+ // A staged channel's memory-tile ring: one stream-to-memory and one
+ // memory-to-stream DMA channel, a buffer descriptor per record on each, and a
+ // credit/ready lock pair.
+@@ -1544,7 +1558,8 @@
+       !loom_aie2p_array_channel_is_intake(channel) &&
+       channel->stage_column % 2u == 0 &&
+       channel->stage_column + 1u < builder->family->column_count &&
+-      channel->record_count % 2u == 0) {
++      channel->record_count % 2u == 0 &&
++      !loom_aie2p_array_ingress_pair_skips(channel->stage_column)) {
+     channel->ingress_pair = true;
+     demands->memory_tile_buffer_descriptors += 2u * channel->stage_record_count;
+     demands->memory_tile_locks += 2u;

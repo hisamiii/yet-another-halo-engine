@@ -1,0 +1,322 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:45:00 +0100
+Subject: [PATCH] loom: share a shim channel between two staged ingresses
+
+LOOM_EXP_SHIM_SHARE=<rider>:<host>: a staged ingress rides on another's shim DMA channel (own descriptors, queued after the host's), as packets (host id 1, rider id 2) parted at the host's shim switch (arbiters 2 / 3), each master dropping the header. Frees a shim channel (the swap image's gate poll). Off by default.
+---
+
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -1348,7 +1348,12 @@
+       direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM
+           ? &demands->shim_memory_to_stream_channels
+           : &demands->shim_stream_to_memory_channels;
+-  if (*directional_channel_count == totals->dma_channel_count_per_direction) {
++  // (LOOM_EXP_SHIM_SHARE: a rider takes its host's channel)
++  const bool shim_rider =
++      direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM &&
++      loom_aie2p_array_shim_share_host(channel_index) != UINT32_MAX;
++  if (!shim_rider &&
++      *directional_channel_count == totals->dma_channel_count_per_direction) {
+     const iree_string_view_t reason =
+         direction == LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM
+             ? IREE_SV(
+@@ -1365,7 +1370,7 @@
+         builder, channel_index, worker_coordinate,
+         IREE_SV("the array has no remaining shim DMA buffer descriptor"));
+   }
+-  ++*directional_channel_count;
++  if (!shim_rider) ++*directional_channel_count;
+   ++demands->shim_buffer_descriptors;
+   ++cardinalities->dma_channel_count;
+   return iree_ok_status();
+@@ -3898,7 +3903,43 @@
+                         ? channel->stage_panel_group_count
+                         : 1u));
+   }
+-  if (owns_shim_dma) {
++  // LOOM_EXP_SHIM_SHARE: the host's shim DMA channel, descriptors of its own.
++  const uint32_t shim_host =
++      owns_shim_dma && ingress ? loom_aie2p_array_shim_share_host(channel_index)
++                               : UINT32_MAX;
++  const loom_aie2p_array_dma_plan_t* shim_host_dma =
++      shim_host != UINT32_MAX &&
++              builder->channels[shim_host].sender_dma_index != UINT32_MAX
++          ? &builder->dma_channels[builder->channels[shim_host].sender_dma_index]
++          : NULL;
++  if (shim_host != UINT32_MAX) {
++    const loom_aie2p_array_tile_resources_t* host_resources =
++        shim_host_dma ? &loom_aie2p_array_tile_state(builder,
++                                                     shim_host_dma->coordinate)
++                             ->resources
++                      : NULL;
++    if (!staged || !shim_host_dma ||
++        !(shim_host_dma->flags & LOOM_AIE2P_ARRAY_DMA_FLAG_SHIM) ||
++        (uint32_t)host_resources->next_buffer_descriptor +
++                shim_descriptor_count >
++            host_resources->facts->dma.buffer_descriptor_count) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, worker->coordinate,
++          IREE_SV("a shim-shared staged ingress needs its staged host planned "
++                  "first and free descriptors on the host's shim tile"));
++    }
++    shim_proposal = (loom_aie2p_array_shim_endpoint_proposal_t){
++        .coordinate = shim_host_dma->coordinate,
++        .direction = shim_direction,
++        .dma_channel = shim_host_dma->dma_channel,
++        .buffer_descriptor_start = host_resources->next_buffer_descriptor,
++        .buffer_descriptor_count = shim_descriptor_count,
++    };
++    fprintf(stderr, "SHIMSHARE channel %u on host %u: shim (%u,0) dma %u bd %u+%u\n",
++            channel_index, shim_host, shim_proposal.coordinate.column,
++            shim_proposal.dma_channel, shim_proposal.buffer_descriptor_start,
++            shim_proposal.buffer_descriptor_count);
++  } else if (owns_shim_dma) {
+     if (!loom_aie2p_array_select_shim_endpoint(
+             builder, preferred_shim_column, shim_direction,
+             shim_descriptor_count, &shim_proposal)) {
+@@ -3923,10 +3964,22 @@
+     committed_compute = loom_aie2p_array_commit_compute_endpoint(
+         builder, channel_index, worker_endpoint->direction, &compute_proposal);
+   }
+-  const uint32_t shim_dma_index =
+-      owns_shim_dma ? loom_aie2p_array_commit_shim_endpoint(
+-                          builder, channel_index, &shim_proposal)
+-                    : source_channel->sender_dma_index;
++  uint32_t shim_dma_index = UINT32_MAX;
++  if (owns_shim_dma) {
++    // (a shared channel takes descriptors only: the tile's next channel stays)
++    loom_aie2p_array_tile_resources_t* shim_resources =
++        &loom_aie2p_array_tile_state(builder, shim_proposal.coordinate)->resources;
++    const uint8_t next_m2s = shim_resources->next_memory_to_stream_channel;
++    const uint8_t next_s2m = shim_resources->next_stream_to_memory_channel;
++    shim_dma_index = loom_aie2p_array_commit_shim_endpoint(
++        builder, channel_index, &shim_proposal);
++    if (shim_host != UINT32_MAX) {
++      shim_resources->next_memory_to_stream_channel = next_m2s;
++      shim_resources->next_stream_to_memory_channel = next_s2m;
++    }
++  } else {
++    shim_dma_index = source_channel->sender_dma_index;
++  }
+   loom_aie2p_array_dma_plan_t* compute_dma =
+       &builder->dma_channels[committed_compute.dma_index];
+   loom_aie2p_array_dma_plan_t* shim_dma =
+@@ -4053,9 +4106,14 @@
+           &builder->route_trees[channel->fill_source], source_dma->coordinate,
+           source_dma->dma_channel, fill->coordinate, fill->dma_channel, false);
+     } else {
++      // (LOOM_EXP_SHIM_SHARE: a branch of the host's fill tree; memory tiles
++      // have no east/west ports, so it parts at the host's shim switch)
+       fill_routed = loom_aie2p_array_route_ingress(
+           &builder->route_builder, channel_index,
+-          &builder->route_trees[channel->source_channel_index],
++          &builder->route_trees[shim_host != UINT32_MAX
++                                    ? builder->channels[shim_host]
++                                          .source_channel_index
++                                    : channel->source_channel_index],
+           shim_dma->coordinate,
+           shim_dma->dma_channel, fill->coordinate, LOOM_XDNA_STREAM_PORT_DMA,
+           fill->dma_channel, /*vertical_first=*/false);
+@@ -4630,8 +4688,9 @@
+     const loom_aie2p_array_endpoint_t* receiver =
+         &builder->endpoints[channel->receiver_endpoint_index];
+     if (loom_aie2p_array_channel_is_intake(channel)) continue;   // below
+-    if (loom_aie2p_array_share_payload((uint32_t)i) != UINT32_MAX) {
+-      continue;   // (after its payload: below)
++    if (loom_aie2p_array_share_payload((uint32_t)i) != UINT32_MAX &&
++        loom_aie2p_array_shim_share_host((uint32_t)i) == UINT32_MAX) {
++      continue;   // (after its payload: below; a shim rider stays in order)
+     }
+     channel->first_channel_slot = (uint32_t)builder->channel_slot_cursor;
+     switch (channel->transport) {
+@@ -4680,6 +4739,7 @@
+     // routed
+     const uint32_t share_channel = share_channels[k];
+     if (share_channel >= builder->plan->channel_count) continue;
++    if (loom_aie2p_array_shim_share_host(share_channel) != UINT32_MAX) continue;
+     loom_aie2p_array_channel_t* channel = &builder->channels[share_channel];
+     channel->first_channel_slot = (uint32_t)builder->channel_slot_cursor;
+     IREE_RETURN_IF_ERROR(loom_aie2p_array_plan_external_channel(
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -811,10 +811,31 @@
+ // LOOM_EXP_PACKET_SHARE=<channel>:<payload>[,<channel>:<payload>...]
+ // (EXPERIMENT): each core stream egress channel may borrow its payload's lanes
+ // up to the payload's receiver, as packets. Returns the pair count (<= max).
++// LOOM_EXP_SHIM_SHARE=<channel>:<host>[,...] (EXPERIMENT): a staged ingress
++// channel rides on its host staged ingress's shim DMA channel (its own
++// descriptors, queued per push after the host's): the host's descriptors carry
++// packet id 1, the channel's id 2, and the channel's fill route branches off the
++// host's at the host's memory tile, where each id picks its master and drops
++// its header. The pairs also count as LOOM_EXP_PACKET_SHARE pairs (planned after
++// their host, the branch switch configured as a part).
++static inline uint32_t loom_aie2p_array_shim_share_host(uint32_t channel) {
++  const char* env = getenv("LOOM_EXP_SHIM_SHARE");
++  while (env && *env) {
++    unsigned c = 0, h = 0;
++    int used = 0;
++    if (sscanf(env, "%u:%u%n", &c, &h, &used) != 2) break;
++    if (c == channel) return h;
++    env += used;
++    if (*env == ',') ++env;
++  }
++  return UINT32_MAX;
++}
++
+ static inline int loom_aie2p_array_share_pairs(uint32_t* channels,
+                                                uint32_t* payloads, int max) {
+-  const char* env = getenv("LOOM_EXP_PACKET_SHARE");
+   int n = 0;
++  for (int pass = 0; pass < 2; ++pass) {
++  const char* env = getenv(pass ? "LOOM_EXP_SHIM_SHARE" : "LOOM_EXP_PACKET_SHARE");
+   while (env && *env && n < max) {
+     unsigned c = 0, p = 0;
+     int used = 0;
+@@ -825,6 +846,7 @@
+     env += used;
+     if (*env == ',') ++env;
+   }
++  }
+   return n;
+ }
+ 
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -491,15 +491,18 @@
+     loom_xdna_tile_coordinate_t coordinate, uint16_t slave, uint16_t slot,
+     uint8_t id, uint8_t arbiter, uint8_t master_select) {
+   const bool mem = kind == LOOM_XDNA_TILE_KIND_MEMORY;
++  const bool shim = kind == LOOM_XDNA_TILE_KIND_SHIM_NOC;  // (LOOM_EXP_SHIM_SHARE)
+   const uint16_t slave_indices[] = {slave};
+   loom_aie2p_register_update_t config = loom_aie2p_program_resolve_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_CONFIG_ENABLE
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_CONFIG_ENABLE
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_CONFIG_ENABLE
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_CONFIG_ENABLE,
+       coordinate, slave_indices, 1);
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_CONFIG_PACKET_ENABLE
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_CONFIG_PACKET_ENABLE
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_CONFIG_PACKET_ENABLE
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_CONFIG_PACKET_ENABLE,
+       coordinate, slave_indices, 1, &config));
+   IREE_RETURN_IF_ERROR(
+@@ -507,27 +510,32 @@
+   const uint16_t slot_indices[] = {slave, slot};
+   loom_aie2p_register_update_t rule = loom_aie2p_program_resolve_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_PACKET_ID
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_PACKET_ID
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_PACKET_ID
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_PACKET_ID,
+       coordinate, slot_indices, id);
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_PACKET_MASK
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_PACKET_MASK
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_PACKET_MASK
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_PACKET_MASK,
+       coordinate, slot_indices, LOOM_AIE2P_TASK_COMPLETION_PACKET_MASK, &rule));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_ENABLE
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_ENABLE
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_ENABLE
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_ENABLE,
+       coordinate, slot_indices, 1, &rule));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_MASTER_SELECT
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_MASTER_SELECT
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_MASTER_SELECT
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_MASTER_SELECT,
+       coordinate, slot_indices, master_select, &rule));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_ARBITER
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_SLAVE_SLOT_ARBITER
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_SLAVE_SLOT_ARBITER
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_SLAVE_SLOT_ARBITER,
+       coordinate, slot_indices, arbiter, &rule));
+   return loom_aie2p_program_accumulate_route_update(builder, &rule);
+@@ -538,18 +546,21 @@
+     loom_xdna_tile_coordinate_t coordinate, uint16_t master, uint8_t arbiter,
+     uint8_t master_select, bool drop_header) {
+   const bool mem = kind == LOOM_XDNA_TILE_KIND_MEMORY;
++  const bool shim = kind == LOOM_XDNA_TILE_KIND_SHIM_NOC;  // (LOOM_EXP_SHIM_SHARE)
+   const uint16_t indices[] = {master};
+   loom_aie2p_register_update_t config = loom_aie2p_program_resolve_field_update(
+       builder->plan, loom_aie2p_program_stream_master_enable_field(kind),
+       coordinate, indices, 1);
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_MASTER_CONFIG_PACKET_ENABLE
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_MASTER_CONFIG_PACKET_ENABLE
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_MASTER_CONFIG_PACKET_ENABLE
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_MASTER_CONFIG_PACKET_ENABLE,
+       coordinate, indices, 1, &config));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+       builder->plan,
+-      mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_MASTER_CONFIG_DROP_HEADER
++      shim ? LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_STREAM_MASTER_CONFIG_DROP_HEADER
++      : mem ? LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_STREAM_MASTER_CONFIG_DROP_HEADER
+           : LOOM_XDNA_REGISTER_FIELD_CORE_STREAM_MASTER_CONFIG_DROP_HEADER,
+       coordinate, indices, drop_header ? 1 : 0, &config));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_merge_field_update(
+@@ -640,17 +651,19 @@
+                                             route->coordinate, c_dst, 0, 0,
+                                             route->dma_destination);
+   }
+-  // one slave, the id picks the master (each drops the header)
++  // one slave, the id picks the master (each drops the header); at a shim
++  // switch arbiters 2 / 3 (its completion route owns arbiter 0)
++  const uint8_t arb0 = tile->kind == LOOM_XDNA_TILE_KIND_SHIM_NOC ? 2 : 0;
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_slave(
+       builder, tile->kind, route->coordinate, c_src, 0,
+-      LOOM_AIE2P_SHARE_PAYLOAD_ID, 0, 0));
++      LOOM_AIE2P_SHARE_PAYLOAD_ID, arb0, 0));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_slave(
+       builder, tile->kind, route->coordinate, c_src, 1,
+-      LOOM_AIE2P_SHARE_CHANNEL_ID, 1, 0));
++      LOOM_AIE2P_SHARE_CHANNEL_ID, arb0 + 1, 0));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_packet_master(
+-      builder, tile->kind, route->coordinate, p_dst, 0, 0, true));
++      builder, tile->kind, route->coordinate, p_dst, arb0, 0, true));
+   return loom_aie2p_program_packet_master(builder, tile->kind,
+-                                          route->coordinate, c_dst, 1, 0, true);
++                                          route->coordinate, c_dst, arb0 + 1, 0, true);
+ }
+ 
+ static iree_status_t loom_aie2p_program_build_completion_route(
+@@ -2248,6 +2261,27 @@
+       LOOM_AIE2P_SHIM_DMA_AXI_CACHE_ENCODING, &words[5]);
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD7_VALID_BD, 1, &words[7]);
++  {
++    // LOOM_EXP_SHIM_SHARE: the host's records carry id 1, the rider's id 2.
++    const uint32_t c = binding_plan->channel_index;
++    uint32_t id = loom_aie2p_array_shim_share_host(c) != UINT32_MAX
++                      ? LOOM_AIE2P_SHARE_CHANNEL_ID : 0;
++    uint32_t sc[8], sp[8];
++    const int sn = loom_aie2p_array_share_pairs(sc, sp, 8);
++    for (int k = 0; k < sn && !id; ++k) {
++      if (sp[k] == c && loom_aie2p_array_shim_share_host(sc[k]) == c) {
++        id = LOOM_AIE2P_SHARE_PAYLOAD_ID;
++      }
++    }
++    if (id) {
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD2_ENABLE_PACKET, 1,
++          &words[2]);
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD2_PACKET_ID, id,
++          &words[2]);
++    }
++  }
+   // A request pair: the tick's descriptors release the shared shim lock once
+   // per record, the poll's acquire it before each read.
+   const loom_aie2p_array_channel_t* channel =

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hisamiii <265242552+hisamiii@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:45:00 +0100
+Subject: [PATCH] loom: keep a paired ingress ring in its own memory tile
+
+LOOM_EXP_INGRESS_PAIR=2: the pair ring sits in the stage's own memory tile, fed over a westward route from the east column's shim channel, so the drain reads only local memory and locks (=1's east-window drain hung the NPU). The swap image's 8 A streams (yah GN_QSWPAIR).
+---
+
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -3113,6 +3113,12 @@
+   return iree_ok_status();
+ }
+ 
++// LOOM_EXP_INGRESS_PAIR=2: the paired ingress's ring is local (see below).
++static inline bool loom_aie2p_array_ingress_pair_local(void) {
++  const char* env = getenv("LOOM_EXP_INGRESS_PAIR");
++  return env && atoi(env) == 2;
++}
++
+ // LOOM_EXP_INGRESS_PAIR: the odd records of a staged ingress (planned by
+ // loom_aie2p_array_plan_stage first): a ring as deep as the channel's own in
+ // the east neighbor memory tile, filled by that tile's stream-to-memory DMA
+@@ -3122,8 +3128,12 @@
+     loom_aie2p_array_plan_builder_t* builder, uint32_t channel_index,
+     uint16_t shim_descriptor_count) {
+   loom_aie2p_array_channel_t* channel = &builder->channels[channel_index];
++  // LOOM_EXP_INGRESS_PAIR=2 (local): the ring in the stage's own memory tile,
++  // fed from the east column's shim channel over a westward route, so the
++  // drain reads only local memory and locks (=1: the east neighbor's ring).
++  const bool local = loom_aie2p_array_ingress_pair_local();
+   const loom_xdna_tile_coordinate_t coordinate = {
+-      (uint16_t)(channel->stage_column + 1u), 1};
++      (uint16_t)(channel->stage_column + (local ? 0u : 1u)), 1};
+   loom_aie2p_array_tile_state_t* state =
+       loom_aie2p_array_tile_state(builder, coordinate);
+   loom_aie2p_array_tile_resources_t* resources = &state->resources;
+@@ -3156,8 +3166,9 @@
+   }
+   loom_aie2p_array_shim_endpoint_proposal_t shim_proposal = {0};
+   if (!loom_aie2p_array_select_shim_endpoint(
+-          builder, coordinate.column, LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM,
+-          shim_descriptor_count, &shim_proposal)) {
++          builder, (uint16_t)(channel->stage_column + 1u),
++          LOOM_XDNA_DMA_DIRECTION_MEMORY_TO_STREAM, shim_descriptor_count,
++          &shim_proposal)) {
+     return loom_aie2p_array_reject_channel_resources(
+         builder, channel_index, coordinate,
+         IREE_SV("no shim tile has a free memory-to-stream DMA channel for the "
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1822,7 +1822,12 @@
+       tile->memory.local_load_base +
+       plan->stage_record_offsets[dma->stage_record_base + record_slot] +
+       record_byte_offset;
+-  if (pair_fill != NULL) {
++  if (pair_fill != NULL && pair_fill->coordinate.column == dma->coordinate.column) {
++    // (LOOM_EXP_INGRESS_PAIR=2: the pair ring is local)
++    dma_address = tile->memory.local_load_base +
++                  plan->stage_record_offsets[pair_fill->stage_record_base +
++                                             record_slot];
++  } else if (pair_fill != NULL) {
+     const loom_xdna_address_window_t* window = loom_xdna_array_load_window(
+         plan->family, dma->coordinate, pair_fill->coordinate);
+     if (window == NULL) {
