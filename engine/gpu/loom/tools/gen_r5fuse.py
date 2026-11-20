@@ -367,13 +367,41 @@ def fuse(text, n, nwg, lanes, pay=None):
         %<ft>g16 (ft None: t); every new name tagged with t (a pair: t = ft + "g" / ft + "u");
       decode(e, carried, ind, t="") -> 8 f32 weight names (exact), or (E i32, 8 i32 mantissa words fma(w, jq, magic))
         when the payload rounds itself; local names tagged with t.
-    Names a payload's prologue defines must not clash with the other payload's in a pair."""
+    Names a payload's prologue defines must not clash with the other payload's in a pair.
+    A pair is loop-versioned (VERSION_PAIRS): the tensor a workgroup decodes is fixed for its whole run (%G2 < 512:
+    gate), so the K loop and the epilogue run in one of two copies, each holding one payload's carried values and
+    decode (registers near a single payload's, code twice), under a result-free scf.if; R5_PAIRIF=1: the scf.if per
+    phase."""
     assert lanes == LANES and nwg >= WGS, (lanes, nwg)
     pays = _pays(pay)
-    nin, nout = n * (2 * pays[0].row_bytes if len(pays) == 1 else pays[0].row_bytes + pays[1].row_bytes), out_bytes()
+    nin = n * (2 * pays[0].row_bytes if len(pays) == 1 else pays[0].row_bytes + pays[1].row_bytes)
     extra = []
     for p in pays:
         extra += [_bufname(b) for b in p.buffers if _bufname(b) not in extra]
+    if len(pays) == 1 or not VERSION_PAIRS:
+        return _fuse(text, n, pays, nin, extra)
+    g = _fuse(text, n, pays[:1], nin, extra, mark=True).rstrip("\n").split("\n")
+    u = _fuse(text, n, pays[1:], nin, extra, mark=True).rstrip("\n").split("\n")
+    mg, mu = g.index(MARK), u.index(MARK)
+    tail = 2 if g[-2].strip().startswith("kernel.return") else 1   # (the launch's end stays outside the copies)
+    assert g[:mg] == u[:mu] and g[-tail:] == u[-tail:] and g[-1] == "}", "copies share the frame prologue and the end"
+    outer = set(re.findall(r"%[\w$.-]+", "\n".join(g[:mg])))
+    ren = lambda s: re.sub(r"%[\w$.-]+", lambda m: m.group(0) if m.group(0) in outer else m.group(0) + "_vu", s)
+    out = g[:mg] + ["  %dz_visg = index.cmp ult, %dz_G2, %dz_c512 : index",
+                    "  %dz_visu = index.cmp uge, %dz_G2, %dz_c512 : index", "  scf.if %dz_visg {"]
+    out += ["  " + ln for ln in g[mg + 1:-tail]] + ["  }", "  scf.if %dz_visu {"]
+    out += ["  " + ren(ln) for ln in u[mu + 1:-tail]] + ["  }"] + g[-tail:]
+    return "\n".join(out) + "\n"
+
+
+VERSION_PAIRS = os.environ.get("R5_PAIRIF") != "1"
+MARK = "  // r5: frame prologue end"
+
+
+def _fuse(text, n, pays, nin, extra, mark=False):
+    """fuse's body for one payload or a per-phase pair; mark: MARK after the frame prologue (the versioned pair's
+    split point)."""
+    nout = out_bytes()
     L = text.rstrip("\n").split("\n")
     assert sum("= scf.for %kp = [" in ln for ln in L) == 1
     li = next(i for i, ln in enumerate(L) if ln.startswith("} launch("))
@@ -388,6 +416,8 @@ def fuse(text, n, nwg, lanes, pay=None):
     ki = next(i for i, ln in enumerate(L) if "= scf.for %kp = [" in ln)
     P = []
     _frame_prologue(P.append, n, nin, nout)
+    if mark:
+        P.append(MARK)
     for p in pays:
         p.prologue(P.append, n, nin, nout)
     init, tys = _loads(P.append, pays, "%c0", "p", "  ")
