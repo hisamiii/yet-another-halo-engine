@@ -15,6 +15,7 @@ IQ3_XXS (98 B) / IQ2_XS (74 B) / IQ2_S (82 B): w = d (1 + 2 s) (grid / 4 or / 8)
 IQ3_XXS / IQ2_XS signs from 7-bit fields f (ksigns(f) = f | parity(f) << 7, the parity by xor folds).
 E / m: npu_dec_emit.bfp_hw, as gen_iq4xs_bfp (the exponent of max |w|, + 1 when the largest value rounds to 128).
 """
+import os
 import sys
 
 import gen_iq4xs_bfp as I
@@ -23,6 +24,7 @@ WG = I.WG
 BLK = {"Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "Q3_K": 110, "IQ3_XXS": 98, "IQ2_XS": 74, "IQ2_S": 82}
 # grid formats: the grid (tables/grid_<fmt>.bin) is a second input buffer of this many i32 words
 GRIDW = {"IQ3_S": 512, "IQ3_XXS": 256, "IQ2_XS": 1024, "IQ2_S": 2048}
+LDS = os.environ.get("KQ_LDS", "1") == "1"   # (gen_iq4xs_bfp.restage; KQ_LDS=0: 9 strided 8 B stores a lane)
 QS = {"Q4_K": 16, "Q5_K": 48}   # the qs bytes' offset in a block (Q5_K: qh 32 B at 16 first)
 
 
@@ -62,6 +64,8 @@ def gen(fmt, rows, K, stream=None):
         e("  %w_na, %out_na = buffer.assume.noalias %w, %out : buffer, buffer")
     e("  %wv = buffer.view %w_na[%base] : buffer -> view<[%nin]xi8>")
     e("  %ov = buffer.view %out_na[%base] : buffer -> view<[%nout]xi8>")
+    if LDS:
+        I.lds_decl(e, n)
     e("  %wg = kernel.workgroup.id<x> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e(f"  %cwg = index.constant {WG} : index")
@@ -71,6 +75,29 @@ def gen(fmt, rows, K, stream=None):
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def store(e, src):
+    """The fragment's 72 bytes at %frag. (diag KQ_DIAG: "nostore" guards the stores by an impossible E (loads and math
+    kept); "storeonly" stores a word of %frag instead of the values (the decode is dead code))"""
+    diag = os.environ.get("KQ_DIAG", "")
+    if diag == "storeonly":
+        e("    %dgf = index.cast %frag : index to i32")
+        I.st(e, ["%dgf"] * 18, "%frag")
+        return
+    words = I.pack(e, src)
+    if diag == "nostore":
+        e("    %dgc = scalar.constant 999 : i32")
+        e("    %dg = scalar.cmpi eq, %E1_0, %dgc : i32")
+        e("    scf.if %dg {")
+        I.st(e, words, "%frag")
+        e("    }")
+        return
+    assert not diag, diag
+    if LDS:
+        I.restage(e, words)
+        return
+    I.st(e, words, "%frag")
 
 
 def rne(e, n, x):
@@ -281,7 +308,7 @@ def body_iq3s(rows, K, stream=None):
         e(f"    %ro{r} = index.constant {r * rb} : index")
         e(f"    %blk{r} = index.add %blkb, %ro{r} : index")
         row_iq3s(e, src, r)
-    I.st(e, I.pack(e, src), "%frag")
+    store(e, src)
     e("  }")
     return L
 
@@ -378,7 +405,7 @@ def body_q3k(rows, K, stream=None):
         e(f"    %ro{r} = index.constant {r * rb} : index")
         e(f"    %blk{r} = index.add %blkb, %ro{r} : index")
         row_q3k(e, src, r)
-    I.st(e, I.pack(e, src), "%frag")
+    store(e, src)
     e("  }")
     return L
 
@@ -535,7 +562,7 @@ def body_g2(fmt, rows, K, stream=None):
         e(f"    %ro{r} = index.constant {r * rb} : index")
         e(f"    %blk{r} = index.add %blkb, %ro{r} : index")
         row_g2(e, src, fmt, r)
-    I.st(e, I.pack(e, src), "%frag")
+    store(e, src)
     e("  }")
     return L
 
@@ -591,7 +618,7 @@ def body(fmt, rows, K, stream=None):
         e(f"    %ro{r} = index.constant {r * rb} : index")
         e(f"    %blk{r} = index.add %blkb, %ro{r} : index")
         row(e, src, fmt, r)
-    I.st(e, I.pack(e, src), "%frag")
+    store(e, src)
     e("  }")
     return L
 

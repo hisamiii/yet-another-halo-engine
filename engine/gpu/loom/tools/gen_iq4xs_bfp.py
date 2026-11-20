@@ -8,12 +8,16 @@ max |w|, + 1 if a rounded mantissa leaves int8 (npu_dec_emit.bfp_hw, the NPU pan
 needed after the bump).
 One work item per fragment; adjacent items take adjacent k-blocks of one 8-row group, so a wave writes whole lines.
 """
+import os
 import re
 import sys
 
 import gen_bfp16_encode as BE
 
 WG = 256
+WAVE_B = 32 * 72   # a wave's fragments: one 2304-aligned run of 2304 B (stream and row-major)
+# stream mode: the stores restaged through LDS (restage); KQ_LDS=0: 9 strided 8 B stores a lane, 2-2.4x slower
+LDS = os.environ.get("KQ_LDS", "1") == "1"
 KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 
 
@@ -48,6 +52,8 @@ def gen(rows, K, stream=None):
     e("  %w_na, %out_na = buffer.assume.noalias %w, %out : buffer, buffer")
     e("  %wv = buffer.view %w_na[%base] : buffer -> view<[%nin]xi8>")
     e("  %ov = buffer.view %out_na[%base] : buffer -> view<[%nout]xi8>")
+    if stream and LDS:
+        lds_decl(e, n)
     e("  %wg = kernel.workgroup.id<x> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     e(f"  %cwg = index.constant {WG} : index")
@@ -149,6 +155,55 @@ def st(e, words, base):
         e(f"    %wo{n} = index.constant {8 * j} : index")
         e(f"    %wa{n} = index.add {base}, %wo{n} : index")
         e(f"    vector.store %w{n}, %ov[%wa{n}] : vector<8xi8>, view<[%nout]xi8>")
+
+
+def lds_decl(e, n):
+    """The restage's LDS: WG / 32 waves x WAVE_B bytes (n items: all live, for its barrier)."""
+    assert n % WG == 0, "the restage's barrier needs every item live"
+    e(f"  %lds_bytes = index.constant {WG // 32 * WAVE_B} : offset")
+    e("  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer")
+    e(f"  %lv = buffer.view %lds[%base] : buffer -> view<{WG // 32 * WAVE_B}xi8>")
+
+
+def restage(e, words):
+    """KQ_LDS=1: the wave's 32 fragments (one 2304-aligned 2304 B run) go to its 2304 B of LDS at the fragment's place in
+    the run, then back out as 144 contiguous 16 B chunks (lane l: chunks l + 32 r): whole lines instead of 9 strided
+    8 B stores a lane. Global bytes written: exactly the run's, as before."""
+    nl = WG // 32 * WAVE_B
+    for nm, v in (("rs_cw", WAVE_B), ("rs_c32", 32), ("rs_c16", 16)):
+        e(f"    %{nm} = index.constant {v} : index")
+    e("    %rs_nl16 = index.sub %nout, %rs_c16 : index")
+    e("    %rs_wave = index.div %tid, %rs_c32 : index")
+    e("    %rs_lane = index.rem %tid, %rs_c32 : index")
+    e("    %rs_wl = index.mul %rs_wave, %rs_cw : index")
+    e("    %rs_in = index.rem %frag, %rs_cw : index")
+    e("    %rs_gq = index.div %frag, %rs_cw : index")
+    e("    %rs_gb = index.mul %rs_gq, %rs_cw : index")          # the run's first byte
+    # (assumed, checked by the caller's layout: the fragment starts at 72 i in its run, i < 32; the run lies in out)
+    e(f"    %rs_l0x = index.add %rs_wl, %rs_in : index")
+    e(f"    %rs_l0 = index.assume %rs_l0x [range(%rs_l0x, 0, {nl - 72})] : index")
+    for j in range(9):
+        e(f"    %rs_d{j} = vector.from_elements {words[2 * j]}, {words[2 * j + 1]} : vector<2xi32>")
+        e(f"    %rs_w{j} = vector.bitcast %rs_d{j} : vector<2xi32> to vector<8xi8>")
+        e(f"    %rs_o{j} = index.constant {8 * j} : index")
+        e(f"    %rs_a{j} = index.add %rs_l0, %rs_o{j} : index")
+        e(f"    vector.store %rs_w{j}, %lv[%rs_a{j}] : vector<8xi8>, view<{nl}xi8>")
+    e("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    for r in range(5):
+        e(f"    %rs_cr{r} = index.constant {32 * r} : index")
+        e(f"    %rs_ch{r} = index.add %rs_lane, %rs_cr{r} : index")
+        e(f"    %rs_cb{r} = index.mul %rs_ch{r}, %rs_c16 : index")
+        if r == 4:   # chunks 128 .. 143: lanes 0 .. 15
+            e(f"    %rs_cl = index.constant {WAVE_B} : index")
+            e(f"    %rs_ok = index.cmp ult, %rs_cb4, %rs_cl : index")
+            e("    scf.if %rs_ok {")
+        e(f"    %rs_la{r} = index.add %rs_wl, %rs_cb{r} : index")
+        e(f"    %rs_v{r} = vector.load %lv[%rs_la{r}] : view<{nl}xi8> -> vector<16xi8>")
+        e(f"    %rs_gx{r} = index.add %rs_gb, %rs_cb{r} : index")
+        e(f"    %rs_ga{r} = index.assume %rs_gx{r} [range(%rs_gx{r}, 0, %rs_nl16)] : index")
+        e(f"    vector.store %rs_v{r}, %ov[%rs_ga{r}] : vector<16xi8>, view<[%nout]xi8>")
+        if r == 4:
+            e("    }")
 
 
 def prologue(e, rows, K, rb, koff=0, stream=None, blk=136):
@@ -255,7 +310,10 @@ def body(rows, K, p="", rstride=None, koff=0, stream=None):
             e(f"    %qx{r}_{h} = vector.extract %qw{r}[{h}] : vector<2xi32> -> i32")
             qw.append(f"%qx{r}_{h}")
         frag(e, src, r, f"%s{r}", qw, "%nsh")
-    st(e, pack(e, src), "%frag")
+    if stream and LDS:
+        restage(e, pack(e, src))
+    else:
+        st(e, pack(e, src), "%frag")
     e("  }")
     return [re.sub(r"%([A-Za-z_]\w*)", lambda m: "%" + p + m.group(1), ln) for ln in L] if p else L
 
