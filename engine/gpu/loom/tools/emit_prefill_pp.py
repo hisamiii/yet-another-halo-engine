@@ -1689,6 +1689,10 @@ def r5_carriers(by, nn, last, split):
             pay = (pay1(pg, 0, "pg"), pay1(pu, n * rbg, "pu"))
         t = dataclasses.replace(TG.default_tile(gf, "swiglu", kb), **AF_TILE,
                                 **(AF_FFN_MIX[(gf, uf)] if mx else AF_FFN[gf]), ffn=True, tout=True)
+        # (the .fp's dz_w: the raw binding the payloads read, gate's n rows then up's, clamped below n (rb_g + rb_u))
+        rb = lambda f_: gen_r5fuse.RBG if f_ == "iq4xs" else gen_r5kq.PAYLOADS[f_].row_bytes
+        E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5%s" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu))] = \
+            {"dz_w": n * (rb(pg) + rb(pu))}
         split(gf if gf == uf else gf + ":" + uf, "ffn", mt, kb, t,
               "gemm_ffn_%s_%d_%d.af.to.r5%s.hal" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu)), nn,
               wrap=lambda text, n_, nwg, lanes, p_=pay: gen_r5fuse.fuse(text, n_, nwg, lanes, pay=p_),
@@ -1762,7 +1766,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), FS)
                     if RSWAP_EMIT and fmt == "iq4xs" and sfx == ".af.to.hal" and FS == gen_r5fuse.F and kb == 20:
                         # (row 5 swap) the same split decoding another layer's NPU gate / up rows into the swap's
-                        # stream ("<hal>.af.to.r5.npu.hal", gen_r5fuse)
+                        # stream ("<hal>.af.to.r5.npu.hal", gen_r5fuse); its .fp dz_w: both tensors' raw rows
+                        E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5" % (fmt, mt, kb)] = {"dz_w": mt * 16 * 2 * gen_r5fuse.RBG}
                         split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d.af.to.r5.hal" % (fmt, mt, kb), FS,
                               wrap=gen_r5fuse.fuse)
                     if sw5 and fmt == "iq4xs":   # (the row-segmented layers' GPU rows: their up rows F rows on)

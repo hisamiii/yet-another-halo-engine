@@ -233,8 +233,30 @@ def _build(loomfile, text, tgt, ce, key, dst, seq, gate, vtry=None, vspill=None)
     _place(dst, seq, hal, json.load(open(meta))["fp"])
 
 
+# Stated bounds a caller knows better than the compiler's envelope: {HAL name stem: {root: bytes}}; a HAL whose name is
+# <stem>.<anything> gets max(envelope, bytes) on that root's .fp line (the r5 carriers' dz_w: the payloads' raw row
+# loads, which the envelope understates by ~27%: a harness sized from the .fp read 20 MB past dz_w, 11-21 08:31)
+FP_FLOOR = {}
+
+
+def _floor(dst, fp):
+    base = os.path.basename(dst)
+    fl = next((v for k, v in FP_FLOOR.items() if base.startswith(k + ".")), None)
+    if not fp or not fl:
+        return fp
+    out, seen = [], set()
+    for ln in fp.split("\n"):
+        f = ln.split()
+        if len(f) == 3 and f[0] != "grid" and f[2] in fl:
+            ln, _ = "%s %d %s" % (f[0], max(int(f[1]), fl[f[2]]), f[2]), seen.add(f[2])
+        out.append(ln)
+    assert seen == set(fl), ("FP_FLOOR roots missing from the .fp", dst, set(fl) - seen)
+    return "\n".join(out)
+
+
 def _place(dst, seq, hal, fp):
     """Copy a built HAL and its .fp (None: no .fp) to dst, unless a later emit of dst replaced this one."""
+    fp = _floor(dst, fp)
     with _lock:
         if _latest.get(dst) != seq:
             return
