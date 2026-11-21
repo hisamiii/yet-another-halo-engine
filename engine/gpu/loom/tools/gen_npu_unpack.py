@@ -46,9 +46,9 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K.
     remres (with resid and rem): rem already holds resid + the GPU's partial (its GEMM's residual epilogue): out = rem +
     the C chunks' sum (bindings c, rem, out), a summation order of its own.
-    swap = R (out16, qg or resid [+ rem], one part): C is a swap-form site image's (R rows, swapc_base, one value an
-    element)."""
-    assert not swap or ((out16 or qg or resid) and parts == 1 and not (remres or swiglu or tiled or bfp or dup)
+    swap = R (out16, qg or resid [+ rem [+ remres]]; parts > 1 with resid): C is a swap-form site image's (R rows,
+    swapc_base, one value an element); part p's C (the down in swap form: a K part's calls) p tokens R elements on."""
+    assert not swap or ((out16 or qg or resid) and (parts == 1 or resid) and not (swiglu or tiled or bfp or dup)
                         and tokens % 512 == 0 and cols * GN.TN <= swap)
     assert not remres or (resid and rem)
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
@@ -90,7 +90,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     else:
         e("} launch(%c: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
-    e(f"  %nc = index.constant {tokens * swap // 2 if swap else c_elems * nblk // 2} : index")   # bf16 pairs
+    e(f"  %nc = index.constant {tokens * swap * parts // 2 if swap else c_elems * nblk // 2} : index")   # bf16 pairs
     e(f"  %no = index.constant {tokens * stride} : index")
     if remres:
         e("  %c_na, %rem_na, %out_na = buffer.assume.noalias %c, %rem, %out : buffer, buffer, buffer")
@@ -232,9 +232,9 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         load_cg(e, "%v", "%ca")
     val = "%v"
     for p in range(1, parts):   # the K chunks' partial sums
-        e(f"  %cpo{p} = index.constant {p * c_elems} : index")
+        e(f"  %cpo{p} = index.constant {p * (tokens * swap if swap else c_elems)} : index")
         e(f"  %cpa{p} = index.add %ca, %cpo{p} : index")
-        load_cg(e, f"%cp{p}", f"%cpa{p}")
+        (load_c if swap else load_cg)(e, f"%cp{p}", f"%cpa{p}")
         e(f"  %cs{p} = vector.addf {val}, %cp{p} : vector<8xf32>")
         val = f"%cs{p}"
     if rem:   # token tok, NPU column j2 of the [tokens][TN * cols] partial (dup: output column jo of [tokens][stride])
