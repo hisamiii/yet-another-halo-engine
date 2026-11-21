@@ -983,6 +983,19 @@ RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "256" if NPU_FFNBLKS and NPU_F
 # the image's A a dense run a row (gen_npu_q GN_QAHORD), so a row may take > 64 blocks (RSWAP_NB > 256, F 8704). The
 # GPU carriers must write the same order: one switch for both.
 AHORD = os.environ.get("YAH_NPU_AHORD") == "1"
+# YAH_NPU_RSWAP_FS=<F>[,<F>...] (with RSWAP_EMIT): one more swap image a layer F' besides the FFN block's F (tile's
+# share-up, F' = F + 256 k): "npu_ffnswap_iq4xs_<F'>" at one call a token panel (NB F' / 32, > 256 needs AHORD), its
+# H rows hpass = ffnblk_apass(F') apart; dispatch.txt "npurswap_<F'> <F'>", "npubytes_ffnswap_<F'>"
+RSWAP_FS = sorted({int(v) for v in os.environ.get("YAH_NPU_RSWAP_FS", "").split(",") if v})
+
+
+def rswap_nb(F):
+    """A swap image's weight blocks a call at F features: one call a token panel when the A sender allows it."""
+    if F == NPU_FFNBLKS:
+        return RSWAP_NB
+    nb = F // 32
+    assert F % 256 == 0 and (AHORD or nb <= 256), "YAH_NPU_RSWAP_FS: F' %d needs YAH_NPU_AHORD=1" % F
+    return nb
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
                  GN_QSWPAIR=os.environ.get("GN_QSWPAIR", "1"))   # 8 A streams (gen_npu_q; 11-20: -53.8 ms pp2048)
@@ -1815,6 +1828,14 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     QJOB_ENV["npu_ffnswap_iq4xs"] = dict(RSWAP_ENV)
                     if PANEL:
                         QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QPANEL"] = str(FS // 32 // RSWAP_NB)
+                    for F_ in (f for f in RSWAP_FS if f != FS):   # (share-up layers' F')
+                        nb_, nm_ = rswap_nb(F_), "npu_ffnswap_iq4xs_%d" % F_
+                        hp_ = ffnblk_apass(F_) or ffnblk_units(F_)[0][2]
+                        jobs.append((GN.Config(NPU_COLS, nb_, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
+                                               rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=hp_, hord="P4"), nm_, 4))
+                        QJOB_ENV[nm_] = dict(RSWAP_ENV)
+                        if PANEL:
+                            QJOB_ENV[nm_]["GN_QPANEL"] = str(F_ // 32 // nb_)
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
                                  swcol=32, hpass=FS // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
@@ -2043,6 +2064,10 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             out.append(("npuhapass", 1, 0, 0))
         with GN.np_override(4):
             out.append(("npubytes_ffnswap",) + tuple(GN.stream_bytes(swj[0])))
+            for j_ in (j for j in jobs if j[1].startswith("npu_ffnswap_iq4xs_")):
+                F_ = int(j_[1].rsplit("_", 1)[1])
+                out.append(("npurswap_%d" % F_, F_, 0, 0))
+                out.append(("npubytes_ffnswap_%d" % F_,) + tuple(GN.stream_bytes(j_[0])))
     if NPU_Q:
         out.append(("npuffnq", 1, 0, 0))
         for fmt, mt, kb in sorted(DNSEG):   # (the engine reorders these formats' down rows: LoomWeights)
