@@ -997,6 +997,14 @@ AHORD = os.environ.get("YAH_NPU_AHORD") == "1"
 # share-up, F' = F + 256 k): "npu_ffnswap_iq4xs_<F'>" at one call a token panel (NB F' / 32, > 256 needs AHORD), its
 # H rows hpass = ffnblk_apass(F') apart; dispatch.txt "npurswap_<F'> <F'>", "npubytes_ffnswap_<F'>"
 RSWAP_FS = sorted({int(v) for v in os.environ.get("YAH_NPU_RSWAP_FS", "").split(",") if v})
+# YAH_NPU_SWDOWN (default on, with RSWAP_EMIT; "0": the in-core down): the FFN block's down in swap form. ffnswap writes
+# H as the down's token panels (gen_npu_q GN_QHPAN: [64-token block][128-feature group][slab][4 x 576 B]); the down
+# image "npu_swdown" (the swap site image at R 5120, 16 passes a K part, GN_QWCS: a block of H apart) reads them as
+# its W, the GPU-decoded weights as its A ("npu_swddec_<fmt>.hal": gen_iq4xs_bfp / gen_kq_bfp kdown, a K part of the
+# 17408-wide rows in H's K order); C per (K part, panel) in swapc form, read by "npu_unpack_ffnblk_sw[_rr].hal" and
+# "npu_unormsw_rr_<r|t|rt>[_pk].hal"; dispatch.txt "npuswdown", "npubytes_swdown". 11-21: checker 8.04 M a job vs
+# the in-core down's ~8.3 (both bit-exact on the checker's operands).
+SWDOWN = RSWAP_EMIT and os.environ.get("YAH_NPU_SWDOWN", "1") != "0"
 
 
 def rswap_nb(F):
@@ -1666,7 +1674,7 @@ def npu_images(images, B, tmp, outdir, extra=()):
         tl = name in os.environ.get("GN_QCYCIMG", "").split(",")   # (diag: these images with GN_QCYC stamps, GN.qtlp)
         qswap = GN.QSWAP
         try:
-            GN.QSWAP = qswap or name.startswith(("npu_ffnswap_", "npu_swsite_"))   # (RSWAP_EMIT: gen_npu_gemm reads GN_QSWAP at import)
+            GN.QSWAP = qswap or name.startswith(("npu_ffnswap_", "npu_swsite_", "npu_swdown"))   # (RSWAP_EMIT: gen_npu_gemm reads GN_QSWAP at import)
             GN.QCYC = GN.QCYC or tl
             GN.QFCYC = tl and os.environ.get("GN_QFCYC") == "1"
             with GN.np_override(np_):
@@ -1674,7 +1682,7 @@ def npu_images(images, B, tmp, outdir, extra=()):
                 text = Q.gen(cfg) if NPU_Q else GN.gen(cfg)
                 open(src, "w").write(GN.qtlp(text) if tl and os.environ.get("GN_QTLP") == "1" else text)
                 env_ = dict(hrx_paths.env(), **(Q.loom_env(cfg) if NPU_Q else GN.loom_env(cfg)))
-                if name.startswith(("npu_ffnswap_", "npu_swsite_")):
+                if name.startswith(("npu_ffnswap_", "npu_swsite_", "npu_swdown")):
                     for k_, v_ in Q.P1K_LOOM.items():
                         if k_ not in RSWAP_DROP:
                             env_.setdefault(k_, v_)
@@ -1729,7 +1737,7 @@ def npu_images(images, B, tmp, outdir, extra=()):
     out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(j0[0])),
            ("npurows", NPU_ROWS, 0, 0)]
     j4 = [j for j in jobs if NPU_Q and j[2] == 4 and j[0].fmt != "IQ4_XS" and not j[0].qsw
-          and not j[1].startswith("npu_swsite_")]
+          and not j[1].startswith(("npu_swsite_", "npu_swdown"))]
     if j4 and NPU_QP1K:   # (the NP 4 formats' site images, np4)
         with GN.np_override(4):
             out += [("npubytes4_5120",) + tuple(GN.stream_bytes(j4[0][0])), ("npurows4", NPU_COLS * 64, 0, 0)]
@@ -1967,6 +1975,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                            rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
                                  "npu_ffnswap_iq4xs", 4))
                     QJOB_ENV["npu_ffnswap_iq4xs"] = dict(RSWAP_ENV)
+                    if SWDOWN:   # (H as the swap down's token panels)
+                        assert not RSWAP_FS, "YAH_NPU_SWDOWN: not with share-up F' (YAH_NPU_RSWAP_FS)"
+                        QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QHPAN"] = "1"
                     if PANEL:
                         QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QPANEL"] = str(FS // 32 // RSWAP_NB)
                     for F_ in (f for f in RSWAP_FS if f != FS):   # (share-up layers' F')
@@ -2034,6 +2045,53 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             assert r == p and not ap
             jobs.append((npu_cfg(B, NPU_KS, p // 4, kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0],
                                  **KCHAIN(fmt)), "npu_ffndn%d_%s" % (p // 4, fmt), 4))
+    if SWDOWN:   # (the down in swap form: image, weight decoders, C readers)
+        import gen_iq4xs_bfp
+        import gen_kq_bfp
+        us, ap = ffnblk_units(F), ffnblk_apass(F)
+        assert NPU_Q and NPU_QP1K and F == FS == 8192 and B % 512 == 0 and ap == 32 and \
+            [u[1:] for u in us] == [(16, 16), (16, 16)], ("YAH_NPU_SWDOWN: two 4096 K parts in H's 32 units", F, FS, us, ap)
+        st_ = dict(ks=RSWAP_KS, passes=16, tile=64, plain=True, kdown=True)
+        jobs.append((GN.Config(NPU_COLS, 80, RSWAP_KS, 16, mu=1, gate=GN.GATE_SUPPLY, fuse=0, rawdma=0, gord="P4",
+                               qsw=False, dgu=0, hord="P4"), "npu_swdown", 4))
+        QJOB_ENV["npu_swdown"] = dict({k: v for k, v in RSWAP_ENV.items() if k != "GN_QSWHT"}, GN_QWCS=str(ap * 18432))
+        with GN.np_override(4):
+            out.append(("npubytes_swdown",) + tuple(GN.stream_bytes(jobs[-1][0])))
+        for fm_, mt_, kb_ in sorted({l["ffn_down"] for l in ok + pairs}):
+            assert fm_ in ("iq4xs", "iq4nl") or fm_ in RSWAP_KQ, ("YAH_NPU_SWDOWN: no stream decoder for", fm_)
+            nm_ = "npu_swddec_%s" % fm_
+            src = os.path.join(tmp, nm_ + ".loom")
+            # (DNSEG: a K part's rows are its own segment, 4096 wide; else the GGUF's 17408-wide rows)
+            kf_ = None if (fm_, mt_, kb_) in DNSEG else kb_ * 256
+            open(src, "w").write(gen_iq4xs_bfp.gen(5120, 4096, st_, nl=fm_ == "iq4nl", kfull=kf_)
+                                 if fm_ in ("iq4xs", "iq4nl") else gen_kq_bfp.gen(RSWAP_KQ[fm_], 5120, 4096, st_, kfull=kf_))
+            E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+            out.append((nm_ + ".hal", gen_iq4xs_bfp.items(5120, 4096), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(5120, 4096, st_)))
+        import gen_half_norm
+        cg_ = GU.CG
+        GU.CG = 1
+        try:
+            with GN.np_override(4):
+                cols_ = 5120 // GN.TN
+                for rr in (False, True):
+                    nm_ = "npu_unpack_ffnblk_sw" + ("_rr" if rr else "")
+                    src = os.path.join(tmp, nm_ + ".loom")
+                    open(src, "w").write(GU.gen(B, cols_, 5120, 0, resid=True, parts=2, rem=True, remres=rr, swap=5120))
+                    E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+                    out.append((nm_ + ".hal", B * cols_ * (GN.TN // 8) // GU.wg(cols_), GU.wg(cols_), 0))
+                if {"qkv", "q"} & set(NPU_SPLIT):
+                    for pk in (False, True):
+                        for f16 in ("r", "t", "rt"):
+                            nm_ = "npu_unormsw_rr_%s%s" % (f16, "_pk" if pk else "")
+                            src = os.path.join(tmp, nm_ + ".loom")
+                            open(src, "w").write(gen_half_norm.gen_unorm(B, list(NPU_KS), NPU_PASSES, 2, pk, remres=True,
+                                                                         f16=f16, swap=5120))
+                            E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                                         "yah_half_norm.fused=0"], nm_ + ".hal", outdir)
+                            out.append((nm_ + ".hal", B // 4, 32 * 4 * 4, 0))
+        finally:
+            GU.CG = cg_
+        out.append(("npuswdown", 1, 0, 0))
     for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], hord_of(l["ffn_down"][0]))
                                                   for l in pairs}):
         # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = F)
