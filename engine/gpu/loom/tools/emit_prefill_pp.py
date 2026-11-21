@@ -979,10 +979,16 @@ R5_PARTS = (0, 1) if R5PART else (None,)
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
 R5_VTRY = "208,200,192"
-# the gen_r5kq carriers (by their split's name, e.g. "iq3s", "iq3s_iq4xs"; "all") whose GEMM issues each k step's B a
-# step ahead (gen_gemm_tile bnext, replacing bpre / b0early) so their payload's wait hides behind it (port's pf;
-# the IQ4_XS ".af.to.r5" carrier always does); default none until each family is benched
-R5_BNEXT = {c for c in os.environ.get("YAH_NPU_R5BNEXT", "").split(",") if c}
+# the gen_r5kq carriers (split, gate payload, up payload) whose GEMM issues each k step's B a step ahead
+# (gen_gemm_tile bnext, replacing bpre / b0early) so their payload's wait hides behind it (port's pf, carrier_ab 11-21:
+# iq3s / iq3s+iq4xs +5.49 -> +3.74%, iq2s_iq2s +11.04 -> +9.92, iq2xs_iq2s +6.89 -> +5.27; iq3s's other payloads
+# share its tile). Off elsewhere: q4k / q5k payloads and iq4xs_q4k, q5k_q5k, iq3s_q3k, iq4xs_iq3s, iq3xxs_iq2s spill at
+# 192; iq3xxs, iq3xxs_iq3s, q3k_q3k, iq2s_iq3xxs, iq2xs_iq3s lose their own bpre / b0early (+1.4 .. +4.4 pt slower);
+# iq3s_iq4xs needs 200 VGPRs (recomputing its lane values per k step frees 9 loop-carried VGPRs, but the body's peak,
+# two B sets + decode temporaries at a WMMA, still spills 32 ops at 192); iq4xs + iq3s / iq4xs within noise. The IQ4_XS
+# ".af.to.r5" carrier always does.
+R5_BNEXT = {("iq3s", "iq3s", "iq4xs"), ("iq3s", "q3k", "iq3s"), ("iq3s", "iq4xs", "iq4xs"), ("iq3s", "iq3s", "iq3s"),
+            ("iq2s_iq2s", "iq3xxs", "iq2s"), ("iq2xs_iq2s", "iq3s", "q3k")}
 R5_SKIP = {"q3k_iq3s"}
 RSWAP_KQ = {"q4k": "Q4_K", "q5k": "Q5_K", "q3k": "Q3_K", "iq3s": "IQ3_S", "iq3xxs": "IQ3_XXS", "iq2xs": "IQ2_XS",
             "iq2s": "IQ2_S", "q2k": "Q2_K"}   # (gen_kq_bfp's formats)
@@ -1875,7 +1881,7 @@ def r5_carriers(by, nn, last, split, FL=None):
             pay = (pay1(pg, 0, "pg"), pay1(pu, n * rbg, "pu"))
         t = dataclasses.replace(TG.default_tile(gf, "swiglu", kb), **AF_TILE,
                                 **(AF_FFN_MIX[(gf, uf)] if mx else AF_FFN[gf]), ffn=True, tout=True)
-        if car in R5_BNEXT or "all" in R5_BNEXT:
+        if (car, pg, pu) in R5_BNEXT:
             t = dataclasses.replace(t, bnext=True, bpre=0, b0early=False)
         # (the .fp's dz_w: the raw binding the payloads read, gate's n rows then up's, clamped below n (rb_g + rb_u))
         rb = lambda f_: gen_r5fuse.RBG if f_ == "iq4xs" else gen_r5kq.PAYLOADS[f_].row_bytes
