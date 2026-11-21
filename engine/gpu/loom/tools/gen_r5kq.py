@@ -5,7 +5,9 @@ k-block kk = 4 jp + 2 whi + bb of super-block pq), with gen_kq_bfp's exact weigh
 Each carries 2 x vector<2xi32>, the IQ4_XS payload's types, so any two can pair."""
 import re
 
-K, F = 5120, 8192
+import gen_r5fuse as _R   # (F: the swap's rows a tensor, set per call by its geom(); read at text time)
+
+K = 5120
 SBS = K // 256   # super-blocks a row
 CARRY = "vector<2xi32>"
 
@@ -24,7 +26,7 @@ class IQ3S:
 
     def prologue(self, e, n, nin, nout):
         p, rb = self.p, self.row_bytes
-        base = (n - F) * rb + (self.toff or 0)
+        base = (n - _R.F) * rb + (self.toff or 0)
         for nm, v in (("rb", rb), ("ctb", n * rb), ("blk", self.blk), ("r0", base), ("ld2", nin - 2),
                       ("ld1", nin - 1), ("c66", 66), ("c74", 74), ("c106", 106)):
             e(f"  %{p}{nm} = index.constant {v} : index")
@@ -157,7 +159,7 @@ class _Pay:
     def prologue(self, e, n, nin, nout):
         x = self._x(e, "  ", "")
         rb = self.row_bytes
-        for nm, v in (("rb", rb), ("ctb", n * rb), ("blk", self.blk), ("r0", (n - F) * rb + (self.toff or 0)),
+        for nm, v in (("rb", rb), ("ctb", n * rb), ("blk", self.blk), ("r0", (n - _R.F) * rb + (self.toff or 0)),
                       ("ld1", nin - 1), ("ld2", nin - 2), ("ld4", nin - 4), ("ld8", nin - 8)):
             x(f"%${nm} = index.constant {v} : index")
         if self.grid:
