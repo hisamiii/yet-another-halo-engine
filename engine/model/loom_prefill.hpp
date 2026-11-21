@@ -199,8 +199,15 @@ class LoomPrefill {
       p.w_bytes = std::max(p.w_bytes, std::size_t{geom_.at("npu_swpanel.hal").tt});
     }
     // (out: a DeltaNet layer's out C follows its qkv and gate C)
+    NpuPlan qp = need("q");
+    if (const std::uint32_t r = SwSiteMaxR("q")) {   // (a swap-form q site: its stream at A 0, C B R bf16)
+      if (halves_) throw LoomError("YAH_PP_HALVES: swap-form sites are not built for halves");
+      qp.a_bytes = std::max(qp.a_bytes, NpuBytesOf("npubytes_swsite_" + std::to_string(r)).a);
+      qp.c_bytes = std::max(qp.c_bytes, SwSiteC(r));
+      p.w_bytes = std::max(p.w_bytes, std::size_t{geom_.at("npu_swpanel.hal").tt});
+    }
     for (const NpuPlan& q : {NpuPlan{std::max({qkv.a_bytes, gate.a_bytes, sw_a}), 0, qkv.c_bytes + gate.c_bytes + need("out").c_bytes},
-                             need("q"), need("out")})
+                             qp, need("out")})
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
       p.a_bytes = std::max(p.a_bytes, NpuK(5120).a);
@@ -2537,6 +2544,7 @@ class LoomPrefill {
     Fmt f{};
     FmtOf(static_cast<std::uint32_t>(t->type), &f);
     const std::string h = "npu_swsdec_" + std::string(f.name) + "_" + std::to_string(rows) + ".hal";
+    if (!geom_.count(h)) throw LoomError("prefill: the set has no " + h + " (" + wname + "'s swap-form site): re-emit it");
     const Geom& gd = geom_.at(h);
     const std::size_t M = t->dims[1], trb = static_cast<std::size_t>(t->bytes) / M;
     hrx_buffer_ref_t wr = TRef(*t);
@@ -2544,8 +2552,15 @@ class LoomPrefill {
     std::vector<hrx_buffer_ref_t> db = {wr};
     if (const auto gw = GemmWeights(*t, f); gw.size() > 1) db.push_back(gw[1]);   // (a grid format's grid)
     db.push_back(ARef(a, gd.tt));
-    Dispatch(Exe(h), std::strcmp(f.name, "iq4xs") == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp", (gd.tokens + gd.rowgrp - 1) / gd.rowgrp,
+    Dispatch(Exe(h), std::strncmp(f.name, "iq4", 3) == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp", (gd.tokens + gd.rowgrp - 1) / gd.rowgrp,
              1, 1, gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
+  }
+  // The norm's tiled output as the swap's token panel (npu_swpanel) in W; returns its bytes
+  std::size_t SwSitePanel() {
+    const Geom& gp = geom_.at("npu_swpanel.hal");
+    Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1, gp.rowgrp, 1, 1,
+             {Ref(*normt_), WRef(0, gp.tt)}, 2);
+    return gp.tt;
   }
   // A swap-form site's job: one npu_swsite_<r> call a 512-token panel (stream at A offset a, panel t at W t w, C at
   // c_off on); returns its C view
@@ -3131,12 +3146,23 @@ class LoomPrefill {
       // the NPU's heads of q (whole heads of 512 rows [256 q | 256 gate]) beside the GPU's heads and k / v;
       // the norm wrote the row-major input unless q, k and v are all afrag
       const bool tiled = q_af && k_af && v_af;
-      const auto a = NpuEncode("q", tiled ? *normt_ : *scratch_, tiled, NpuPk(pre + "attn_q.weight"));
       std::size_t c_off = 0;
-      const auto w = NpuRawRows("q", pre + "attn_q.weight", nq);
       std::vector<std::uint32_t> calls;
-      const NpuView c = NpuCalls("q", a, w, c_off, calls, pre + "attn_q.weight");
-      NpuEnqueue(std::move(calls), "q");
+      NpuView c{};
+      if (const std::uint32_t rq = SwSiteR("q", l, nq)) {
+        // (swap-form site) the GPU decodes the NPU's rows to the plain stream at A 0, the norm's tiled output to the panel
+        if (!tiled) throw LoomError("prefill: " + pre + " a swap-form q site needs the tiled norm output");
+        const NpuBytes bq = NpuBytesOf("npubytes_swsite_" + std::to_string(rq));
+        SwSiteDecode(pre + "attn_q.weight", nq, 0);
+        const std::size_t pw = SwSitePanel();
+        c = SwSiteCalls(rq, 0, c_off, calls);
+        NpuEnqueue(std::move(calls), "swq", {{ARef(0, bq.a), WRef(0, pw)}, CRef(c.offset, c.length)});
+      } else {
+        const auto a = NpuEncode("q", tiled ? *normt_ : *scratch_, tiled, NpuPk(pre + "attn_q.weight"));
+        const auto w = NpuRawRows("q", pre + "attn_q.weight", nq);
+        c = NpuCalls("q", a, w, c_off, calls, pre + "attn_q.weight");
+        NpuEnqueue(std::move(calls), "q");
+      }
       RunPendingNorm();
       RunKqgSplit(pre + "attn_q.weight", q_af, qs, nq);
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
@@ -3353,16 +3379,13 @@ class LoomPrefill {
         const std::size_t ag = SwSiteGateA();
         const NpuBytes bq = NpuBytesOf("npubytes_swsite_" + std::to_string(rq)),
                        bg = NpuBytesOf("npubytes_swsite_" + std::to_string(rg));
-        const Geom& gp = geom_.at("npu_swpanel.hal");
         SwSiteDecode(pre + "attn_qkv.weight", nq, 0);
-        Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1,
-                 gp.rowgrp, 1, 1, {Ref(*normt_), WRef(0, gp.tt)}, 2);
+        const std::size_t pw = SwSitePanel();
         cq = SwSiteCalls(rq, 0, c_off, calls);
-        qkv_job = NpuEnqueue(std::exchange(calls, {}), "swqkv",
-                             {{ARef(0, bq.a), WRef(0, gp.tt)}, CRef(cq.offset, cq.length)});
+        qkv_job = NpuEnqueue(std::exchange(calls, {}), "swqkv", {{ARef(0, bq.a), WRef(0, pw)}, CRef(cq.offset, cq.length)});
         SwSiteDecode(pre + "attn_gate.weight", ng, ag);
         cg = SwSiteCalls(rg, ag, c_off, calls);
-        gate_job = NpuEnqueue(std::move(calls), "swgate", {{ARef(ag, bg.a), WRef(0, gp.tt)}, CRef(cg.offset, cg.length)});
+        gate_job = NpuEnqueue(std::move(calls), "swgate", {{ARef(ag, bg.a), WRef(0, pw)}, CRef(cg.offset, cg.length)});
       } else {
         const bool kq = NpuPk(pre + "attn_qkv.weight"), kg = NpuPk(pre + "attn_gate.weight");
         std::vector<NpuView> a4, ak;
