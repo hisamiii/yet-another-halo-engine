@@ -1634,6 +1634,8 @@ class LoomPrefill {
   // before the swap's streams at its end (A's size / 2 put it inside the swap's stream since RSwapOn; harmless while
   // each stream was written right before its job, not once the double buffer keeps one across layers)
   std::size_t PkA() const {
+    // (early site decodes: A has no second copy; the front holds the S / O / D regions, so no pk stream fits)
+    if (EarlyDec()) throw LoomError("prefill: an in-core pk NPU stream with early site decodes (A's S / O / D regions)");
     std::size_t s = halves_ ? a_one_ : npu_->A().size;   // (halves: one half's A, its p4 stream then the pk one)
     if (RSwapOn() && !halves_) s -= (R5Fuse() ? 2 : 1) * SwapStreamMax();
     return s / 2;
@@ -2064,6 +2066,8 @@ class LoomPrefill {
     const bool swdown = rswap && SwDown();
     if (SwDown() && !rswap) throw LoomError("prefill: " + pre + "a swap-form down set needs the swap gate / up (H as panels)");
     std::vector<std::uint32_t> cswd;
+    std::vector<std::vector<hrx_buffer_ref_t>> ddb;   // (swdown) the decodes' bindings, dispatched after the FFN GEMM
+    std::string ddh;
     std::size_t swc = 0, swa = 0;
     if (swdown) {
       if (!hap || apass != 32 || parts.size() != 2 || parts[0].p != 16 || parts[1].p != 16 || parts[0].r != 16 ||
@@ -2074,6 +2078,7 @@ class LoomPrefill {
       const std::string h = "npu_swddec_" + std::string(fd.name) + ".hal";
       if (!geom_.count(h)) throw LoomError("prefill: the set has no " + h + " (" + pre + "ffn_down, swap form): re-emit it");
       const Geom& gd = geom_.at(h);
+      ddh = h;
       swa = Up4k(b.a);
       const std::uint32_t nt = B_ / 512;
       for (std::uint32_t kp = 0; kp < 2; ++kp) {
@@ -2085,8 +2090,7 @@ class LoomPrefill {
         std::vector<hrx_buffer_ref_t> db = {wr};
         if (const auto gw = GemmWeights(*td, fd); gw.size() > 1) db.push_back(gw[1]);   // (a grid format's grid)
         db.push_back(ARef(DownA() + kp * swa, gd.tt));
-        Dispatch(Exe(h), std::strncmp(fd.name, "iq4", 3) == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp",
-                 (gd.tokens + gd.rowgrp - 1) / gd.rowgrp, 1, 1, gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
+        ddb.push_back(std::move(db));
         for (std::uint32_t t = 0; t < nt; ++t, swc += b.c)
           cswd.push_back(npu_->BindSwap(dir_ + "/npu_swdown.xdna", HA({DownA() + kp * swa, b.a}),
                                         HA({hbase(kp) + std::size_t{8} * t * qu * 18432, (std::size_t{7} * qu + 16) * 18432, true}),
@@ -2140,8 +2144,6 @@ class LoomPrefill {
     // YAH_NPU_DNJOBS=1: a job per part)
     static const bool dnjobs = std::getenv("YAH_NPU_DNJOBS") != nullptr;
     const bool one = !dnjobs && std::all_of(dn.begin(), dn.end(), [&](const std::string& d) { return d == dn[0]; });
-    if (swdown)
-      NpuEnqueue(std::move(cswd), "swdown", {{ARef(DownA(), 2 * swa), CRef(0, FfnBlkH())}, CRef(doff, swc)});
     for (std::size_t ci = 0; ci < parts.size() && !swdown; ++ci) {
       if (one && ci + 1 < parts.size()) {
         cdn[ci + 1].insert(cdn[ci + 1].begin(), cdn[ci].begin(), cdn[ci].end());
@@ -2185,6 +2187,13 @@ class LoomPrefill {
                32, 1, 1, b, wmask);
       ClkFfnEnd(b, wmask);
       if (carry) part_done_[half_] = static_cast<std::int64_t>(r5k), carriers_[half_] += !npu_planning_;
+    }
+    if (swdown) {   // (beside the FFN GEMM above; the NPU runs the gate / up meanwhile)
+      const Geom& gd = geom_.at(ddh);
+      for (const auto& db : ddb)
+        Dispatch(Exe(ddh), std::strncmp(fd.name, "iq4", 3) == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp",
+                 (gd.tokens + gd.rowgrp - 1) / gd.rowgrp, 1, 1, gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
+      NpuEnqueue(std::move(cswd), "swdown", {{ARef(DownA(), 2 * swa), CRef(0, FfnBlkH())}, CRef(doff, swc)});
     }
     if (rswap) PreDecodeNext();   // (beside the FFN GEMM above)
     // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
