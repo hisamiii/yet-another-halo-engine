@@ -241,7 +241,12 @@ class LoomPrefill {
     if (p.dcol) {
       // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
       p.w_bytes = std::max({p.w_bytes, NpuK(5120).w, geom_.count("npubytes4_5120") ? NpuK(5120, true).w : 0});
-      p.a_bytes *= 2;
+      // (the pk half only when a pk writer can run: its "_pk" encoders / norms or the "bfppk" keys; swap-form sets
+      // have none, every site's stream is the GPU's decode)
+      const bool pkw = std::any_of(geom_.begin(), geom_.end(), [](const auto& g) {
+        return g.first.find("_pk") != std::string::npos || g.first.find("bfppk") != std::string::npos;
+      });
+      if (pkw) p.a_bytes *= 2;
     }
     if (RSwapOn()) {   // (YAH_NPU_RSWAP) the swap's weight stream at A's end (SwapA), its token panel at W's start
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
