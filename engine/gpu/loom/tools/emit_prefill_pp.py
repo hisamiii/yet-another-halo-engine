@@ -973,8 +973,9 @@ RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.p
 # YAH_NPU_RSWAP_NB=<n> (with RSWAP_EMIT): the swap image's weight M blocks (64 stream rows) a call, a multiple of 32
 # (today's 1024 features a call); the engine reads it from npubytes_ffnswap's A bytes. 128: 2 calls a token panel
 # at F 8192, so a job loads each panel twice instead of 8 times; 256: one call a token panel, each panel loaded once
-# (11-21: -0.65 M a job in the gated checker, H in the same down layout)
-RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "128"))
+# (11-21: -0.65 M a job in the gated checker, H in the same down layout). Default 256 when F / 32 allows it (11-21
+# on 5cd5aee: -11.9 ms pp2048, md5 unchanged), else 128.
+RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "256" if NPU_FFNBLKS and NPU_FFNBLKS // 32 % 256 == 0 else "128"))
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
                  GN_QSWPAIR=os.environ.get("GN_QSWPAIR", "1"))   # 8 A streams (gen_npu_q; 11-20: -53.8 ms pp2048)
