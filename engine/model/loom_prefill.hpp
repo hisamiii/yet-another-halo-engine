@@ -3651,7 +3651,10 @@ class LoomPrefill {
       NpuJoin(gate_job);
       const std::string un = RowsHal(Np4Hal("npu_unpack_gate", pre + "attn_gate.weight"), "gate", ng, Np4(pre + "attn_gate.weight"));
       const std::string sfx = un.substr(15, un.size() - 19);   // "npu_unpack_gate<sfx>.hal"
-      if (bfp && geom_.count(pn + (pk ? "_a_bfp_pk_gc" : "_a_bfp_gc") + sfx + ".hal") && geom_.count(pn + "_b_gc" + sfx + ".hal"))
+      // (a swap-form out: part a writes no stream, "<pn>_a_gc<sfx>.hal")
+      if ((bfp || (dnsplit_a_ && on && SwSiteR("out", BlkOf(pre), on))) &&
+          geom_.count(pn + (pk ? "_a_bfp_pk_gc" : bfp ? "_a_bfp_gc" : "_a_gc") + sfx + ".hal") &&
+          geom_.count(pn + "_b_gc" + sfx + ".hal"))
         gc_sfx = "_gc" + sfx, gc_read_ = cg;
       else
         NpuUnpack(un, cg, {Ref(*gate_)}, 2);

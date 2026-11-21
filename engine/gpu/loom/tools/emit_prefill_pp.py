@@ -1421,8 +1421,8 @@ def npu_split(rows, combos, B, outdir):
             encs.add((K, ci if chunked else None, chunk))
     if NPU_FFNBLK:   # the FFN block's gate / up activations
         encs.add((5120, None, (0, NPU_PASSES)))
-    for K, ci, (k_off, passes) in sorted(encs, key=lambda x: (x[0], -1 if x[1] is None else x[1])):
-        for tiled in (False, True):
+    for K, ci, (k_off, passes) in sorted(() if SWSITE else encs, key=lambda x: (x[0], -1 if x[1] is None else x[1])):
+        for tiled in (False, True):   # (swap-form sites: the GPU's decoders write A, no encoder)
             for perm in ("p4", "pk"):
                 name = "npu_enc_%d%s%s%s.hal" % (K, "" if ci is None else "_c%d" % ci, "_t" if tiled else "",
                                                  "_pk" if perm == "pk" else "")
@@ -1436,7 +1436,7 @@ def npu_split(rows, combos, B, outdir):
                 E.emit(src, ["nop=0"], name, outdir)   # emit_hal.py wants a config; the encoder has none
                 out.append((name, B // 8 * (passes * sum(NPU_KS)) // GE.WG, GE.WG, 0))
     # the norms that feed K = 5120 sites also write the NPU's BFP16 input (gen_half_norm.gen_split bfp): "<norm>_bfp.hal"
-    if {"qkv", "q"} & set(NPU_SPLIT):
+    if {"qkv", "q"} & set(NPU_SPLIT) and not SWSITE:   # (swap-form sites: no stream)
         # (and "<norm>_bfp_pk.hal": the Q4_K-order stream too, into A's second half, for sites with a Q4_K weight)
         for tiled, name, pk in [(t, n[:-4] + pk * "_pk" + ".hal", pk) for pk in (False, True)
                                 for t, n in ((False, "norm_bfp.hal"), (True, "norm_t_bfp.hal"),
@@ -1450,7 +1450,7 @@ def npu_split(rows, combos, B, outdir):
         out.append(("npunormbfppk", 1, 0, 0))
     # the DeltaNet postnorm over heads 0 .. DNSPLIT[0] - 1 (exactly ssm_out's NPU K chunk) also writes the NPU's BFP16
     # input (gen_postnorm_bfp): "postnorm[_t]_a_bfp.hal"
-    if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == NPU_KCALL:
+    if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == NPU_KCALL and not SWSITE:
         import gen_postnorm_bfp
         # ("_pk": the stream in Q4_K's k-block order, into A's second half, for a Q4_K ssm_out)
         for tiled, name, perm in [(t, n + pk + ".hal", perm) for pk, perm in (("", "p4"), ("_pk", "pk"))
@@ -1525,9 +1525,11 @@ def npu_split(rows, combos, B, outdir):
             # the DeltaNet postnorm parts read the gate's NPU columns straight from C (gen_postnorm_bfp gc), so the gate
             # unpack goes: "postnorm[_t]_a_bfp[_pk]_gc<sfx>.hal" (part a with the out stream) and "postnorm[_t]_b_gc<sfx>.hal"
             import gen_postnorm_bfp
-            pn_bfp = "out" in NPU_SPLIT and DNSPLIT[0] * 128 == NPU_KCALL
+            pn_bfp = "out" in NPU_SPLIT and DNSPLIT[0] * 128 == NPU_KCALL and not SWSITE
             pvars = [(t, "_a_bfp" + pk, 0, DNSPLIT[0], True, perm) for t in (False, True)
                      for pk, perm in (("", "p4"), ("_pk", "pk")) if pn_bfp]
+            # (swap-form out: part a writes no stream, "_a_gc")
+            pvars += [(t, "_a", 0, DNSPLIT[0], False, "p4") for t in (False, True) if SWSITE]
             pvars += [(t, "_b", DNSPLIT[0], DNSPLIT[1], False, "p4") for t in (False, True)]
             for tiled, part, h0, nh, bfp, perm in pvars:
                 gname = "postnorm%s%s_gc%s.hal" % ("_t" if tiled else "", part, sfx)
@@ -1664,7 +1666,9 @@ def npu_images(images, B, tmp, outdir, extra=()):
     else:
         jobs = [(npu_cfg(B, NPU_KS, NPU_PASSES, kraw=K, fmt=DCOL_FMTS[fmt][0], **KCHAIN(fmt)),
                  "npu_dcol_%s_%d" % (fmt, K), GN.NP) for fmt, K in sorted(images)]
-    jobs += list(extra)
+    cfgs = jobs + list(extra)   # (all configs: the dispatch.txt lines below)
+    # (swap-form sites: the in-core site images are never bound, LoomPrefill::NpuOk / SwSiteOf; not compiled)
+    jobs = [j for j in jobs if not SWSITE] + list(extra)
 
     # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
     def source(cfg, name, np_):
@@ -1733,10 +1737,10 @@ def npu_images(images, B, tmp, outdir, extra=()):
     for (cfg, name, _), r in zip(jobs, rs):
         if r.returncode:
             raise SystemExit("NPU image compile failed (%s): %s" % (name, r.stderr[-800:]))
-    j0 = next(j for j in jobs if j[2] == NPU_NP)
+    j0 = next(j for j in cfgs if j[2] == NPU_NP)
     out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(j0[0])),
            ("npurows", NPU_ROWS, 0, 0)]
-    j4 = [j for j in jobs if NPU_Q and j[2] == 4 and j[0].fmt != "IQ4_XS" and not j[0].qsw
+    j4 = [j for j in cfgs if NPU_Q and j[2] == 4 and j[0].fmt != "IQ4_XS" and not j[0].qsw
           and not j[1].startswith(("npu_swsite_", "npu_swdown"))]
     if j4 and NPU_QP1K:   # (the NP 4 formats' site images, np4)
         with GN.np_override(4):
@@ -2080,7 +2084,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
                     out.append((nm_ + ".hal", B * cols_ * (GN.TN // 8) // GU.wg(cols_), GU.wg(cols_), 0))
                 if {"qkv", "q"} & set(NPU_SPLIT):
-                    for pk in (False, True):
+                    for pk in () if SWSITE else (False, True):   # (swap-form sites: "_ns" only)
                         for f16 in ("r", "t", "rt"):
                             nm_ = "npu_unormsw_rr_%s%s" % (f16, "_pk" if pk else "")
                             src = os.path.join(tmp, nm_ + ".loom")
@@ -2161,14 +2165,15 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             import gen_half_norm
             unorm = {}
             # (not yet for TN 80, the Q' P1K down: gen_unorm reads C as TN 64; the sum then runs as its own unpack)
-            if {"qkv", "q"} & set(NPU_SPLIT) and (N - rows) == (calls - 1) * NPU_COLS * GN.TN and GN.TN == 64:
+            if {"qkv", "q"} & set(NPU_SPLIT) and (N - rows) == (calls - 1) * NPU_COLS * GN.TN and GN.TN == 64 \
+                    and not SWSITE:
                 for pk in (False, True):
                     unorm["npu_unorm%s.hal" % ("_pk" if pk else "")] = gen_half_norm.gen_unorm(
                         B, list(NPU_KS), NPU_PASSES, len(parts), pk)
             # after the "_rr" sum: the sum, the stream and the f16 output(s) in one pass ("npu_unorm_rr_<r|t|rt>[_pk]",
             # TN 64 or 80: gen_unorm indexes each column in full at 80)
             if {"qkv", "q"} & set(NPU_SPLIT) and (N - rows) == (calls - 1) * NPU_COLS * GN.TN and GN.TN in (64, 80):
-                for pk in (False, True):
+                for pk in () if SWSITE else (False, True):
                     for f16 in ("r", "t", "rt"):
                         unorm["npu_unorm_rr_%s%s.hal" % (f16, "_pk" if pk else "")] = gen_half_norm.gen_unorm(
                             B, list(NPU_KS), NPU_PASSES, len(parts), pk, remres=True, f16=f16)
@@ -2207,7 +2212,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 text4_rr = GU.gen(B, calls4 * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
                                   dup=((calls4 - 1) * NPU_COLS, N - rows4), remres=True)
                 if {"qkv", "q"} & set(NPU_SPLIT) and calls4 * rows4 == N:   # (as above, the NP 4 downs at TN 64)
-                    for pk in (False, True):
+                    for pk in () if SWSITE else (False, True):
                         for f16 in ("r", "t", "rt"):
                             unorm["npu_unorm4_rr_%s%s.hal" % (f16, "_pk" if pk else "")] = gen_half_norm.gen_unorm(
                                 B, list(NPU_KS), NPU_PASSES, len(parts), pk, remres=True, f16=f16)
