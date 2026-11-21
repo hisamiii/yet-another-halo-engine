@@ -162,7 +162,7 @@ class LoomPrefill {
     }
     return p;
   }
-  std::size_t SwapAll() const { return RSwapOn() ? (R5Fuse() ? 2 : 1) * SwapStream() : 0; }
+  std::size_t SwapAll() const { return RSwapOn() ? (R5Fuse() ? 2 : 1) * SwapStreamMax() : 0; }
   // one half's A region: the one-B plan's A before the swap's stream (NpuPlanOne rounds it to 4096 when the swap is on)
   std::size_t HalfA(const NpuPlan& one) const { return Up4k(one.a_bytes - SwapAll()); }
   static std::size_t Up4k(std::size_t b) { return (b + 4095) / 4096 * 4096; }
