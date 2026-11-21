@@ -1018,19 +1018,20 @@ if AHORD:
 # 512-token panel, F / 32 / RSWAP_NB), dispatch.txt "npupanel <k>"; the GPU may then open each panel on its own
 PANEL = os.environ.get("YAH_NPU_PANEL") == "1"
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
-# YAH_NPU_SWSITE=1 (tile's swap coverage): every dequant site in swap form, qkv, gate, q (attn_q) and out (attn_output /
+# Swap-form sites (the default with the Q' P1K set; YAH_NPU_SWSITE=0: the in-core baseline): every dequant site in swap form, qkv, gate, q (attn_q) and out (attn_output /
 # ssm_out: its NPU K 5120, the GPU keeps the last 1024 as today). Per layer its NPU rows on a plain
 # bfp16-A image "npu_swsite_<R>" (the swap image without SwiGLU: the weights its stream in the act layout
 # [64-row block][pass][..], the swap's token panel npu_swpanel resident, K 5120 in 20 passes, one call a 512-token
 # panel; npu chk/swd.py, 11-21: bit-exact). R = nb x 64, nb the real rows' blocks up to a multiple of 4 (the image's
 # 4 compute rows): the stream's pad rows are zero. C: bf16 8x8 blocks [8 tokens][8 rows], panel p at p R 1024 B, in
 # it per 64-token column c block c (R / 8) 8 + (rb / 2) 16 + (t / 2) 4 + (rb % 2) 2 + t % 2 ("swapc").
-# dispatch.txt "npuswsite_<site>@<L> <nb> <real rows>", "npubytes_swsite_<R>". Unset: no change.
-SWSITE = os.environ.get("YAH_NPU_SWSITE") == "1"
+# dispatch.txt "npuswsite_<site>@<L> <nb> <real rows>", "npubytes_swsite_<R>". YAH_NPU_SWSITE=1 requires the P1K set.
+SWSITE = os.environ.get("YAH_NPU_SWSITE", "1" if NPU_QP1K else "0") == "1"
 SWSITE_NB = set()   # (the images' nb, filled by the per-layer sites)
 # (YAH_NPU_SWSITE) qkv's and gate's (format, NPU rows): the GPU's plain stream decoders of those rows (K 5120),
 # "npu_swsdec_<fmt>_<rows>.hal", the engine's standalone decode before the site's job (carriers may take it over)
 SWSITE_DEC = set()
+SWSITE_DECO = set()   # (YAH_NPU_SWSITE) out's (format, NPU rows): "npu_swsdeco_<fmt>_<rows>.hal", k 0 .. 5120 of 6144
 
 
 def ffnblk_parts(F):
@@ -1390,6 +1391,7 @@ def npu_split(rows, combos, B, outdir):
         lrows.add((fmt, site, nn))
         out.append(("npusplit_%s@%d" % (site, L), nn, 0, 0))
     if SWSITE:   # (YAH_NPU_SWSITE) each layer's NPU rows of its split sites in swap form
+        assert NPU_QP1K and B % 512 == 0, "swap-form sites: the Q' P1K set and 512-token panels (YAH_NPU_SWSITE=0: in-core)"
         for nm in sorted(lfmt):
             m = re.match(r"blk\.(\d+)\.(attn_qkv|attn_gate|attn_q|attn_output|ssm_out)\.weight$", nm)
             site = m and {"attn_output": "out", "ssm_out": "out"}.get(m[2], m[2][5:])
@@ -1399,8 +1401,7 @@ def npu_split(rows, combos, B, outdir):
             nn = NPU_SPLIT_LAYERS.get((site, L)) or (npu_rows4(site) if np4(lfmt[nm]) else NPU_SPLIT[site])
             nb = -(-nn // 256) * 4
             SWSITE_NB.add(nb)
-            if site in ("qkv", "gate", "q"):
-                SWSITE_DEC.add((lfmt[nm], nn))
+            (SWSITE_DECO if site == "out" else SWSITE_DEC).add((lfmt[nm], nn))
             out.append(("npuswsite_%s@%d" % (site, L), nb, nn, 0))
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
     encs = set()
@@ -1461,8 +1462,8 @@ def npu_split(rows, combos, B, outdir):
         N = mt * 16
         f = {"qkv": dict(out16=True), "gate": dict(out16=True), "q": dict(qg=True),
              "out": dict(resid=True, parts=len(npu_chunks("out")), rem=True)}[site]
-        # (YAH_NPU_SWSITE) qkv's, gate's and q's C is the swap-form site image's (R rows): their readers take swap=R
-        sw = GU.swap_rows(n) if SWSITE and site in ("qkv", "gate", "q") else None
+        # (YAH_NPU_SWSITE) every site's C is the swap-form site image's (R rows): their readers take swap=R
+        sw = GU.swap_rows(n) if SWSITE else None
         name = "npu_unpack_%s%s.hal" % (site, sfx)
         src = os.path.join(tmp, name[:-4] + ".loom")
         open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, swap=sw, **f))
@@ -1475,7 +1476,7 @@ def npu_split(rows, combos, B, outdir):
             groups, perm = GE.GROUPS, GE.ACT_PERM
             GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
             try:
-                text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+                text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES), swap=sw)
             finally:
                 GE.GROUPS, GE.ACT_PERM = groups, perm
             oname = "npu_onorm%s.hal" % sfx
@@ -1488,7 +1489,7 @@ def npu_split(rows, combos, B, outdir):
                 pname = "npu_onorm%s_pn.hal" % sfx
                 GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = (NPU_PASSES,), "p4", (RSWAP_KS, RSWAP_PASSES)
                 try:
-                    text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+                    text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES), swap=sw)
                 finally:
                     GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = groups, perm, None
                 src = os.path.join(tmp, pname[:-4] + ".loom")
@@ -1504,7 +1505,7 @@ def npu_split(rows, combos, B, outdir):
                         GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL = (NPU_PASSES,), "p4", (RSWAP_KS, RSWAP_PASSES)
                         gen_half_norm.WG_BASE = q * B // 16
                         try:
-                            text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES))
+                            text = gen_half_norm.gen_osum(B, N - n, n, f["parts"], ONORM_SPLIT, (B, list(NPU_KS), NPU_PASSES), swap=sw)
                         finally:
                             GE.GROUPS, GE.ACT_PERM, gen_half_norm.PANEL, gen_half_norm.WG_BASE = groups, perm, None, None
                         src = os.path.join(tmp, qname[:-4] + ".loom")
@@ -1603,17 +1604,25 @@ def npu_split(rows, combos, B, outdir):
     bfp_site_rows(bsites, outdir)
     out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
     extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
-    for fm_, nn_ in sorted(SWSITE_DEC):   # (YAH_NPU_SWSITE) qkv's / gate's plain stream decoders
+    for fm_, nn_, kf_ in sorted([(f_, n_, None) for f_, n_ in SWSITE_DEC] + [(f_, n_, 6144) for f_, n_ in SWSITE_DECO],
+                                key=str):   # (YAH_NPU_SWSITE) the sites' plain stream decoders (out: k 0 .. 5120 of 6144)
         import gen_iq4xs_bfp
         import gen_kq_bfp
         assert fm_ in ("iq4xs", "iq4nl") or fm_ in RSWAP_KQ, ("YAH_NPU_SWSITE: no stream decoder for", fm_)
         st_ = dict(ks=RSWAP_KS, passes=RSWAP_PASSES, tile=64, plain=True)
-        nm_ = "npu_swsdec_%s_%d" % (fm_, nn_)
+        nm_ = ("npu_swsdeco_%s_%d" if kf_ else "npu_swsdec_%s_%d") % (fm_, nn_)
         src = os.path.join(tmp, nm_ + ".loom")
-        open(src, "w").write(gen_iq4xs_bfp.gen(nn_, 5120, st_, nl=fm_ == "iq4nl") if fm_ in ("iq4xs", "iq4nl") else
-                             gen_kq_bfp.gen(RSWAP_KQ[fm_], nn_, 5120, st_))
+        open(src, "w").write(gen_iq4xs_bfp.gen(nn_, 5120, st_, nl=fm_ == "iq4nl", kfull=kf_) if fm_ in ("iq4xs", "iq4nl")
+                             else gen_kq_bfp.gen(RSWAP_KQ[fm_], nn_, 5120, st_, kfull=kf_))
         E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
         out.append((nm_ + ".hal", gen_iq4xs_bfp.items(nn_, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(nn_, 5120, st_)))
+    if SWSITE_DECO:   # (YAH_NPU_SWSITE) out's token panels: its input's k 0 .. 5120 (of 6144), row-major / fragment-major
+        for t_ in (False, True):
+            pn_ = "npu_swpanel_o%s.hal" % ("_t" if t_ else "")
+            src = os.path.join(tmp, pn_[:-4] + ".loom")
+            open(src, "w").write(GE.gen("wgt", B, RSWAP_KS, RSWAP_PASSES, 64, True, t_, k_src=6144, p1k=True))
+            E.emit(src, ["nop=0"], pn_, outdir)
+            out.append((pn_, B // 8 * 640, GE.WG, GE.layout_bytes("wgt", B, RSWAP_KS, RSWAP_PASSES)))
     for nb in sorted(SWSITE_NB):   # (YAH_NPU_SWSITE) the plain bfp16-A site images (npu chk/swd.py's config)
         assert NPU_Q and NPU_QP1K and B % 512 == 0 and nb % 4 == 0, ("YAH_NPU_SWSITE: the Q' P1K set", nb)
         name = "npu_swsite_%d" % (nb * 64)
