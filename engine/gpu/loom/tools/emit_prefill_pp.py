@@ -1196,7 +1196,7 @@ def npu_split(rows, combos, B, outdir):
             # a split's narrower row group may not emit (spills): the engine runs that form unsplit
             print("npu split %s: not emitted with row group %d (%s)" % (name, tf.rowgrp, str(ex)[:120]))
 
-    def outseg(fmt, mt, kb, nn, kbw):
+    def outseg(fmt, mt, kb, nn, kbw, osfx=""):
         """(OUTSEG) the out site's GPU kres split (the ".af.npu.hal" tile, split_tile) and its K remainder
         (npurem, the same tile) as one dispatch, "npuseg_out_<fmt>.hal": gen_segcat linear, every kres workgroup
         dispatches before the remainder's, which fill the kres's last round (tile/outseg/sched.py: NP 4 layers 29 -> 24
@@ -1230,7 +1230,7 @@ def npu_split(rows, combos, B, outdir):
             E._gate("npuseg_out_%s_%s" % (fmt, kind), raw, [sym, fmt, kind, str(m), str(k), str(tt), str(B)]
                     + (["ostride=%d" % ostride] if ostride else ["kfull=%d" % kb]), hrx_paths.env())
             texts.append((raw, (m, k, tt)))
-        name = "npuseg_out_%s.hal" % fmt
+        name = "npuseg_out_%s%s.hal" % (fmt, osfx)
         text, nwg = gen_segcat.segcat("yah_seg", texts, wgs=tk.lanes, linear=True)
         src = os.path.join(tmp, name[:-4] + ".loom")
         open(src, "w").write(text)
@@ -1238,6 +1238,24 @@ def npu_split(rows, combos, B, outdir):
         print("outseg %s: kres %d x %d + rem %d x %d = %d workgroups, %d VGPRs" % (
             name, mtg // tk.rowgrp, B // tk.bn, nn // 16 // tr.rowgrp, B // tr.bn, nwg, hal_vgprs(os.path.join(outdir, name))))
         return (name, tk.bn, nwg, 1)
+
+    def rem_hals(site, fmt, mt, kb, nn, osfx):
+        """The GPU's K remainder of the NPU's nn rows ("npurem_<site>_<fmt><osfx>.hal") and, for out, its outseg
+        ("npuseg_out_<fmt><osfx>.hal"; not when the NPU takes all rows: no GPU kres to concatenate)."""
+        kbw = npu_rem(site) // 256
+        tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), nn // 16)
+
+        def gen_rem(f, k, tr=tr, kb=kb, kbw=kbw):
+            TG.KWIN = (kb - kbw, kb)
+            try:
+                return TG.gen(f, "kstore", tr, False)
+            finally:
+                TG.KWIN = None
+        assert nn // 16 not in O16_MT, "the remainder writes f32"
+        out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s%s.hal" % (site, fmt, osfx), outdir,
+                             "kstore", tr.rowgrp, kfull=kb))
+        if OUTSEG and site == "out" and (fmt, "kres", mt, kb) in AF and nn < mt * 16:
+            out.append(outseg(fmt, mt, kb, nn, kbw, osfx))
 
     def variants(fmt, kind, mt, kb, base, nn, site, osfx=""):
         """Every form of GEMM base the set emits (tile_kstore, afrag_variants): its split."""
@@ -1298,20 +1316,7 @@ def npu_split(rows, combos, B, outdir):
                 bsites.update((t, nn) for t in combos[(kind, fmt, port, mt, kb)])
             if npu_rem(site) and (site, fmt) not in done:   # the GPU's K remainder of the NPU's rows (f32 [B][nn])
                 done.add((site, fmt))
-                kbw = npu_rem(site) // 256
-                tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), nn // 16)
-
-                def gen_rem(f, k, tr=tr, kb=kb, kbw=kbw):
-                    TG.KWIN = (kb - kbw, kb)
-                    try:
-                        return TG.gen(f, "kstore", tr, False)
-                    finally:
-                        TG.KWIN = None
-                assert nn // 16 not in O16_MT, "the remainder writes f32"
-                out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s.hal" % (site, fmt), outdir,
-                                     "kstore", tr.rowgrp, kfull=kb))
-                if OUTSEG and site == "out" and (fmt, "kres", mt, kb) in AF:
-                    out.append(outseg(fmt, mt, kb, nn, kbw))
+                rem_hals(site, fmt, mt, kb, nn, "")
     # per-layer rows (NPU_SPLIT_LAYERS): the GPU's split HALs per (format, site, rows); the unpacks below
     lfmt = {}
     for nm, dims, ty in rows:
@@ -1319,14 +1324,26 @@ def npu_split(rows, combos, B, outdir):
             lfmt[nm] = E.FMT[ty][0]
     lrows = set()   # (site, rows, np4)
     for (site, L), nn in sorted(NPU_SPLIT_LAYERS.items()):
-        assert site in ("qkv", "q") and site in NPU_SPLIT, ("YAH_NPU_SPLIT_LAYERS: qkv / q sites of the split only", site)
-        fmt = lfmt["blk.%d.attn_%s.weight" % (L, site)]
+        assert site in ("qkv", "q", "out") and site in NPU_SPLIT, ("YAH_NPU_SPLIT_LAYERS: qkv / q / out sites of the split", site)
+        wn = ["blk.%d.%s.weight" % (L, n) for n in (("attn_output", "ssm_out") if site == "out" else ("attn_" + site,))]
+        fmt = lfmt[next(w for w in wn if w in lfmt)]
         assert nn % (512 if np4(fmt) else NPU_ROWS) == 0 and (site != "q" or nn % 512 == 0), (site, L, nn, fmt)
         assert site != "qkv" or nn <= 6144, ("qkv: v channels only", L, nn)
         skind, smt, skb = NPU_SITES[site]
+        assert nn <= smt * 16 and (site == "out" or nn < smt * 16), (site, L, nn)   # (out: all rows, no GPU split)
+        sfx_ = "_n%d" % nn
         for kind, f2, port, mt, kb in sorted(combos):
-            if (f2, mt) == (fmt, smt) and kb * qk_of(fmt) == skb * 256 and kind == "kstore" and (fmt, site, nn) not in lrows:
-                variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn, site, osfx="_n%d" % nn)
+            if (f2, mt) != (fmt, smt) or kb * qk_of(fmt) != skb * 256 or (fmt, site, nn) in lrows:
+                continue
+            if site == "out" and kind == "residual":   # (the kres split, its K remainder and outseg at nn rows)
+                if nn == (npu_rows4(site) if np4(fmt) else NPU_SPLIT[site]):   # (the set's own rows: its forms)
+                    continue
+                if nn < mt * 16:
+                    variants(fmt, "kres", mt, kb, "gemm_kres_%s_%d_%d.hal" % (fmt, mt, kb), nn, site, osfx=sfx_)
+                rem_hals(site, fmt, mt, kb, nn, sfx_)
+                lrows.add((fmt, site, nn))
+            elif site != "out" and kind == "kstore":
+                variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn, site, osfx=sfx_)
         lrows.add((fmt, site, nn))
         out.append(("npusplit_%s@%d" % (site, L), nn, 0, 0))
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input

@@ -2655,8 +2655,11 @@ class LoomPrefill {
       const bool down = wname.find("ffn_down") != std::string::npos;
       const std::uint32_t nn = tt == g.tt && !down && NpuOk(wname) ? NpuRows(site, wname) : 0;
       // The persistent kres runs one workgroup per row block (one per CU unsplit), so the split uses the tiled form.
-      const std::string sh = nn ? NpuHal(fused) : "";
-      if (!sh.empty()) {
+      // Per-layer rows ("npusplit_out@<L>"): the "_n<rows>" forms (RowsHal). all: the NPU takes every row (no GPU
+      // kres; the GPU runs only the K remainder, the unpack adds the residual).
+      const bool np4w = nn && Np4(wname), all = nn && nn == M;
+      const std::string sh = nn && !all ? RowsHal(NpuHal(fused), site, nn, np4w) : "";
+      if (!sh.empty() || (all && geom_.count(RowsHal("npurem_" + std::string(site) + "_" + f.name + ".hal", site, nn, np4w)))) {
         const auto a = NpuEncode(site, input, af, NpuPk(wname));
         // (PanelQ) after the FFN block's H; a DeltaNet layer's after its qkv and gate C (dn_c_end_), the later of both
         const std::size_t dn_end = std::exchange(dn_c_end_, 0);
@@ -2669,9 +2672,9 @@ class LoomPrefill {
           throw LoomError("prefill: the out job's C overlaps the gate's C that the postnorm reads (" + wname + ")");
         NpuEnqueue(std::move(calls), site, {{Ref(npu_->A())}, CView(c)});   // (its own C: not after other C readers)
         RunAfterRelease();
-        const Geom gs = GeomOf(sh);
+        const Geom gs = all ? Geom{} : GeomOf(sh);
         const std::string kname = std::string("yah_ffn_gemm_") + f.name + "_kres";
-        const std::uint32_t blocks = (MTiles(*t) - nn / 16) / gs.rowgrp;
+        const std::uint32_t blocks = all ? 0 : (MTiles(*t) - nn / 16) / gs.rowgrp;
         // The persistent kres (one workgroup per row block) over all but the last token tile, the tiled kres on that
         // tile beside it (disjoint token ranges: the graph runs them together on the CUs the row blocks leave idle).
         const std::string p3 = fused0.substr(0, fused0.size() - 4) + ".af.p3.npu.hal";   // NPU split only
@@ -2680,7 +2683,7 @@ class LoomPrefill {
         // the persistent part + the tiled last tile)
         static const bool outp3 = std::getenv("YAH_NPU_OUTP3") != nullptr;
         // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
-        const std::string rh = "npurem_" + std::string(site) + "_" + f.name + ".hal";
+        const std::string rh = RowsHal("npurem_" + std::string(site) + "_" + f.name + ".hal", site, nn, np4w);
         const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / M;
         auto rb = GemmWeights(*t, f);
         rb[0].offset += (M - nn) * row_bytes, rb[0].length = std::size_t{nn} * row_bytes;
@@ -2690,14 +2693,16 @@ class LoomPrefill {
         // kres workgroups first, the remainder's fill its last round); bindings the kres's, then the remainder's weights
         // and output. The same values; 11-21 pp2048: out site GPU kernels 113.9 -> 106.9 ms. YAH_NPU_OUTSEG=0: two.
         static const bool outseg = [] { const char* e = std::getenv("YAH_NPU_OUTSEG"); return !e || std::strcmp(e, "0"); }();
-        const std::string segh = "npuseg_out_" + std::string(f.name) + ".hal";
-        const auto sg = outseg && !outp3 ? geom_.find(segh) : geom_.end();
+        const std::string segh = RowsHal("npuseg_out_" + std::string(f.name) + ".hal", site, nn, np4w);
+        const auto sg = outseg && !outp3 && !all ? geom_.find(segh) : geom_.end();
         if (sg != geom_.end()) {
           auto sb = b;
           sb.insert(sb.end(), rb.begin(), rb.end() - 4);   // (the remainder's weights: all but input, wstage, ostage, out)
           sb.push_back(rb.back());
           Dispatch(Exe(segh), "yah_seg", sg->second.rowgrp, 1, 1, 512, 1, 1, sb,
                    GemmWrites(b, f, {hidden2_}) | std::uint64_t{1} << (sb.size() - 1));
+        } else if (all) {
+          // (no GPU rows: the K remainder below is the GPU's whole share)
         } else if (outp3 && af && geom_.count(p3) && tt == g.tt && gs.tt == g.tt) {
           const std::size_t T = tt - 1;
           const std::size_t tile = B_ / tt;
