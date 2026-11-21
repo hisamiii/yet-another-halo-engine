@@ -233,6 +233,8 @@ class LoomPrefill {
       p.a_bytes = std::max(p.a_bytes, 2 * Up4k(b.a));
       p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + 2 * std::size_t{B_ / 512} * b.c);
     }
+    if (EarlyDec())   // (early site decodes) A's S / O / D regions (OutA, DownA)
+      p.a_bytes = std::max(p.a_bytes, DownA() + (SwDown() ? 2 * Up4k(NpuBytesOf("npubytes_swdown").a) : 0));
     if (OutCAfterH())   // (PanelQ: the out site's C after the FFN block's H, from FfnBlkDown)
       p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + op.c_bytes);
     p.dcol = geom_.count("npudcol") != 0;
@@ -241,7 +243,7 @@ class LoomPrefill {
     if (p.dcol) {
       // the NPU decodes raw rows: W is one call's unread panel binding; A holds the p4 stream, then the pk one (Q4_K)
       p.w_bytes = std::max({p.w_bytes, NpuK(5120).w, geom_.count("npubytes4_5120") ? NpuK(5120, true).w : 0});
-      p.a_bytes *= 2;
+      if (!EarlyDec()) p.a_bytes *= 2;   // (swap-form sites write no pk stream)
     }
     if (RSwapOn()) {   // (YAH_NPU_RSWAP) the swap's weight stream at A's end (SwapA), its token panel at W's start
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
@@ -872,6 +874,7 @@ class LoomPrefill {
     const std::string pre = "blk." + std::to_string(l) + ".";
     split_armed_ = split_layer_ && l == split_layer_;
     layer_ = l;
+    std::erase_if(predec_, [l](const auto& e) { return BlkOf(e.first) != l; });   // (early decodes: this layer's only)
     ClkProbe();
     tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
     if (cfg_.IsFullAttention(l)) {
@@ -2081,11 +2084,11 @@ class LoomPrefill {
         wr.offset += k0, wr.length = (std::size_t{5120} - 1) * srb(kp) + 16 * blkd;
         std::vector<hrx_buffer_ref_t> db = {wr};
         if (const auto gw = GemmWeights(*td, fd); gw.size() > 1) db.push_back(gw[1]);   // (a grid format's grid)
-        db.push_back(ARef(kp * swa, gd.tt));
+        db.push_back(ARef(DownA() + kp * swa, gd.tt));
         Dispatch(Exe(h), std::strncmp(fd.name, "iq4", 3) == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp",
                  (gd.tokens + gd.rowgrp - 1) / gd.rowgrp, 1, 1, gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
         for (std::uint32_t t = 0; t < nt; ++t, swc += b.c)
-          cswd.push_back(npu_->BindSwap(dir_ + "/npu_swdown.xdna", HA({kp * swa, b.a}),
+          cswd.push_back(npu_->BindSwap(dir_ + "/npu_swdown.xdna", HA({DownA() + kp * swa, b.a}),
                                         HA({hbase(kp) + std::size_t{8} * t * qu * 18432, (std::size_t{7} * qu + 16) * 18432, true}),
                                         HC({doff + swc, b.c}), "swdown"));
       }
@@ -2138,7 +2141,7 @@ class LoomPrefill {
     static const bool dnjobs = std::getenv("YAH_NPU_DNJOBS") != nullptr;
     const bool one = !dnjobs && std::all_of(dn.begin(), dn.end(), [&](const std::string& d) { return d == dn[0]; });
     if (swdown)
-      NpuEnqueue(std::move(cswd), "swdown", {{ARef(0, 2 * swa), CRef(0, FfnBlkH())}, CRef(doff, swc)});
+      NpuEnqueue(std::move(cswd), "swdown", {{ARef(DownA(), 2 * swa), CRef(0, FfnBlkH())}, CRef(doff, swc)});
     for (std::size_t ci = 0; ci < parts.size() && !swdown; ++ci) {
       if (one && ci + 1 < parts.size()) {
         cdn[ci + 1].insert(cdn[ci + 1].begin(), cdn[ci].begin(), cdn[ci].end());
@@ -2183,6 +2186,7 @@ class LoomPrefill {
       ClkFfnEnd(b, wmask);
       if (carry) part_done_[half_] = static_cast<std::int64_t>(r5k), carriers_[half_] += !npu_planning_;
     }
+    if (rswap) PreDecodeNext();   // (beside the FFN GEMM above)
     // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
     // GPU waits for the NPU's down here anyway), so the sum after the NPU's down reads one f32 tensor less
     // ("npu_unpack_ffnblk[_4]_rr.hal": (hidden + GPU down) + NPU partials, a summation order of its own; YAH_NPU_REMEXACT=1:
@@ -2636,9 +2640,60 @@ class LoomPrefill {
     if (b.c != std::size_t{r} * 1024) throw LoomError("prefill: npubytes_swsite_" + std::to_string(r) + "'s C is not R 512 bf16");
     return std::size_t{B_} / 512 * b.c;
   }
+  // (early site decodes) with swap-form sites A's front has three regions: S [0, OutA) the q / qkv / gate streams, O
+  // [OutA, DownA) the out site's, D [DownA, ..) the swap down's K parts; a site's stream is then decoded while another
+  // region's job runs (PreDecodeNext, PreDecodeOut)
+  bool EarlyDec() const { return !halves_ && SwSiteMaxR("out") && (SwSiteMaxR("qkv") || SwSiteMaxR("q")); }
+  std::size_t OutA() const {
+    if (!EarlyDec()) return 0;
+    std::size_t s = geom_.count("npubytes_5120") ? NpuK(5120).a : 0;
+    if (const std::uint32_t rg = SwSiteMaxR("gate"))
+      s = std::max(s, SwSiteGateA() + NpuBytesOf("npubytes_swsite_" + std::to_string(rg)).a);
+    for (const char* site : {"qkv", "q"})
+      if (const std::uint32_t r = SwSiteMaxR(site)) s = std::max(s, NpuBytesOf("npubytes_swsite_" + std::to_string(r)).a);
+    return Up4k(s);
+  }
+  std::size_t DownA() const {
+    return EarlyDec() ? OutA() + Up4k(NpuBytesOf("npubytes_swsite_" + std::to_string(SwSiteMaxR("out"))).a) : 0;
+  }
+  // the next layer's swap-form q / qkv / gate streams into S, right after this layer's FFN GEMM (S's last readers, this
+  // layer's site jobs, are joined)
+  void PreDecodeNext() {
+    if (!EarlyDec() || layer_ + 1 >= cfg_.main_block_count()) return;
+    const std::uint32_t n = layer_ + 1;
+    const std::string pre = "blk." + std::to_string(n) + ".";
+    if (cfg_.IsFullAttention(n)) {
+      const std::string w = pre + "attn_q.weight";
+      const std::uint32_t nq = NpuOk(w) ? NpuRows("q", w) : 0;
+      if (SwSiteR("q", n, nq)) PreDecode(w, nq, 0);
+    } else {
+      const std::string wq = pre + "attn_qkv.weight", wg = pre + "attn_gate.weight";
+      const bool nok = NpuOk(wq) && NpuOk(wg);
+      const std::uint32_t nq = nok ? NpuRows("qkv", wq) : 0, ng = nok ? NpuRows("gate", wg) : 0;
+      if (SwSiteR("qkv", n, nq) && SwSiteR("gate", n, ng)) PreDecode(wq, nq, 0), PreDecode(wg, ng, SwSiteGateA());
+    }
+  }
+  // this layer's swap-form out stream into O, right after its qkv / q GEMM (O's last reader, the last layer's out job,
+  // is joined)
+  void PreDecodeOut(const std::string& pre) {
+    if (!EarlyDec()) return;
+    const std::string w = pre + (cfg_.IsFullAttention(layer_) ? "attn_output.weight" : "ssm_out.weight");
+    const std::uint32_t nn = NpuOk(w) ? NpuRows("out", w) : 0;
+    if (SwSiteR("out", layer_, nn)) PreDecode(w, nn, OutA());
+  }
+  void PreDecode(const std::string& wname, std::uint32_t rows, std::size_t a) {
+    predec_.erase(wname);
+    SwSiteDecode(wname, rows, a);
+    predec_[wname] = {rows, a};
+  }
   std::size_t SwSiteGateA() const { return Up4k(NpuBytesOf("npubytes_swsite_" + std::to_string(SwSiteMaxR("qkv"))).a); }
   // Site rows of wname (its last rows: the NPU's) decoded to the swap's plain stream at A offset a (npu_swsdec_<fmt>_<rows>)
   void SwSiteDecode(const std::string& wname, std::uint32_t rows, std::size_t a) {
+    if (const auto it = predec_.find(wname); it != predec_.end()) {   // (decoded early: PreDecode)
+      const bool same = it->second == std::make_pair(rows, a);
+      predec_.erase(it);
+      if (same) return;
+    }
     const auto* t = Find(wname);
     Fmt f{};
     FmtOf(static_cast<std::uint32_t>(t->type), &f);
@@ -3151,9 +3206,9 @@ class LoomPrefill {
         NpuView c{};
         std::size_t ow = 0;   // (swap form) the panel's W bytes
         if (ro) {   // (swap-form site) the GPU decodes the NPU rows' k 0 .. 5120 to A 0, the input's k 0 .. 5120 to the panel
-          SwSiteDecode(wname, nn, 0);
+          SwSiteDecode(wname, nn, OutA());
           ow = SwSitePanel(af ? "npu_swpanel_o_t.hal" : "npu_swpanel_o.hal", &input);
-          c = SwSiteCalls(ro, 0, c_off, calls);
+          c = SwSiteCalls(ro, OutA(), c_off, calls);
         } else {
           const auto a = NpuEncode(site, input, af, NpuPk(wname));
           const auto w = NpuRawRows(site, wname, nn);
@@ -3163,7 +3218,7 @@ class LoomPrefill {
         if (gc_read_.length && c.offset < gc_read_.offset + gc_read_.length && gc_read_.offset < c.offset + c.length)
           throw LoomError("prefill: the out job's C overlaps the gate's C that the postnorm reads (" + wname + ")");
         if (ro)
-          NpuEnqueue(std::move(calls), "swout", {{ARef(0, NpuBytesOf("npubytes_swsite_" + std::to_string(ro)).a), WRef(0, ow)},
+          NpuEnqueue(std::move(calls), "swout", {{ARef(OutA(), NpuBytesOf("npubytes_swsite_" + std::to_string(ro)).a), WRef(0, ow)},
                                                  CRef(c.offset, c.length)});
         else
           NpuEnqueue(std::move(calls), site, {{Ref(npu_->A())}, CView(c)});   // (its own C: not after other C readers)
@@ -3283,6 +3338,7 @@ class LoomPrefill {
       }
       RunPendingNorm();
       RunKqgSplit(pre + "attn_q.weight", q_af, qs, nq);
+      PreDecodeOut(pre);   // (beside the kqg GEMM above)
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
       NpuJoin();
@@ -3520,6 +3576,7 @@ class LoomPrefill {
       RunPendingNorm();
       RunAlphaBeta(pre, ab_t);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
+      PreDecodeOut(pre);   // (beside the qkv GEMM above)
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
       NpuJoin(qkv_job);
       if (geom_.count(QkvHal("convkq_c", wqkv, nq))) {
@@ -3771,6 +3828,7 @@ class LoomPrefill {
   bool out_np4_ = false;           // ... from an NP 4 image (npu_unpack_out_4.hal)
   bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
   bool ffn_pendingsw_ = false;
+  std::map<std::string, std::pair<std::uint32_t, std::size_t>> predec_;   // (PreDecode) wname -> rows, A offset
   bool out_panel_ = false;         // the DeltaNet postnorm part a wrote the out site's token panel (_a_pn_gc)
   bool site_panel_ = false;        // the attention norm wrote the q / qkv sites' token panel (norm_t_pn.hal)     // ... from the swap-form down (npu_unpack_ffnblk_sw.hal, npu_unormsw_rr_*)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
