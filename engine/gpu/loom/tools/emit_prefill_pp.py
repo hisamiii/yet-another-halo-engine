@@ -1456,11 +1456,17 @@ def npu_split(rows, combos, B, outdir):
         N = mt * 16
         f = {"qkv": dict(out16=True), "gate": dict(out16=True), "q": dict(qg=True),
              "out": dict(resid=True, parts=len(npu_chunks("out")), rem=True)}[site]
+        # (YAH_NPU_SWSITE) qkv's and gate's C is the swap-form site image's (R rows): their direct readers take swap=R
+        # and the full unpack is not emitted (it has no swap form)
+        sw = GU.swap_rows(n) if SWSITE and site in ("qkv", "gate") else None
         name = "npu_unpack_%s%s.hal" % (site, sfx)
-        src = os.path.join(tmp, name[:-4] + ".loom")
-        open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
-        E.emit(src, ["nop=0"], name, outdir)
-        out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
+        if not sw:
+            src = os.path.join(tmp, name[:-4] + ".loom")
+            open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
+            E.emit(src, ["nop=0"], name, outdir)
+            out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
+        else:
+            assert site == "qkv" or (DNSPLIT and 384 in O16_MT), ("YAH_NPU_SWSITE: gate's C read by the postnorm", site)
         if site == "out" and NPU_FFNBLK and not NO_ONORM:
             # the same sum fused into the FFN block's norm ("norm_t_bfp_g1": its fragment-major f16 and the
             # one-replay-group stream): "npu_onorm<sfx>.hal", gen_half_norm.gen_osum (LoomPrefill::RunNorm)
@@ -1518,7 +1524,8 @@ def npu_split(rows, combos, B, outdir):
                 src = os.path.join(tmp, gname[:-4] + ".loom")
                 GE.ACT_PERM = perm
                 try:
-                    text = gen_postnorm_bfp.gen(B, h0, nh, list(NPU_KS), NPU_PASSES, tiled, True, bfp=bfp, gc=n)
+                    text = gen_postnorm_bfp.gen(B, h0, nh, list(NPU_KS), NPU_PASSES, tiled, True, bfp=bfp, gc=n,
+                                                gcswap=sw)
                 finally:
                     GE.ACT_PERM = "p4"
                 open(src, "w").write(text)
@@ -1528,12 +1535,13 @@ def npu_split(rows, combos, B, outdir):
             # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
             # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
             for hal, text, cfg in (
-                    ("npu_unpack_qkv_tail%s.hal" % sfx, GU.gen(B, n // GN.TN, N, N - n, out16=True, last8=True),
+                    ("npu_unpack_qkv_tail%s.hal" % sfx, GU.gen(B, n // GN.TN, N, N - n, out16=True, last8=True,
+                                                                         swap=sw),
                      ["nop=0"]),
                     ("convkq_g%s.hal" % sfx, gen_conv_kq.gen(N - n), ["yah_ssm_conv_kq.batch=%d" % B,
                                                                       "yah_ssm_conv_kq.qkv_dim=10240",
                                                                       "yah_ssm_conv_kq.num_key_heads=16"]),
-                    ("convkq_c%s.hal" % sfx, gen_conv_kq.gen_c(N - n, n // GN.TN, B), ["nop=0"])):
+                    ("convkq_c%s.hal" % sfx, gen_conv_kq.gen_c(N - n, n // GN.TN, B, swap=sw), ["nop=0"])):
                 src = os.path.join(tmp, hal[:-4] + ".loom")
                 open(src, "w").write(text)
                 E.emit(src, cfg, hal, outdir)
@@ -1548,7 +1556,7 @@ def npu_split(rows, combos, B, outdir):
                 for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
                     hal = "dnc_%s%s.hal" % (tag, sfx)
                     src = os.path.join(tmp, hal[:-4] + ".loom")
-                    open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh)), N - n, n // GN.TN, B))
+                    open(src, "w").write(gen_gdn_ss.gen(list(range(h0, h0 + nh)), N - n, n // GN.TN, B, swap=sw))
                     E.emit(src, ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
                                  "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
                                  "yah_deltanet.num_heads=48"], hal, outdir)
@@ -1557,7 +1565,7 @@ def npu_split(rows, combos, B, outdir):
                         # (YAH_DNC_GROUP) the same kernel over heads p0 .. p0 + g - 1: each workgroup's code unchanged
                         hp, pn = "dnc_a_p%d%s.hal" % (i, sfx), min(DNC_GROUP, h0 + nh - p0)
                         src = os.path.join(tmp, hp[:-4] + ".loom")
-                        open(src, "w").write(gen_gdn_ss.gen(list(range(p0, p0 + pn)), N - n, n // GN.TN, B))
+                        open(src, "w").write(gen_gdn_ss.gen(list(range(p0, p0 + pn)), N - n, n // GN.TN, B, swap=sw))
                         E.emit(src, ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
                                      "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
                                      "yah_deltanet.num_heads=48"], hp, outdir)
