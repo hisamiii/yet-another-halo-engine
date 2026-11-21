@@ -943,8 +943,8 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 # wgt p1k); dispatch.txt "npurswap <F>", "npubytes_ffnswap". The engine uses them with YAH_NPU_RSWAP=1 only.
 # The Q' pairs' other gate / up formats get their decoders into the same stream too ("npu_swdec_<fmt>_<g|u>.hal",
 # gen_kq_bfp stream): the swap image reads bfp16 only, so it serves every format.
-# YAH_DNSSC=1 (with a qkv split and dnsplit): DeltaNet as gen_gdn_ss reading the NPU's v channels from C ("dnc_*")
-DNSSC = os.environ.get("YAH_DNSSC") == "1"
+# YAH_DNSSC (default on, with a qkv split and dnsplit): DeltaNet as gen_gdn_ss reading the NPU's v channels from C ("dnc_*")
+DNSSC = os.environ.get("YAH_DNSSC", "1") != "0"   # (default on; "0": the chunked form)
 RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT", "1") != "0"   # (default on; "0": off)
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
