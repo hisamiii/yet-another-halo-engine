@@ -1430,6 +1430,10 @@ class LoomPrefill {
     return u.r == u.p && !apass ? std::to_string(u.p / 4)
                                 : "u" + std::to_string(u.r) + "_" + std::to_string(u.p) + "_" + std::to_string(apass);
   }
+  // (share-up F', whole units only, emit_prefill_pp ffnblk_front) the padded first part's pads at its front: H = [pads]
+  // [real units] (one run, as the swap's one call a panel writes it); its rows read from p - r blocks before its K
+  // segment's row (DNSEG: the previous row's, or the GPU segment's last row's, last blocks), times those zero pads
+  static bool FfnBlkFront(std::uint32_t F) { return F % 256 == 0 && F % 1024 && F % 1280; }
   static std::size_t FfnBlkHOf(std::uint32_t B, std::uint32_t F) {
     std::size_t units = 0;
     for (const FfnPart& u : FfnBlkUnits(F)) units += u.p;
@@ -1720,11 +1724,12 @@ class LoomPrefill {
       const std::uint32_t nt = B_ / 512;
       for (std::uint32_t i = 0; i < nt * nbk; ++i) {
         const std::uint32_t t = bouter ? i % nt : i / nbk, b = bouter ? i / nt : i % nbk;   // (call b: units uc b ..)
-          const std::uint32_t j = uc * b;
+          // (FfnBlkFront: H's real units from the first part's pads on)
+          const std::uint32_t j = uc * b, hf = FfnBlkFront(F) ? parts[0].p - parts[0].r : 0;
           csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs" + SwapTag(F) + ".xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a},
                                        {t * bw.w, bw.w},
-                                       {j / qu * qpart + std::size_t{j % qu} * 18432 + std::size_t{8} * t * qu * 18432,
-                                        std::size_t{nbk == 1 ? 8 * qu : 7 * qu + uc} * 18432}));
+                                       {j / qu * qpart + std::size_t{j % qu + hf} * 18432 + std::size_t{8} * t * qu * 18432,
+                                        std::size_t{nbk == 1 ? 8 * qu - hf : 7 * qu + uc} * 18432}));
         }
     }
     for (std::uint32_t j = 0; j < F / fc && !cpair && !rswap; ++j)   // (np5: a call's rows span 4 x 256 + 64)
@@ -1748,10 +1753,13 @@ class LoomPrefill {
       if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
       for (std::uint32_t r = 0; r < calls; ++r) {
         const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + u.u0;
-        // (a padded part's last row reads p - r blocks on: the next segment's, or past the tensor in its registered pad)
+        // (a padded part's last row reads p - r blocks on: the next segment's, or past the tensor in its registered pad;
+        // FfnBlkFront: its first row reads p - r blocks before, the GPU segment's last row's)
+        const std::size_t front = FfnBlkFront(F) && ks ? std::size_t{u.p - u.r} * blkd : 0;
+        if (FfnBlkFront(F) && !ks) throw LoomError("prefill: " + pre + "front-padded down parts need K segments");
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".xdna", DecoderId(fd.name),
                                         {qffn ? hbase(ci) : std::size_t{u.u0} * 18432, bd.a, true},
-                                        ks ? pd + td->dims[1] * (*ks)[ci + 1].first * blkd + r0 * srb(ci)
+                                        ks ? pd + td->dims[1] * (*ks)[ci + 1].first * blkd + r0 * srb(ci) - front
                                            : pd + r0 * rbd + k0 * blkd,
                                         (rows - 1) * srb(ci) + (16 + u.p - u.r) * blkd + RecordRow(fd.name),
                                         {doff + (ci * calls + r) * cp, cp}, fam));
