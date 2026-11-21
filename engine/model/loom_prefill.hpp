@@ -356,6 +356,10 @@ class LoomPrefill {
       fsum += mhz[i], fmin = std::min(fmin, mhz[i]), fmax = std::max(fmax, mhz[i]);
     }
     const bool each = std::string(std::getenv("YAH_CLK_PROBE")) == "2";
+    if (std::string(std::getenv("YAH_CLK_PROBE")) == "3")   // (diag) every wait: its job, entry (ms from the first probe), length
+      for (std::size_t k = 0; k < stamp_n_; ++k)
+        std::fprintf(f, "clk wait: %zu %s %.4f %.4f\n", k, k < stamp_tag_.size() ? stamp_tag_[k].c_str() : "?",
+                     static_cast<std::int32_t>(s[2 * k] - p[0]) * 1e-5, (s[2 * k + 1] - s[2 * k]) * 1e-5);
     const std::uint32_t a0 = p[0], span_t = p[4 * (clk_n_ - 1)] - a0;
     double waits = 0, cyc = 0, outside = 0;
     std::vector<double> wi(clk_n_, 0);
@@ -2926,6 +2930,10 @@ class LoomPrefill {
     } else if (stamp_) {   // YAH_CLK_PROBE: REALTIME at the wait's entry and exit to its own 8-byte slot (ReportClk)
       const bool rec = !npu_planning_ && !warming_;
       if (rec && stamp_n_ == kWaitLogSlots) throw LoomError("YAH_CLK_PROBE: more waits than stamp slots");
+      if (rec) {   // (YAH_CLK_PROBE=3: the wait's job, for the per-wait lines)
+        const NpuSplit::Queued& q = flagged_.at(job < 0 ? flagged_.size() - 1 : static_cast<std::size_t>(job));
+        stamp_tag_.resize(stamp_n_ + 1), stamp_tag_[stamp_n_] = std::to_string(q.layer) + " " + q.tag;
+      }
       w.words.push_back({stamp_->handle, (rec ? stamp_n_++ : 0) * 8, 8});
       Dispatch(Exe("npu_flag_wait_stamp.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 12, &w.npu_side);
     } else {
@@ -3886,6 +3894,7 @@ class LoomPrefill {
   std::vector<ClkFfn> clk_ffn_;
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
   std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
+  std::vector<std::string> stamp_tag_;   // (YAH_CLK_PROBE=3) each stamp slot's layer and job tag
   std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
   std::vector<std::uint32_t> prof_layers_;  // and their layers
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
