@@ -1374,7 +1374,17 @@ class LoomPrefill {
       for (const auto& [p0, n] : FfnBlkParts(F)) out.push_back({4 * p0, 4 * n, 4 * n});
       return out;
     }
-    if (F % 1280) throw LoomError("prefill: FFN block of " + std::to_string(F) + " features: not whole passes or groups");
+    if (F % 256 == 0 && F % 1280) {   // (share-up F', whole units: ceil(U / 4) passes in the fewest parts of <= 5,
+      // shorter first, the first padded: its over-read lands on the next K segment's rows, as FFNSW5's)
+      const std::uint32_t U = F / 256, P = (U + 3) / 4, n = (P + 4) / 5;
+      for (std::uint32_t i = 0, u0 = 0; i < n; ++i) {
+        const std::uint32_t p = 4 * (P / n + (i >= n - P % n)), r = p - (i ? 0 : 4 * P - U);
+        out.push_back({u0, r, p});
+        u0 += r;
+      }
+      return out;
+    }
+    if (F % 1280) throw LoomError("prefill: FFN block of " + std::to_string(F) + " features: not whole units");
     const std::uint32_t G = F / 1280, n = (G + 3) / 4;
     for (std::uint32_t i = 0, u0 = 0; i < n; ++i) {
       const std::uint32_t r = 5 * (G / n + (i >= n - G % n));
