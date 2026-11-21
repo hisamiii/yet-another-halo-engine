@@ -242,17 +242,67 @@ class LoomPrefill {
   // for its 20 us and the next kernel after it: ~1.5 ms a run with the probe on.
   void ClkProbe() {
     if (!clk_ || npu_planning_ || warming_ || halves_) return;
+    ClkDispatch("clk_probe.hal", "yah_clk_probe", {{clk_->handle, ClkSlot() * 16, 16}}, {Ref(*hidden_)});
+  }
+  std::size_t ClkSlot() {
     if (clk_n_ == kClkSlots) throw LoomError("YAH_CLK_PROBE: more probes than slots");
+    return clk_n_++;
+  }
+  void ClkDispatch(const char* hal, const char* name, const std::vector<hrx_buffer_ref_t>& b,
+                   const std::vector<hrx_buffer_ref_t>& after) {
     if (split_armed_ && graph_) SplitGraph();
-    const LoomExecutable& exe = Exe("clk_probe.hal");
-    const std::uint32_t ordinal = exe.OrdinalOrZero("yah_clk_probe");
+    const LoomExecutable& exe = Exe(hal);
+    const std::uint32_t ordinal = exe.OrdinalOrZero(name);
     const hrx_dispatch_config_t config = LoomDevice::Config(1, 1, 1, 32, 1, 1);
-    const hrx_buffer_ref_t b{clk_->handle, clk_n_++ * 16, 16};
-    const std::vector<hrx_buffer_ref_t> after{Ref(*hidden_)};
     if (graph_)
-      graph_->Dispatch(exe, ordinal, config, &b, 1, 1, &after);
+      graph_->Dispatch(exe, ordinal, config, b.data(), b.size(), 1, &after);
     else
-      gpu_.Dispatch(exe, ordinal, config, nullptr, 0, &b, 1);
+      gpu_.Dispatch(exe, ordinal, config, nullptr, 0, b.data(), b.size());
+  }
+  // YAH_CLK_PROBE=ffn, around one FFN gate / up GEMM (bindings b): a probe ordered after what it reads (it runs right
+  // before the GEMM: the graph runs a dispatch with dependencies after every earlier one) and one after what it writes.
+  // The probe can not run inside the GEMM in this graph (mem-clkffn2-gate: a dispatch with no dependencies launches as
+  // a root, ahead of the chunk), so the GEMM's clock is its two edge clocks.
+  struct ClkFfn {
+    std::uint32_t layer;
+    bool carry;
+    std::size_t edge, end;
+  };
+  void ClkFfnBegin(const std::vector<hrx_buffer_ref_t>& b, bool carry) {
+    if (!clk_ffn_on_ || !clk_ || npu_planning_ || warming_ || halves_) return;
+    clk_ffn_.push_back({layer_, carry, ClkSlot(), 0});
+    ClkDispatch("clk_probe.hal", "yah_clk_probe", {{clk_->handle, clk_ffn_.back().edge * 16, 16}}, b);
+  }
+  void ClkFfnEnd(const std::vector<hrx_buffer_ref_t>& b, std::uint64_t writes) {
+    if (!clk_ffn_on_ || !clk_ || npu_planning_ || warming_ || halves_) return;
+    std::vector<hrx_buffer_ref_t> out;
+    for (std::size_t i = 0; i < b.size(); ++i)
+      if ((writes >> i) & 1) out.push_back(b[i]);
+    clk_ffn_.back().end = ClkSlot();
+    ClkDispatch("clk_probe.hal", "yah_clk_probe", {{clk_->handle, clk_ffn_.back().end * 16, 16}}, out);
+  }
+  // YAH_CLK_PROBE=ffn: a line per GEMM call ("clk ffn: <layer> <carrier|plain> gemm <ms> edges <MHz> <MHz> <Mcyc>":
+  // REALTIME from the probe before it to the one after, the two probes' clocks, ms x their mean) and one per class
+  // (calls, mean ms, mean edge clocks, total and mean Mcyc)
+  void ReportClkFfn(std::FILE* f, const std::vector<std::uint32_t>& p) {
+    if (clk_ffn_.empty()) return;
+    const auto mhz = [&](std::size_t i) {
+      const std::uint32_t dt = p[4 * i + 1] - p[4 * i];
+      return dt ? ((p[4 * i + 3] - p[4 * i + 2]) & 0xfffffu) * 100.0 / dt : 0.0;
+    };
+    struct Sum { std::size_t n = 0; double ms = 0, before = 0, after = 0, mcyc = 0; };
+    std::map<std::string, Sum> cls;
+    for (const ClkFfn& c : clk_ffn_) {
+      const double ms = (p[4 * c.end] - p[4 * c.edge]) * 1e-5, a = mhz(c.edge), z = mhz(c.end);
+      const char* k = c.carry ? "carrier" : "plain";
+      const double mc = ms * (a + z) * 0.5e-3;
+      std::fprintf(f, "clk ffn: %u %s gemm %.3f ms edges %.0f %.0f MHz %.2f Mcyc\n", c.layer, k, ms, a, z, mc);
+      Sum& s = cls[k];
+      ++s.n, s.ms += ms, s.before += a, s.after += z, s.mcyc += mc;
+    }
+    for (const auto& [k, s] : cls)
+      std::fprintf(f, "clk ffn: class %s n %zu gemm %.3f ms mean, edges %.0f %.0f MHz mean, %.1f Mcyc total, %.2f mean\n",
+                   k.c_str(), s.n, s.ms / s.n, s.before / s.n, s.after / s.n, s.mcyc, s.mcyc / s.n);
   }
   // YAH_CLK_PROBE: after the run, one line: the GPU span from the first probe to the last (REALTIME), the flag waits
   // inside it, work = span - waits, and work in G cycles (each interval between probes at the mean clock of its two
@@ -262,6 +312,7 @@ class LoomPrefill {
     std::vector<std::uint32_t> p(clk_n_ * 4), s(stamp_n_ * 2);
     gpu_.D2H(*clk_, p.data(), p.size() * 4);
     if (stamp_n_) gpu_.D2H(*stamp_, s.data(), s.size() * 4);
+    ReportClkFfn(f, p);
     std::vector<double> mhz(clk_n_);
     double fsum = 0, fmin = 1e9, fmax = 0;
     for (std::size_t i = 0; i < clk_n_; ++i) {
@@ -288,6 +339,7 @@ class LoomPrefill {
     std::fprintf(f, "clk: span %.2f ms, waits %.2f ms (%zu, %.2f ms outside), work %.2f ms, work %.4f Gcyc = %.2f ms at "
                  "2600 MHz; clock %.0f MHz mean, %.0f..%.0f, %zu probes\n", span_t * 1e-5, waits, stamp_n_, outside,
                  span_t * 1e-5 - waits, cyc * 1e-9, cyc / 2.6e6, fsum / clk_n_, fmin, fmax, clk_n_);
+    std::fflush(f);   // (before the NPU's report, which writes to stderr: no lines cut into each other)
   }
   // YAH_NPU_PROF in a GPU + NPU run: after it, the first NPU chunk's per-job counters as CPU-driven runs print them
   // (tools/npu_prof.py; no per-job host time: 0).
@@ -551,7 +603,7 @@ class LoomPrefill {
     if (npu_attn_ && ci >= na_from_) ++na_seq_;  // the layers' ready / done values (words are reused per chunk)
     flagged_.clear();
     npu_job_ = 0, npu_cleared_ = 0, npu_joined_ = 0;
-    if (ci == 0) clk_n_ = 0, stamp_n_ = 0;   // (YAH_CLK_PROBE: ReportClk reads the last pass's chunks)
+    if (ci == 0) clk_n_ = 0, stamp_n_ = 0, clk_ffn_.clear();   // (YAH_CLK_PROBE: ReportClk reads the last pass's chunks)
     swap_layer_.clear(), swap_reader_[0] = swap_reader_[1] = -1, part_done_[0] = part_done_[1] = -1;   // (halves: a chunk's job indices start again; its graph runs after the last)
     job_side_.clear();
     NewGraph();
@@ -1140,6 +1192,7 @@ class LoomPrefill {
       if (!geom_.count("clk_probe.hal")) throw LoomError("YAH_CLK_PROBE: the set has no clk_probe.hal (re-emit it)");
       clk_ = &Alloc(kClkSlots * 16);
       if (geom_.count("npu_flag_wait_stamp.hal")) stamp_ = &Alloc(kWaitLogSlots * 8);
+      clk_ffn_on_ = std::string(std::getenv("YAH_CLK_PROBE")) == "ffn";   // (also around each FFN gate / up GEMM)
     }
     scratch_ = &Alloc(B * kFfn * 2);
     qkv_ = &Alloc(B * kQProj * 4);
@@ -2035,7 +2088,9 @@ class LoomPrefill {
       const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (tg->type != tu->type ? "_" + std::string(fu.name) : "") + "_ffn";
       std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
       if (carry) r5_bind(b, wmask), SlotFree((r5k + 1) % 2);
+      ClkFfnBegin(b, carry);
       Dispatch(Exe(carry ? r5h : fh), sym.c_str(), (M - F) / 16 / g.rowgrp, tt, 1, 32, 1, 1, b, wmask);
+      ClkFfnEnd(b, wmask);
       if (carry) part_done_[half_] = static_cast<std::int64_t>(r5k), carriers_[half_] += !npu_planning_;
     } else if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
@@ -2050,8 +2105,10 @@ class LoomPrefill {
       std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
       if (carry) r5_bind(b, wmask), SlotFree((r5k + 1) % 2);   // (R5Fuse) swap layer k + 1's NPU rows, other half
       const std::string& gh = carry ? r5h : sh;
+      ClkFfnBegin(b, carry);
       Dispatch(Exe(gh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(gh).rowgrp, tt, 1,
                32, 1, 1, b, wmask);
+      ClkFfnEnd(b, wmask);
       if (carry) part_done_[half_] = static_cast<std::int64_t>(r5k), carriers_[half_] += !npu_planning_;
     }
     // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
@@ -3577,6 +3634,8 @@ class LoomPrefill {
   LoomBuffer* clk_ = nullptr;     // YAH_CLK_PROBE: 16 bytes a probe (ClkProbe, ReportClk)
   LoomBuffer* stamp_ = nullptr;   // YAH_CLK_PROBE: 8 bytes a flag wait (NpuJoin)
   std::size_t clk_n_ = 0, stamp_n_ = 0;
+  bool clk_ffn_on_ = false;        // YAH_CLK_PROBE=ffn
+  std::vector<ClkFfn> clk_ffn_;
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
   std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
   std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)
