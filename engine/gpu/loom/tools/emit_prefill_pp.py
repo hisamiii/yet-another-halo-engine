@@ -2089,6 +2089,14 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                             E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                                          "yah_half_norm.fused=0"], nm_ + ".hal", outdir)
                             out.append((nm_ + ".hal", B // 4, 32 * 4 * 4, 0))
+                    for f16 in ("r", "t", "rt") if SWSITE else ():   # (swap-form sites: no stream, "_ns")
+                        nm_ = "npu_unormsw_rr_%s_ns" % f16
+                        src = os.path.join(tmp, nm_ + ".loom")
+                        open(src, "w").write(gen_half_norm.gen_unorm(B, list(NPU_KS), NPU_PASSES, 2, False, remres=True,
+                                                                     f16=f16, swap=5120, stream=False))
+                        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                                     "yah_half_norm.fused=0"], nm_ + ".hal", outdir)
+                        out.append((nm_ + ".hal", B // 4, 32 * 4 * 4, 0))
         finally:
             GU.CG = cg_
         out.append(("npuswdown", 1, 0, 0))
