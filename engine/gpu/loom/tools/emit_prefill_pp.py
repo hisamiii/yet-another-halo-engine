@@ -2386,7 +2386,15 @@ def main():
         import gen_npu_unpack as GU
         kdb, groups, cg = gen_attn_fa.R2P_KDB, GE.GROUPS, GU.CG
         GE.GROUPS, GU.CG = (NPU_PASSES,), 1   # (npu_split: one replay group per call, so C is one partial)
-        for sfx, np_, nq in (("", NPU_NP, NPU_SPLIT["q"]), ("_4", 4, npu_rows4("q"))):
+        qfmt = {nm: E.FMT[ty][0] for nm, dims, ty in rows if nm.startswith("blk.") and E.FMT.get(ty)}
+        qrows = [("", NPU_NP, NPU_SPLIT["q"]), ("_4", 4, npu_rows4("q"))]
+        for (site, L), nn in sorted(NPU_SPLIT_LAYERS.items()):   # (per-layer q rows: "_n<rows>", as npu_unpack_q)
+            q4 = site == "q" and np4(qfmt["blk.%d.attn_q.weight" % L])
+            if site == "q" and nn != (npu_rows4("q") if q4 else NPU_SPLIT["q"]):
+                v = ("_4" if q4 else "") + "_n%d" % nn, 4 if q4 else NPU_NP, nn
+                if v not in qrows:
+                    qrows.append(v)
+        for sfx, np_, nq in qrows:
             for tiled in ((False, True) if af24 else (False,)):
                 hal = "wmma%s_qc%s.hal" % ("_t" if tiled else "", sfx)
                 src_ = os.path.join(tmp, hal[:-4] + ".loom")
