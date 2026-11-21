@@ -666,10 +666,6 @@ class LoomPrefill {
         // the job's time from its ready store to its done word (its command's setup and image switch included)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "npu cpu-driven: job %zu %s layer %u %.3f ms\n", i, jobs[i].tag.c_str(), jobs[i].layer, ms);
-        if (std::getenv("YAH_NPU_CPU_TS"))   // (diag) the job's ready store and done, CLOCK_MONOTONIC s (df counter series)
-          std::fprintf(stderr, "npu cpu-driven: ts %zu %s %u %.6f %.6f\n", i, jobs[i].tag.c_str(), jobs[i].layer,
-                       std::chrono::duration<double>(t0.time_since_epoch()).count(),
-                       std::chrono::duration<double>(t0.time_since_epoch()).count() + ms / 1e3);
         if (std::getenv("YAH_NPU_CPU_GO"))   // (diag) the job's go record: [ready value, status, polls, -]
           std::fprintf(stderr, "npu cpu-driven: go %08x %u %u %08x\n", npu_->HostLoad(w.ready + 32),
                        npu_->HostLoad(w.ready + 33), npu_->HostLoad(w.ready + 34), npu_->HostLoad(w.ready + 35));
