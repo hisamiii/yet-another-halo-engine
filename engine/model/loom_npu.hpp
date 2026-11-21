@@ -1500,9 +1500,44 @@ class LoomNpu {
         out.insert(out.end(), w, w + 24), ++ops;
       }
     }
+    if (WriteMerge()) MergeWrites(out, ops);
     const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
     std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
     return out;
+  }
+  // (WriteMerge) A block write that continues the block write right before it (the next address, nothing between)
+  // joins it: the same words in the same order, one operation less (a setup's operations cost ~61 ns each beside
+  // ~1.5 ns a byte; a switch's DMA descriptors are ~500 such neighbours: ~30 us a switch). YAH_NPU_WMERGE=0: off.
+  static bool WriteMerge() {
+    static const bool on = [] { const char* e = std::getenv("YAH_NPU_WMERGE"); return !e || std::strcmp(e, "0"); }();
+    return on;
+  }
+  static void MergeWrites(std::vector<std::uint8_t>& out, std::uint32_t& ops) {
+    std::vector<std::uint8_t> m(out.begin(), out.begin() + 16);
+    std::size_t last = 0;   // the last operation in m when it is a block write (its offset), else 0
+    std::uint32_t merged = 0;
+    for (std::size_t o = 16; o < out.size();) {
+      std::uint32_t len = out[o] == 0 ? 24 : out[o] == 3 ? 28 : 0;
+      if (out[o] == 1) std::memcpy(&len, &out[o + 12], 4);
+      else if (!len) std::memcpy(&len, &out[o + 4], 4);
+      if (len < 8 || o + len > out.size()) throw LoomError("npu: MergeWrites: a malformed operation");
+      if (out[o] == 1 && last) {
+        std::uint32_t pa = 0, pl = 0, a = 0;
+        std::memcpy(&pa, &m[last + 8], 4), std::memcpy(&pl, &m[last + 12], 4), std::memcpy(&a, &out[o + 8], 4);
+        if (pa + (pl - 16) == a && (pa >> 20) == (a >> 20) && len > 16) {
+          m.insert(m.end(), out.begin() + o + 16, out.begin() + o + len);
+          pl += len - 16;
+          std::memcpy(&m[last + 12], &pl, 4);
+          ++merged, o += len;
+          continue;
+        }
+      }
+      last = out[o] == 1 ? m.size() : 0;
+      m.insert(m.end(), out.begin() + o, out.begin() + o + len);
+      o += len;
+    }
+    out.swap(m);
+    ops -= merged;
   }
   // DeltaSetup's control packets: lane 5 is MM2S0 -> shim north 5 -> memtile south 5 / north 5 -> core south 5, up
   // the column; each core tile takes the packets of its row (packet id) to TILE_CONTROL and passes the rest north.
@@ -1954,7 +1989,8 @@ class LoomNpu {
             for (std::size_t q = 16; q < ds.size();) {
               std::uint32_t len = ds[q] == 0 ? 24 : ds[q] == 3 ? 28 : 0, a = 0;
               if (ds[q] == 1) std::memcpy(&len, &ds[q + 12], 4);
-              else if (ds[q] == 128) std::memcpy(&len, &ds[q + 4], 4);
+              else if (!len) std::memcpy(&len, &ds[q + 4], 4);   // (128 waits, 130 PROF_MID reads: size at +4)
+              if (len < 8) break;
               std::memcpy(&a, &ds[q + 8], 4);
               n[ds[q] == 0 ? 0 : ds[q] == 3 ? 1 : ds[q] == 1 ? 2 : 3]++;
               if (ds[q] == 1) {
