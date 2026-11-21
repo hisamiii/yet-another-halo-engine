@@ -1810,10 +1810,16 @@ class LoomPrefill {
     const auto parts = FfnBlkUnits(F);
     const std::uint32_t apass = FfnBlkApass(F);
     const bool hap = apass && geom_.count("npuhapass");   // (equal parts, H [M block][units]: the swap's nb 256)
+    const bool rsw0 = RSwapOn() && (!pair || mix) && (pair || !geom_.count("npuffnsw5")) && geom_.count("npuffnq") &&
+                      !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && (apass == 0 || hap) &&
+                      RSwapF(F) && B_ % 512 == 0 && parts[0].p % 4 == 0 &&
+                      (SwapTag(F).empty() || (geom_.count("npu_swdec_" + std::string(f.name) + "_g" + SwapTag(F) + ".hal") &&
+                                              geom_.count("npu_swdec_" + std::string(fu.name) + "_u" + SwapTag(F) + ".hal")));
     std::vector<std::string> dn;
     for (const FfnPart& u : parts) {
       dn.push_back(dir_ + "/npu_ffndn" + DnTag(u, apass) + "_" + fd.name);
-      if (::access((dn.back() + ".xdna").c_str(), R_OK)) return false;
+      // (a swap-down layer binds none: emit_prefill_pp does not emit them under YAH_NPU_SWDOWN)
+      if (!(rsw0 && SwDown()) && ::access((dn.back() + ".xdna").c_str(), R_OK)) return false;
     }
     if ((pair ? gs.empty() || us.empty() || !Af("gemm_kstore", pre + "ffn_gate.weight") ||
                     !Af("gemm_swiglu", pre + "ffn_up.weight")
@@ -1828,11 +1834,6 @@ class LoomPrefill {
     if (dfr && ::access((dir_ + "/norm_t_bfp_g1s.hal").c_str(), R_OK)) return false;
     // (row 5 swap) this layer swaps (rswap below, checked equal); panel: its FFN norm writes the swap's token panel
     // into W ("<norm>_pn.hal", gen_half_norm PANEL) and the swap skips npu_swpanel.hal
-    const bool rsw0 = RSwapOn() && (!pair || mix) && (pair || !geom_.count("npuffnsw5")) && geom_.count("npuffnq") &&
-                      !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && (apass == 0 || hap) &&
-                      RSwapF(F) && B_ % 512 == 0 && parts[0].p % 4 == 0 &&
-                      (SwapTag(F).empty() || (geom_.count("npu_swdec_" + std::string(f.name) + "_g" + SwapTag(F) + ".hal") &&
-                                              geom_.count("npu_swdec_" + std::string(fu.name) + "_u" + SwapTag(F) + ".hal")));
     const bool panel = rsw0 && !dfr && PanelNorm();
     const bool panelq = panel && PanelQ();   // (the norm runs below, once the swap's calls are bound)
     if (!panelq) RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk", false, panel);

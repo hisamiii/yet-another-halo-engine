@@ -1668,7 +1668,8 @@ def npu_images(images, B, tmp, outdir, extra=()):
                  "npu_dcol_%s_%d" % (fmt, K), GN.NP) for fmt, K in sorted(images)]
     cfgs = jobs + list(extra)   # (all configs: the dispatch.txt lines below)
     # (swap-form sites: the in-core site images are never bound, LoomPrefill::NpuOk / SwSiteOf; not compiled)
-    jobs = [j for j in jobs if not SWSITE] + list(extra)
+    # (the swap down: the in-core down images are never bound either, LoomPrefill::FfnBlkOk's rsw0 && SwDown())
+    jobs = [j for j in jobs if not SWSITE] + [j for j in extra if not (SWDOWN and j[1].startswith("npu_ffndn"))]
 
     # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
     def source(cfg, name, np_):
