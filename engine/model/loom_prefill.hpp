@@ -251,6 +251,25 @@ class LoomPrefill {
       return;
     }
     const std::vector<std::uint32_t> v = prof->Finish(prof_tags_.size());
+    if (prof->Clock()) {   // (YAH_NPU_PROF=clock) "npu clk: jobs <n> busy <ticks> span <ticks> idle <ticks>": NPU work
+      std::uint64_t busy = 0;   // in array cycles, its span from the first gate to the last done, the rest idle;
+      std::map<std::string, std::pair<std::size_t, std::uint64_t>> tag;   // then "npu clk: tag <tag> jobs <n> busy <ticks>"
+      const auto& ts = prof->times();
+      for (std::size_t i = 0; i < ts.size(); ++i) {
+        busy += ts[i].done - ts[i].gate;
+        auto& [n, b] = tag[i < prof_tags_.size() ? prof_tags_[i] : "?"];
+        ++n, b += ts[i].done - ts[i].gate;
+      }
+      const std::uint64_t span = ts.empty() ? 0 : ts.back().done - ts.front().gate;
+      std::fprintf(stderr, "npu clk: jobs %zu busy %llu span %llu idle %llu\n", ts.size(),
+                   static_cast<unsigned long long>(busy), static_cast<unsigned long long>(span),
+                   static_cast<unsigned long long>(span > busy ? span - busy : 0));
+      for (const auto& [t, nb] : tag)
+        std::fprintf(stderr, "npu clk: tag %s jobs %zu busy %llu\n", t.c_str(), nb.first,
+                     static_cast<unsigned long long>(nb.second));
+      PrintNpuTimes(*prof, prof_tags_, prof_layers_);
+      return;
+    }
     std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
     for (std::size_t i = 0; i < prof_tags_.size(); ++i) {
       // (the field after the tag: the job's counter setting, YAH_NPU_PROF_ROT)

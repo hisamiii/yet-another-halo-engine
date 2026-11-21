@@ -12,6 +12,9 @@
 // stream). Unset: those counters count nothing.
 // The read also takes core tile (0, 2)'s 64-bit timer (array clock cycles, the last two values): with event 1 (TRUE) on
 // core counter 0, the job's gate opened at timer - that tile's counter 0 (Finish: times()).
+// YAH_NPU_PROF=clock: only tile (0, 2)'s counter 0 (TRUE) and timer, 3 writes and a 3-word read a job: the jobs' gate
+// and done times (NPU work in array cycles, independent of the clock rate) at a fraction of the counters' cost; the
+// engine prints one "npu clk:" line a run (LoomPrefill::ReportNpuProf).
 // YAH_NPU_PROF_ROT="s0;s1;...": several counter settings in one run, each "c0,c1,c2,c3/m0,m1[@combo][#pc dir]"
 // (combo as YAH_NPU_PROF_COMBO, the PC files' directory as YAH_NPU_PROF_PC; a part left out: those variables'). An
 // image's n-th job counts with setting n % count (chosen(): each Setup's setting, in job order), so the jobs of one
@@ -51,16 +54,20 @@ class NpuProf {
   // cols: the context's columns (the engine's 8; a narrower context's run_once tools fewer), counted from column 0
   explicit NpuProf(const char* spec, std::uint32_t cols = kCols) : cols_(cols) {
     if (cols_ < 1 || cols_ > kCols) throw LoomError("npu prof: bad column count");
-    if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c_[0], &c_[1], &c_[2], &c_[3], &m_[0], &m_[1]) != 6)
-      throw LoomError(std::string("YAH_NPU_PROF: want c0,c1,c2,c3/m0,m1 event ids, got ") + spec);
+    clock_ = !std::strcmp(spec, "clock");
+    if (clock_)
+      c_[0] = 1;   // (TRUE)
+    else if (std::sscanf(spec, "%u,%u,%u,%u/%u,%u", &c_[0], &c_[1], &c_[2], &c_[3], &m_[0], &m_[1]) != 6)
+      throw LoomError(std::string("YAH_NPU_PROF: want c0,c1,c2,c3/m0,m1 event ids or clock, got ") + spec);
     std::vector<std::uint32_t> addr;   // the counters READ_REGS reads, per tile
-    for (std::uint32_t col = 0; col < cols_; ++col)
+    if (clock_) addr.push_back((kRow0 << 20) + 0x31520);
+    for (std::uint32_t col = 0; col < cols_ && !clock_; ++col)
       for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row) {
         const std::uint32_t t = col << 25 | row << 20;
         for (std::uint32_t r = 0; r < kCore; ++r) addr.push_back(t + 0x31520 + 4 * r);
         for (std::uint32_t r = 0; r < kMem; ++r) addr.push_back(t + 0x11020 + 4 * r);
       }
-    for (std::uint32_t col = 0; col < cols_; ++col) {
+    for (std::uint32_t col = 0; col < cols_ && !clock_; ++col) {
       for (std::uint32_t r = 0; r < kMt; ++r) addr.push_back((col << 25 | 1u << 20) + 0x91020 + 4 * r);
       for (std::uint32_t r = 0; r < kShim; ++r) addr.push_back((col << 25) + 0x31020 + 4 * r);
     }
@@ -186,6 +193,11 @@ class NpuProf {
       }
     }
     auto ctl = [](unsigned a, unsigned b) { return (a & 127) | (a & 127) << 8 | (b & 127) << 16 | (b & 127) << 24; };
+    if (clock_) {   // (YAH_NPU_PROF=clock) tile (0, 2): stop, zero counter 0, count TRUE
+      Write(ops, (kRow0 << 20) + 0x31500, 0), Write(ops, (kRow0 << 20) + 0x31520, 0);
+      Write(ops, (kRow0 << 20) + 0x31500, ctl(set.c[0], 0));
+      return ops;
+    }
     for (std::uint32_t col = 0; col < cols_; ++col)
       for (std::uint32_t row = kRow0; row < kRow0 + kRows; ++row) {
         const std::uint32_t t = col << 25 | row << 20;
@@ -210,6 +222,7 @@ class NpuProf {
     return ops;
   }
   std::uint32_t SetupOps() const {
+    if (clock_) return 3;
     return cols_ * kRows * (3 + kCore + kMem + 4 + 2 + 3) + cols_ * (3 + kMt + kShim + 1 + 3) -
            (ShimKeep() ? cols_ * (2 + kShim + 2 + kMt + 2) : 0);
   }
@@ -219,6 +232,7 @@ class NpuProf {
     static const bool on = std::getenv("YAH_NPU_PROF_SHIM_KEEP") != nullptr;
     return on;
   }
+  bool Clock() const { return clock_; }
   // words per job (kValues with the engine's 8 columns)
   std::uint32_t Values() const { return nvals_; }
   const std::vector<std::uint8_t>& Read() const { return read_; }
@@ -305,6 +319,7 @@ class NpuProf {
   std::uint32_t combo_[2] = {};
   std::uint32_t cols_ = kCols;
   std::uint32_t nvals_ = 0;
+  bool clock_ = false;   // (YAH_NPU_PROF=clock)
   unsigned c_[kCore] = {}, m_[kMem] = {}, mt_[kMt] = {}, sh_[kShim] = {};
   std::uint32_t mt_sel_ = 0;
   std::map<std::string, std::vector<std::uint8_t>> setup_;   // per image
