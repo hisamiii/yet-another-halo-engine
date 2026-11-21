@@ -1068,12 +1068,20 @@ def dn_tag(r, p, ap):
     return "%d" % (p // 4) if r == p and not ap else "u%d_%d_%d" % (r, p, ap)
 
 
+def ffnblk_front(F):
+    """(share-up F', whole units only) the padded first part's pads at its FRONT: H = [pads][real units] (one run, as
+    the swap's one call a panel writes it); its weight rows read from p - r blocks before its K segment's row (the
+    previous row's, or the GPU segment's last row's, last blocks: inside the tensor) times those zero pads."""
+    return F % 256 == 0 and F % 1024 != 0 and F % 1280 != 0
+
+
 def ffnblk_pads(F, B):
-    """H's pad units (zero, the padded parts' last units) as (first unit, units apart) over the 64-token M blocks."""
+    """H's pad units (zero, the padded parts' last units; ffnblk_front: first units) as (first unit, units apart) over
+    the 64-token M blocks."""
     us, ap, nb, out = ffnblk_units(F), ffnblk_apass(F), B // 64, []
     for i, (_, r, p) in enumerate(us):
         base = sum(u[2] for u in us[:i]) if ap else i * nb * p
-        out.extend((base + k, ap or p) for k in range(r, p))
+        out.extend((base + k, ap or p) for k in (range(p - r) if ffnblk_front(F) else range(r, p)))
     return out
 
 
@@ -1767,8 +1775,9 @@ def r5_carriers(by, nn, last, split, FL=None):
                                 **(AF_FFN_MIX[(gf, uf)] if mx else AF_FFN[gf]), ffn=True, tout=True)
         # (the .fp's dz_w: the raw binding the payloads read, gate's n rows then up's, clamped below n (rb_g + rb_u))
         rb = lambda f_: gen_r5fuse.RBG if f_ == "iq4xs" else gen_r5kq.PAYLOADS[f_].row_bytes
-        E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5%s" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu))] = \
-            {"dz_w": n * (rb(pg) + rb(pu))}
+        # (share-up: the "_f<F'>" carriers' stem too; the bound is the whole binding, any F)
+        E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5%s%s" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu),
+                                                      "" if fb == nn else "_f%d" % fb)] = {"dz_w": n * (rb(pg) + rb(pu))}
         split(gf if gf == uf else gf + ":" + uf, "ffn", mt, kb, t,
               "gemm_ffn_%s_%d_%d.af.to.r5%s%s.hal" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu),
                                                      "" if fb == nn else "_f%d" % fb), fa,
@@ -2107,20 +2116,23 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     swj = next((j for j in jobs if j[1] == "npu_ffnswap_iq4xs"), None)
     if swj:   # (YAH_NPU_RSWAP_EMIT) the swap's GPU side: the NPU rows' decoders, the token panel
         import gen_iq4xs_bfp
-        st_ = dict(ks=RSWAP_KS, passes=RSWAP_PASSES, tile=64)
-        for up_, nm_ in ((0, "npu_swdec_iq4xs_g"), (1, "npu_swdec_iq4xs_u")):
-            src = os.path.join(tmp, nm_ + ".loom")
-            open(src, "w").write(gen_iq4xs_bfp.gen(FS, 5120, dict(st_, up=up_)))
-            E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
-            out.append((nm_ + ".hal", gen_iq4xs_bfp.items(FS, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(FS, 5120, st_)))
+        st_ = dict(ks=RSWAP_KS, passes=RSWAP_PASSES, tile=64, **({"horder": R5_ROWS} if R5_ROWS else {}))
         import gen_kq_bfp
-        for fm_ in sorted({l[t_][0] for l in pairs for t_ in ("ffn_gate", "ffn_up")} & RSWAP_KQ.keys()):
-            for up_, g_ in ((0, "g"), (1, "u")):
-                nm_ = "npu_swdec_%s_%s" % (fm_, g_)
+        # (share-up) each F' of the table too: "npu_swdec_<fmt>_<g>_<F'>.hal"
+        for f_ in [FS] + [v for v in FV if v != FS]:
+            fx = "" if f_ == FS else "_%d" % f_
+            for up_, nm_ in ((0, "npu_swdec_iq4xs_g" + fx), (1, "npu_swdec_iq4xs_u" + fx)):
                 src = os.path.join(tmp, nm_ + ".loom")
-                open(src, "w").write(gen_kq_bfp.gen(RSWAP_KQ[fm_], FS, 5120, dict(st_, up=up_)))
+                open(src, "w").write(gen_iq4xs_bfp.gen(f_, 5120, dict(st_, up=up_)))
                 E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
-                out.append((nm_ + ".hal", gen_kq_bfp.items(FS, 5120), gen_kq_bfp.WG, gen_kq_bfp.out_bytes(FS, 5120, st_)))
+                out.append((nm_ + ".hal", gen_iq4xs_bfp.items(f_, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(f_, 5120, st_)))
+            for fm_ in sorted({l[t_][0] for l in pairs for t_ in ("ffn_gate", "ffn_up")} & RSWAP_KQ.keys()):
+                for up_, g_ in ((0, "g"), (1, "u")):
+                    nm_ = "npu_swdec_%s_%s%s" % (fm_, g_, fx)
+                    src = os.path.join(tmp, nm_ + ".loom")
+                    open(src, "w").write(gen_kq_bfp.gen(RSWAP_KQ[fm_], f_, 5120, dict(st_, up=up_)))
+                    E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+                    out.append((nm_ + ".hal", gen_kq_bfp.items(f_, 5120), gen_kq_bfp.WG, gen_kq_bfp.out_bytes(f_, 5120, st_)))
         src = os.path.join(tmp, "npu_swpanel.loom")
         open(src, "w").write(GE.gen("wgt", B, RSWAP_KS, RSWAP_PASSES, 64, True, True, p1k=True))
         E.emit(src, ["nop=0"], "npu_swpanel.hal", outdir)
