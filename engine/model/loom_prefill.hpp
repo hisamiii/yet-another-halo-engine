@@ -237,8 +237,9 @@ class LoomPrefill {
     for (const auto& [tag, n] : per_tag)
       std::fprintf(f, "npu wait: %-8s %llu polls\n", tag.c_str(), static_cast<unsigned long long>(n));
   }
-  // YAH_CLK_PROBE: one probe (16-byte slot: t0, t1, c0, c1). Ordered after the hidden state's last write as if it
-  // read it ("after": nothing later waits for it), so it runs beside the layer's kernels, off their chain.
+  // YAH_CLK_PROBE: one probe (16-byte slot: t0, t1, c0, c1), ordered after the hidden state's last write as if it read
+  // it. The graph runs a dispatch with dependencies after every earlier one (mem-clkffn-gate), so the probe runs alone
+  // for its 20 us and the next kernel after it: ~1.5 ms a run with the probe on.
   void ClkProbe() {
     if (!clk_ || npu_planning_ || warming_ || halves_) return;
     if (clk_n_ == kClkSlots) throw LoomError("YAH_CLK_PROBE: more probes than slots");
