@@ -435,6 +435,104 @@ def had64(e, pre, vecs, xors, scale):
     return out
 
 
+# QC = (cbound, tokens): the NPU's q projection rows (heads x [256 q | 256 gate], columns cbound .. 12287) are read
+# straight from its C (gen_npu_unpack's qg layout at the current GN.TN / NP and GU.CG: the split's one replay
+# group, or g0 + g1 as the unpack's vector.addf), binding %cbuf last: the q unpack goes (emit_prefill_pp "wmma[_t]_qc<sfx>.hal"). Each load group's
+# head half is wave-uniform (cbound % 128 == 0), so the C / buffer choice is one uniform branch per group.
+QC = None
+QC_N = [0]
+
+
+def qc_setup(e):
+    import gen_npu_gemm as GN
+    import gen_npu_unpack as GU
+    cb, tok = QC
+    nq = 12288 - cb
+    assert cb % 128 == 0 and nq > 0 and nq % GN.TN == 0 and GU.CG in (1, 2)
+    e(f"  %qc_nc = index.constant {tok * nq * GU.CG // 2} : index")
+    e("  %qc_cv = buffer.view %cbuf[%base] : buffer -> view<[%qc_nc]xi32>")
+    e("  %qc_c2 = index.constant 2 : index")
+    e("  %qc_c16i = scalar.constant 16 : i32")
+    e("  %qc_chii = scalar.constant -65536 : i32")
+    e(f"  %qc_cgs = index.constant {tok * GN.TN} : index")
+    e(f"  %qc_cb = index.constant {cb} : index")
+    e(f"  %qc_last = index.constant {tok * nq * GU.CG - 8 - tok * GN.TN * (GU.CG - 1)} : index")
+    e("  %qc_c256 = index.constant 256 : index")
+    e("  %qc_c512 = index.constant 512 : index")
+    e("  %qc_c6144 = index.constant 6144 : index")
+
+
+def qc_c8(e, n, idx):
+    """the 8 f32 C values of one group from element idx (a multiple of 8): bf16 pairs, the low half first"""
+    e(f"  %{n}w = index.div {idx}, %qc_c2 : index")
+    e(f"  %{n}v = vector.load %qc_cv[%{n}w] : view<[%qc_nc]xi32> -> vector<4xi32>")
+    vals = []
+    for w in range(4):
+        e(f"  %{n}e{w} = vector.extract %{n}v[{w}] : vector<4xi32> -> i32")
+        e(f"  %{n}l{w} = scalar.shli %{n}e{w}, %qc_c16i : i32")
+        e(f"  %{n}h{w} = scalar.andi %{n}e{w}, %qc_chii : i32")
+        e(f"  %{n}lf{w} = scalar.bitcast %{n}l{w} : i32 to f32")
+        e(f"  %{n}hf{w} = scalar.bitcast %{n}h{w} : i32 to f32")
+        vals += [f"%{n}lf{w}", f"%{n}hf{w}"]
+    return vals
+
+
+def qc_wrap(e, gate, runs, view, vt):
+    """runs: [(dst_a, dst_b, idx)] of 8-float runs (dst_b at idx + 4) of one head half in the f32 [token][6144] q or
+    gate buffer: emits both as one uniform branch, C for the NPU's columns, the buffer otherwise"""
+    import gen_npu_gemm as GN
+    import gen_npu_unpack as GU
+    p = f"qc{QC_N[0]}_"
+    QC_N[0] += 1
+    i0 = runs[0][2]
+    e(f"  %{p}r = index.rem {i0}, %qc_c6144 : index")
+    e(f"  %{p}tok = index.div {i0}, %qc_c6144 : index")
+    e(f"  %{p}h = index.div %{p}r, %qc_c256 : index")
+    e(f"  %{p}d = index.rem %{p}r, %qc_c256 : index")
+    e(f"  %{p}hc = index.mul %{p}h, %qc_c512 : index")
+    e(f"  %{p}col0 = index.add %{p}hc, %{p}d : index")
+    if gate:
+        e(f"  %{p}col = index.add %{p}col0, %qc_c256 : index")
+    else:
+        e(f"  %{p}col = index.add %{p}col0, %c0 : index")
+    e(f"  %{p}n = index.cmp uge, %{p}col, %qc_cb : index")
+    tys = ", ".join([V4] * (2 * len(runs)))
+    outs = [x for a, b, _ in runs for x in (a, b)]
+    e(f"  {', '.join(outs)} = scf.if %{p}n -> ({tys}) {{")
+    tb = GU.c_tok(e, p + "t", f"%{p}tok")
+    ys = []
+    for k, (a, b, idx) in enumerate(runs):
+        q = f"{p}{k}"
+        e(f"  %{q}dl = index.sub {idx}, {i0} : index")
+        e(f"  %{q}c = index.add %{p}col, %{q}dl : index")
+        e(f"  %{q}cm = index.max %{q}c, %qc_cb : index")
+        e(f"  %{q}j = index.sub %{q}cm, %qc_cb : index")
+        la = GU.c_lane(e, q + "l", f"%{q}j", QC[1])
+        e(f"  %{q}a0 = index.add {la}, {tb} : index")
+        e(f"  %{q}a = index.min %{q}a0, %qc_last : index")
+        sm = qc_c8(e, q + "g0", f"%{q}a")
+        if GU.CG == 2:   # (the unpack's load_cg: g0 + g1)
+            e(f"  %{q}b = index.add %{q}a, %qc_cgs : index")
+            g1 = qc_c8(e, q + "g1", f"%{q}b")
+            for i in range(8):
+                e(f"  %{q}s{i} = scalar.addf {sm[i]}, {g1[i]} : f32")
+            sm = [f"%{q}s{i}" for i in range(8)]
+        e(f"  %{q}va = vector.from_elements {', '.join(sm[:4])} : {V4}")
+        e(f"  %{q}vb = vector.from_elements {', '.join(sm[4:])} : {V4}")
+        ys += [f"%{q}va", f"%{q}vb"]
+    e(f"    scf.yield {', '.join(ys)} : {tys}")
+    e("  } else {")
+    ys = []
+    for k, (a, b, idx) in enumerate(runs):
+        q = f"{p}{k}"
+        e(f"  %{q}ib = index.add {idx}, %c4 : index")
+        e(f"  %{q}xa = vector.load {view}[{idx}] : view<[{vt}]xf32> -> {V4}")
+        e(f"  %{q}xb = vector.load {view}[%{q}ib] : view<[{vt}]xf32> -> {V4}")
+        ys += [f"%{q}xa", f"%{q}xb"]
+    e(f"    scf.yield {', '.join(ys)} : {tys}")
+    e("  }")
+
+
 def qnorm_load(e, dst, view, vt, base, ks, f16=False):
     """QNORM: the 16-dim f32 runs at base + 32 k (k in ks) as V4s; all loads issued before any use"""
     out = {}
@@ -447,8 +545,12 @@ def qnorm_load(e, dst, view, vt, base, ks, f16=False):
             continue
         for j in range(4):
             e(f"  %{dst}{k}_{j}a = index.add {base}, %qo{32 * k + 4 * j} : index")
-            e(f"  %{dst}{k}_{j} = vector.load {view}[%{dst}{k}_{j}a] : view<[{vt}]xf32> -> {V4}")
+            if not (QC and view == "%q_flat"):
+                e(f"  %{dst}{k}_{j} = vector.load {view}[%{dst}{k}_{j}a] : view<[{vt}]xf32> -> {V4}")
         out[k] = [f"%{dst}{k}_{j}" for j in range(4)]
+    if QC and view == "%q_flat":
+        qc_wrap(e, False, [(f"%{dst}{k}_{j}", f"%{dst}{k}_{j + 1}", f"%{dst}{k}_{j}a") for k in ks for j in (0, 2)],
+                view, vt)
     return out
 
 
@@ -1482,7 +1584,8 @@ def gen():
       + (", %vstat4: buffer" if VQ4 or VQ8 else "") + (", %ptab: buffer" if PAGED else "")
       + (", %qnw: buffer, %qeps: buffer" if QNORM else "") + (", %kscale: buffer" if KRAW else "")
       + (", %pqueue: buffer" if PERSIST and PERSIST_DYN else "")
-      + (", %ksplit: buffer" if KS else "") + (", %npuo: buffer, %npuq: buffer" if NPU and ksm2 else "") + ") {")
+      + (", %ksplit: buffer" if KS else "") + (", %npuo: buffer, %npuq: buffer" if NPU and ksm2 else "")
+      + (", %cbuf: buffer" if QC else "") + ") {")
     e("  %base = index.constant 0 : offset")
     for v in (0, 1, 2, 3, 4, 6, 8, 15, 16, 31, 32, 64, 128, 256, 1024, 4096, 6144):
         e(f"  %c{v} = index.constant {v} : index")
@@ -1546,6 +1649,9 @@ def gen():
         e("  %qs_flat = buffer.view %q_na[%qss_o] : buffer -> view<[%qsstot]xf32>")
     e(f"  %g_flat = buffer.view %g_na[%base] : buffer -> view<[%qtot]x{'f16' if GSIG16 else 'f32'}>")
     e("  %o_flat = buffer.view %o_na[%base] : buffer -> view<[%qtot]xf16>")
+    if QC:
+        assert QNORM and not (GSIG16 or R2P_QPF or R2P_QTOUCH or R2P_QSPLIT or R2P_QROT16 or KDEC)
+        qc_setup(e)
     if "stamp" in R2P_DIAG:   # diag: progress records in the gate buffer (wrong gate; see the QK loop)
         e("  %st_v = buffer.view %g_na[%base] : buffer -> view<262144xi32>")
         e("  %c1024st = index.constant 1024 : index")
@@ -4165,6 +4271,9 @@ def gen():
     def gate_load(f):
         if GSIG16:
             e(f"  %eg{f}h = vector.load %g_flat[%eo{f}] : view<[%qtot]xf16> -> {V8H}")
+            return
+        if QC:
+            qc_wrap(e, True, [(f"%eg{f}a", f"%eg{f}b", f"%eo{f}")], "%g_flat", "%qtot")
             return
         e(f"  %eg{f}a = vector.load %g_flat[%eo{f}] : view<[%qtot]xf32> -> {V4}")
         e(f"  %eg{f}b = vector.load %g_flat[%eo{f}b] : view<[%qtot]xf32> -> {V4}")

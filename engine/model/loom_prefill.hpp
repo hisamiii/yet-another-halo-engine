@@ -1880,6 +1880,8 @@ class LoomPrefill {
   std::function<void()> after_release_;
   NpuView gc_read_{};   // (gc) the gate's C range a deferred postnorm part still reads
   std::size_t dn_c_end_ = 0;   // the end of a DeltaNet layer's qkv + gate C: its out job's C starts there
+  std::string qc_hal_;   // (qc) the attention HAL that reads q / gate from qc_c_, set by the q split
+  NpuView qc_c_{};   // (qc) the q split's C range that chunk 0's attention reads
   void RunAfterRelease() {
     if (after_release_) std::exchange(after_release_, nullptr)();
   }
@@ -2637,8 +2639,14 @@ class LoomPrefill {
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
       NpuJoin();
-      NpuUnpack(RowsHal(Np4Hal("npu_unpack_q", pre + "attn_q.weight"), "q", nq, Np4(pre + "attn_q.weight")), c,
-                {Ref(*q_), Ref(*gate_)}, 6);
+      // qc: chunk 0's attention reads the NPU heads' q / gate from C ("wmma[_t]_qc<sfx>.hal", gen_attn_fa QC), so the
+      // unpack goes (the next NPU job that writes C, the o-projection's, waits for its ready word after the attention)
+      const std::string un = RowsHal(Np4Hal("npu_unpack_q", pre + "attn_q.weight"), "q", nq, Np4(pre + "attn_q.weight"));
+      const std::string qch = std::string(o_af ? "wmma_t_qc" : "wmma_qc") + un.substr(12, un.size() - 16) + ".hal";
+      if (ci == 0 && geom_.count(qch) && c.length >= std::size_t{B_} * nq * 2)   // (one replay group: bf16 per element; the .fp cbuf footprint)
+        qc_hal_ = qch, qc_c_ = c;
+      else
+        NpuUnpack(un, c, {Ref(*q_), Ref(*gate_)}, 6);
     } else {
       // seg: k and v ride in the kqg GEMM's dispatch (f16 sets)
       const bool seg = q_af && k_af && v_af && RunSeg({{"gemm_kqg", pre + "attn_q.weight", {q_, gate_}},
@@ -2716,7 +2724,10 @@ class LoomPrefill {
       Dispatch(Exe("vtrans.hal"), "yah_transpose_v16", 32, (T_ + 31) / 32, 1, 256, 1, 1,
                {{kv16_->handle, voff, kv_cache_ * 2}, {vt16_->handle, 0, vt_bytes_}});
     }
-    if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
+    if (tail_ == kNoRows) {  // K / V are written; nothing reads this layer's output
+      qc_hal_.clear();
+      return;
+    }
     if (kdeq_) {  // the context so far, this chunk included, as f16 pools for the fp16 attention
       const std::uint32_t rows = (ci + 1) * B_;
       const char* kd = attn_kq4_ ? "kdeq4" : "kdeq8";
@@ -2760,11 +2771,17 @@ class LoomPrefill {
       const std::uint32_t tpw = ag != geom_.end() ? ag->second.tokens : attn_tpw_,
                           hpw = ag != geom_.end() ? ag->second.rowgrp : attn_hpw_;
       // a persistent attention HAL (dispatch.txt "persist_<hal> <slots>") runs <slots> workgroups over all the units
-      const std::string& ahx = ah;
+      const std::string ahx = qc_hal_.empty() ? ah : qc_hal_;
       const auto pg = geom_.find("persist_" + ahx);
       if (pg != geom_.end() && pg->second.tt) {
         if (ai >= kPqueueSlots) throw LoomError("prefill: more attention layers than queue counters");
         b.push_back({pqueue_->handle, std::size_t{ai} * 2048, 1056});
+      }
+      if (!qc_hal_.empty()) {   // (gen_attn_fa QC: %cbuf after the others)
+        if (pg == geom_.end() || !pg->second.tt || geom_.count("ksplit_" + ahx) || (npu_attn_ && ci >= na_from_))
+          throw LoomError("prefill: " + ahx + " needs the plain persistent chunk-0 attention");
+        b.push_back({npu_->C().handle, qc_c_.offset, qc_c_.length});
+        qc_hal_.clear();
       }
       // the key-split tail: kernel 1 (this HAL) stores the tail pieces' partials, the merge "wmmak<rest>" writes their output
       const bool ks = geom_.count("ksplit_" + ahx) != 0;

@@ -2377,6 +2377,30 @@ def main():
         write_attn(attn_t_src)
         attn_t_c0_src = write_c0(attn_t_src, os.path.join(tmp, "yah_attn_hip_t_c0.loom"))
         gen_attn_fa.TILED_OUT = False
+    # YAH_ATTN_QC (default 1 with a q split): chunk 0's attention also as "wmma[_t]_qc<sfx>.hal" (sfx "" / "_4" as
+    # npu_unpack_q), reading the NPU heads' q / gate straight from C (gen_attn_fa QC): the q unpack goes
+    qca = []
+    if ("q" in NPU_SPLIT and os.environ.get("YAH_ATTN_QC", "1") == "1" and gen_attn_fa.QNORM and not QSPLIT_ON
+            and not c0seed):
+        import gen_bfp16_encode as GE
+        import gen_npu_unpack as GU
+        kdb, groups, cg = gen_attn_fa.R2P_KDB, GE.GROUPS, GU.CG
+        GE.GROUPS, GU.CG = (NPU_PASSES,), 1   # (npu_split: one replay group per call, so C is one partial)
+        for sfx, np_, nq in (("", NPU_NP, NPU_SPLIT["q"]), ("_4", 4, npu_rows4("q"))):
+            for tiled in ((False, True) if af24 else (False,)):
+                hal = "wmma%s_qc%s.hal" % ("_t" if tiled else "", sfx)
+                src_ = os.path.join(tmp, hal[:-4] + ".loom")
+                gen_attn_fa.QC, gen_attn_fa.TILED_OUT = (12288 - nq, B), tiled
+                gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = False   # (chunk 0: the single K buffer)
+                try:
+                    with GN.np_override(np_):
+                        write_attn(src_)
+                finally:
+                    gen_attn_fa.QC, gen_attn_fa.TILED_OUT = None, False
+                    gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = kdb
+                qca.append((src_, hal))
+                geom.append((hal, 1, 0, 0))
+        GE.GROUPS, GU.CG = groups, cg
     # YAH_ATTN_W64=<chunk>: chunks from <chunk> on run the 2 x 64 R2P kernel (half the K / V staging per MMA, bit-identical).
     # Its 16-wave workgroups run 2 per WGP and phase-lock: it wins only at depth.
     gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = False
@@ -2793,6 +2817,12 @@ def main():
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(ks_from, NCH)
           for src_, stem_ in ((ksn_srcs["kmn"][0] if c >= npu_from else attn64km_src, "wmmak"),)
           + (((ksn_srcs["kmn"][1] if c >= npu_from else attn64km_t_src, "wmmak_t"),) if af24 else ())],
+        *[(src_, hal_, [
+            "attention_prefill.cache_capacity=%d" % T,
+            "attention_prefill.token_count=%d" % B,
+            "attention_prefill.start_pos=0",
+            "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
+            "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for src_, hal_ in qca],
         *[(src, hal, ["nop=0"]) for src, hal in npua],
         *([(vtrans_src, "vtrans.hal",
             ["yah_vtrans.token_count=%d" % T, "yah_vtrans.cache_capacity=%d" % T])]
