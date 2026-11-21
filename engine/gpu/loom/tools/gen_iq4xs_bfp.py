@@ -241,8 +241,32 @@ def prologue(e, rows, K, rb, koff=0, stream=None, blk=136):
         e("    %s_gb8 = index.mul %s_gb, %c8 : index")
         e("    %s_gu = index.add %s_gb8, %s_cup : index")
         e("    %s_g8 = index.add %s_gu, %s_gr : index")
+        g8v = "%s_g8"
+        ho = stream.get("horder")
+        if ho is not None:   # (host block order, gen_r5fuse.block_pos) 64-row block gb at stream block
+            # pos = r rows / 128 + gb / 4 for gb = 4 f + horder[r]: the act layout is linear in the block, so the
+            # offset is emit_offset's at row group 8 pos + 4 up + g8 % 4 (each block's records unchanged)
+            inv = [list(ho).index(k) for k in range(4)]
+            assert stream["tile"] == 64 and sorted(ho) == [0, 1, 2, 3] and rows % 128 == 0, (stream, rows)
+            e(f"    %h_cnbr = index.constant {rows // 128} : index")
+            e("    %h_b4 = index.rem %s_gb, %c4 : index")
+            if inv == [0, 1, 2, 3]:
+                e("    %h_r = index.add %h_b4, %c0i : index")
+            else:
+                assert inv == [0, 2, 1, 3], ho   # (r = 2 (b % 2) + b / 2)
+                e("    %h_b1 = index.rem %h_b4, %c2 : index")
+                e("    %h_b2 = index.mul %h_b1, %c2 : index")
+                e("    %h_b3 = index.div %h_b4, %c2 : index")
+                e("    %h_r = index.add %h_b2, %h_b3 : index")
+            e("    %h_f = index.div %s_gb, %c4 : index")
+            e("    %h_rn = index.mul %h_r, %h_cnbr : index")
+            e("    %h_pos = index.add %h_rn, %h_f : index")
+            e("    %h_p8 = index.mul %h_pos, %c8 : index")
+            e("    %h_pu = index.add %h_p8, %s_cup : index")
+            e("    %h_g8 = index.add %h_pu, %s_gr : index")
+            g8v = "%h_g8"
         fr = BE.emit_offset(e, "act", 2 * rows, list(stream["ks"]), stream["passes"], stream["tile"], True,
-                            "%s_g8", "%kbi", p="s_", perm=False)
+                            g8v, "%kbi", p="s_", perm=False)
         e(f"    %frag = index.add {fr}, %c0i : index")
     else:
         e("    %frag = index.mul %item, %c72 : index")

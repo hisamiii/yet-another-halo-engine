@@ -8,6 +8,7 @@ import re
 import gen_r5fuse as _R   # (F: the swap's rows a tensor, set per call by its geom(); read at text time)
 
 K = 5120
+F_PER_CALL = True   # (the emitter's check: payloads read gen_r5fuse.F at text time)
 SBS = K // 256   # super-blocks a row
 CARRY = "vector<2xi32>"
 
