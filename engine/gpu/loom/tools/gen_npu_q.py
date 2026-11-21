@@ -264,6 +264,11 @@ def array_program(L, cfg):
                     assert 2 * nbr % 8 == 0
                     L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr // 8}x8x{MP}x{rec}xi32, "
                              f"#encoding.layout.strided<strides=[{hm_}, {MP * 8 * rec}, {rec}, {8 * rec}, 1]>>>")
+                if os.environ.get("GN_QHPAN") == "1":   # (the down in swap form) H as the down's token panels: [M block]
+                    # [128-feature group][slab][4 x 576 B], a lane's blocks as [2 nbr / 4 groups][4]
+                    assert 2 * nbr % 4 == 0
+                    L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr // 4}x4x{MP}x{rec}xi32, "
+                             f"#encoding.layout.strided<strides=[{hm_}, {MP * 4 * rec}, {rec}, {4 * rec}, 1]>>>")
             if qsw5_on(cfg):   # (qsw5: column c's 144 B at slot c of each of 5 passes; rows 4608 B apart)
                 hm_ = cfg.hpass * MP * 1152
                 L[-1] = (f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols * R // 2}x{2 * nbr}x{MP}x5x36xi32, "
@@ -305,8 +310,11 @@ def array_program(L, cfg):
     for c in range(0, cols if N.qp1_on() else 0, wdup):   # (GN_QP1) a half-record view per pair row parity: row r gets half r % 2
         assert (not fz or N.qp1k_on()) and not N.qw4_on() and "w" not in qfix() and N.qpass_on() and R % 2 == 0
         hrec = wrec // 2
+        # (GN_QWCS=<bytes>, the down in swap form: column c's panel at c x GN_QWCS, the 64-token blocks of H)
+        wcs = int(os.environ.get("GN_QWCS") or 0) or P * wrec
+        assert wcs >= P * wrec
         for h in range(2):
-            e(f"  %wo{c}_h{h} = constant.u64 {c * P * wrec + h * P * hrec} : reg<aie2p.array.offset : offset>")
+            e(f"  %wo{c}_h{h} = constant.u64 {c * wcs + h * P * hrec} : reg<aie2p.array.offset : offset>")
             e(f"  %ws{c}_h{h} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nbr}x{P}x{hrec // 4}xi32, "
               f"#encoding.layout.strided<strides=[0, {hrec // 4}, 1]>>>")
             e(f"  %wv{c}_h{h} = view.sender %ws{c}_h{h}, %wo{c}_h{h} : reg<aie2p.array.sender : tile<{hrec // 4}xi32>>")
