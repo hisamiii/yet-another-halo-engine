@@ -383,6 +383,41 @@ def c_tok(e, p, tok):
     return f"%{p}tb"
 
 
+def swapc_base(e, p, nc, tok, R):
+    """(swap-form site image, npu_swsite, R = nb * 64 rows) the C element of feature nc (a multiple of 8) and token tok:
+    panel P = tok / 512 at P R 512; in it 64 [c R + (rb / 2) 16 + (t8 / 2) 4 + (rb % 2) 2 + t8 % 2] + (tok % 8) 8 + f % 8,
+    c = (tok % 512) / 64, t8 = (tok % 64) / 8, rb = f / 8. Blocks are [8 tokens][8 features] as dcol's (npu MEASURED on
+    the image's output, sg60): a token's 8 features are contiguous, load_c reads them. Returns its SSA."""
+    for nm, v in (("c8", 8), ("c2", 2), ("c512", 512), ("c64", 64), ("c1024", 1024), ("c128", 128), ("c256", 256),
+                  ("cP", R * 512), ("cC", R * 64)):
+        e(f"  %{p}{nm} = index.constant {v} : index")
+    e(f"  %{p}rb = index.div {nc}, %{p}c8 : index")
+    e(f"  %{p}rh = index.div %{p}rb, %{p}c2 : index")
+    e(f"  %{p}rl = index.rem %{p}rb, %{p}c2 : index")
+    e(f"  %{p}f0 = index.mul %{p}rh, %{p}c1024 : index")
+    e(f"  %{p}f1 = index.mul %{p}rl, %{p}c128 : index")
+    e(f"  %{p}pp = index.div {tok}, %{p}c512 : index")
+    e(f"  %{p}r512 = index.rem {tok}, %{p}c512 : index")
+    e(f"  %{p}cc = index.div %{p}r512, %{p}c64 : index")
+    e(f"  %{p}r64 = index.rem {tok}, %{p}c64 : index")
+    e(f"  %{p}t8 = index.div %{p}r64, %{p}c8 : index")
+    e(f"  %{p}tr = index.rem {tok}, %{p}c8 : index")
+    e(f"  %{p}th = index.div %{p}t8, %{p}c2 : index")
+    e(f"  %{p}tl = index.rem %{p}t8, %{p}c2 : index")
+    e(f"  %{p}a0 = index.mul %{p}pp, %{p}cP : index")
+    e(f"  %{p}a1 = index.mul %{p}cc, %{p}cC : index")
+    e(f"  %{p}a2 = index.mul %{p}th, %{p}c256 : index")
+    e(f"  %{p}a3 = index.mul %{p}tl, %{p}c64 : index")
+    e(f"  %{p}s0 = index.add %{p}a0, %{p}a1 : index")
+    e(f"  %{p}s1 = index.add %{p}s0, %{p}a2 : index")
+    e(f"  %{p}s2 = index.add %{p}s1, %{p}a3 : index")
+    e(f"  %{p}tr8 = index.mul %{p}tr, %{p}c8 : index")
+    e(f"  %{p}s3 = index.add %{p}s2, %{p}tr8 : index")
+    e(f"  %{p}s4 = index.add %{p}s3, %{p}f0 : index")
+    e(f"  %{p}base = index.add %{p}s4, %{p}f1 : index")
+    return f"%{p}base"
+
+
 def load_cg(e, dst, idx):
     """The 8 C values at element idx of a call's group 0 plus the same values of its other groups (%cgs apart)."""
     if CG == 1:

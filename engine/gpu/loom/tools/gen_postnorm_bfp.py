@@ -17,7 +17,9 @@ import gen_bfp16_encode as GE
 import gen_npu_unpack as GU
 
 
-def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None):
+def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcswap=None):
+    """gcswap (with gc): the gate's NPU C is the swap-form site image's (npu_swsite, R = gcswap rows,
+    gen_npu_unpack.swapc_base); the same values and rounding."""
     import gen_npu_gemm as GN
     assert B % 16 == 0 and (not bfp or (h0 + nh) * 128 <= 1024 * passes)
     assert not gc or ((6144 - gc) % 128 == 0 and gc % GN.TN == 0 and gate16)
@@ -61,7 +63,7 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None):
         e("  %bs_buf = buffer.alloca<workgroup> align(16) %bs_bytes : buffer")
         e("  %bs_view = buffer.view %bs_buf[%base] : buffer -> view<1152xi8>")
     if gc:   # the NPU's gate C (gen_npu_unpack.gen's names: %cv, %c2, %c16i, %chii, %cgs)
-        e(f"  %nc = index.constant {B * gc * GU.CG // 2} : index")
+        e(f"  %nc = index.constant {B * gcswap // 2 if gcswap else B * gc * GU.CG // 2} : index")
         e("  %cv = buffer.view %c[%base] : buffer -> view<[%nc]xi32>")
         e("  %c2 = index.constant 2 : index")
         e("  %c16i = scalar.constant 16 : i32")
@@ -110,13 +112,20 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None):
         e("      %gkm = index.max %gk, %cgk0 : index")
         e("      %gnc = index.sub %gkm, %cgk0 : index")
         sub = []
-        la = GU.c_lane(sub.append, "gl_", "%gnc", B)
-        tb = GU.c_tok(sub.append, "gt_", "%tok")
-        sub.append(f"  %gca0 = index.add {la}, {tb} : index")
-        # the last group-0 origin: always in range (column gc - 8 of token B - 1); for the bound proof
-        sub.append(f"  %gclast = index.constant {B * gc * GU.CG - 8 - B * GN.TN * (GU.CG - 1)} : index")
-        sub.append("  %gca = index.min %gca0, %gclast : index")
-        GU.load_cg(sub.append, "%gcv", "%gca")
+        if gcswap:   # (swap form) the base clamped to the largest real one, for the bound proof
+            assert gcswap % 64 == 0 and gc <= gcswap and B % 512 == 0
+            gb = GU.swapc_base(sub.append, "gs_", "%gnc", "%tok", gcswap)
+            sub.append(f"  %gclast = index.constant {swapc_last(B, gc, gcswap)} : index")
+            sub.append(f"  %gca = index.min {gb}, %gclast : index")
+            GU.load_c(sub.append, "%gcv", "%gca")
+        else:
+            la = GU.c_lane(sub.append, "gl_", "%gnc", B)
+            tb = GU.c_tok(sub.append, "gt_", "%tok")
+            sub.append(f"  %gca0 = index.add {la}, {tb} : index")
+            # the last group-0 origin: always in range (column gc - 8 of token B - 1); for the bound proof
+            sub.append(f"  %gclast = index.constant {B * gc * GU.CG - 8 - B * GN.TN * (GU.CG - 1)} : index")
+            sub.append("  %gca = index.min %gca0, %gclast : index")
+            GU.load_cg(sub.append, "%gcv", "%gca")
         for x in range(8):   # the unpack's out16 rounding
             sub.append(f"  %gce{x} = vector.extract %gcv[{x}] : vector<8xf32> -> f32")
             sub.append(f"  %gch{x} = scalar.fptrunc %gce{x} : f32 to f16")
@@ -207,3 +216,15 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None):
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def swapc_last(B, n, R):
+    """The largest swapc_base over features 0, 8, .., n - 8 and tokens 0 .. B - 1 (its 8 elements stay in B R)."""
+    import numpy as np
+    f = np.arange(0, n, 8)[:, None]
+    t = np.arange(B)[None, :]
+    rb, c, t8 = f // 8, (t % 512) // 64, (t % 64) // 8
+    b = t // 512 * R * 512 + 64 * (c * R + (rb // 2) * 16 + (t8 // 2) * 4 + (rb % 2) * 2 + t8 % 2) + t % 8 * 8
+    m = int(b.max())
+    assert m + 8 <= B * R, (m, B, R)
+    return m
