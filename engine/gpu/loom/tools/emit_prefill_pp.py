@@ -979,6 +979,10 @@ R5_PARTS = (0, 1) if R5PART else (None,)
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
 R5_VTRY = "208,200,192"
+# the gen_r5kq carriers (by their split's name, e.g. "iq3s", "iq3s_iq4xs"; "all") whose GEMM issues each k step's B a
+# step ahead (gen_gemm_tile bnext, replacing bpre / b0early) so their payload's wait hides behind it (port's pf;
+# the IQ4_XS ".af.to.r5" carrier always does); default none until each family is benched
+R5_BNEXT = {c for c in os.environ.get("YAH_NPU_R5BNEXT", "").split(",") if c}
 R5_SKIP = {"q3k_iq3s"}
 RSWAP_KQ = {"q4k": "Q4_K", "q5k": "Q5_K", "q3k": "Q3_K", "iq3s": "IQ3_S", "iq3xxs": "IQ3_XXS", "iq2xs": "IQ2_XS",
             "iq2s": "IQ2_S", "q2k": "Q2_K"}   # (gen_kq_bfp's formats)
@@ -1871,6 +1875,8 @@ def r5_carriers(by, nn, last, split, FL=None):
             pay = (pay1(pg, 0, "pg"), pay1(pu, n * rbg, "pu"))
         t = dataclasses.replace(TG.default_tile(gf, "swiglu", kb), **AF_TILE,
                                 **(AF_FFN_MIX[(gf, uf)] if mx else AF_FFN[gf]), ffn=True, tout=True)
+        if car in R5_BNEXT or "all" in R5_BNEXT:
+            t = dataclasses.replace(t, bnext=True, bpre=0, b0early=False)
         # (the .fp's dz_w: the raw binding the payloads read, gate's n rows then up's, clamped below n (rb_g + rb_u))
         rb = lambda f_: gen_r5fuse.RBG if f_ == "iq4xs" else gen_r5kq.PAYLOADS[f_].row_bytes
         # (share-up: the "_f<F'>" carriers' stem too; the bound is the whole binding, any F)
@@ -1968,7 +1974,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                         for pt in R5_PARTS:   # (R5PART: _p0 / _p1)
                             stem = "gemm_ffn_%s_%d_%d.af.to.r5%s" % (fmt, mt, kb, "" if pt is None else "_p%d" % pt)
                             E.FP_FLOOR[stem] = {"dz_w": mt * 16 * 2 * gen_r5fuse.RBG}
-                            split(fmt, "ffn", mt, kb, tt, stem + ".hal", FS,
+                            # (the carrier's GEMM issues each k step's B a step ahead: its payload wait hides behind it)
+                            split(fmt, "ffn", mt, kb, dataclasses.replace(tt, bnext=True), stem + ".hal", FS,
                                   wrap=lambda text, n_, nwg, lanes, pt_=pt: gen_r5fuse.fuse(text, n_, nwg, lanes,
                                                                                            rows=R5_ROWS, part=pt_))
                     if sw5 and fmt == "iq4xs":   # (the row-segmented layers' GPU rows: their up rows F rows on)
