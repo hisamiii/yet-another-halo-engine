@@ -2203,7 +2203,10 @@ class LoomPrefill {
     ffn_pending4_ = dn4 && !swdown;
     ffn_pendingsw_ = swdown;
     // (npu_unorm reads the NP 5 downs' C; after the "_rr" sum, "npu_unorm[4]_rr_*" takes any down)
-    if (ffn_rr_ ? !geom_.count(UnormRr(false, NormOut::kTiled)) : !geom_.count("npu_unorm.hal") || dn4 || swdown) FlushFfn();
+    // (a swap-down sum also waits when the swap norm's fused form exists: "_ns", no stream)
+    const bool nsw = swdown && ffn_rr_ && geom_.count(UnormRr(false, NormOut::kTiled, true));
+    if (!nsw && (ffn_rr_ ? !geom_.count(UnormRr(false, NormOut::kTiled)) : !geom_.count("npu_unorm.hal") || dn4 || swdown))
+      FlushFfn();
     return true;
   }
   // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
@@ -2271,11 +2274,16 @@ class LoomPrefill {
                                         Ref(*hidden2_)};
         if (mode != NormOut::kTiled) b.push_back(Ref(*scratch_));
         if (mode != NormOut::kRow) b.push_back(Ref(*normt_));
-        const LoomExecutable& exe = Exe(UnormRr(false, mode, true));
+        // (tiled, "_pn": the fused norm also writes the q / qkv sites' token panel; SwSitePanel skips npu_swpanel once)
+        const bool pn = mode == NormOut::kTiled && ffn_pendingsw_ && geom_.count("npu_unormsw_rr_t_pn.hal") &&
+                        geom_.count("npu_swpanel.hal");
+        if (pn) b.push_back(WRef(0, geom_.at("npu_swpanel.hal").tt));
+        const LoomExecutable& exe = Exe(pn ? std::string("npu_unormsw_rr_t_pn.hal") : UnormRr(false, mode, true));
         Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, b,
                  ~std::uint64_t{0} << 3);
         std::swap(hidden_, hidden2_);
         norm_bfp_.clear(), norm_pk_.clear();
+        site_panel_ = pn;
         return;
       }
       FlushFfn();

@@ -2118,6 +2118,18 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                         E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                                      "yah_half_norm.fused=0"], nm_ + ".hal", outdir)
                         out.append((nm_ + ".hal", B // 4, 32 * 4 * 4, 0))
+                    if SWSITE:   # (the tiled one with the q / qkv sites' token panel, "_pn", as norm_t_pn)
+                        nm_ = "npu_unormsw_rr_t_pn"
+                        src = os.path.join(tmp, nm_ + ".loom")
+                        gen_half_norm.PANEL = (RSWAP_KS, RSWAP_PASSES)
+                        try:
+                            open(src, "w").write(gen_half_norm.gen_unorm(B, list(NPU_KS), NPU_PASSES, 2, False,
+                                                                         remres=True, f16="t", swap=5120))
+                        finally:
+                            gen_half_norm.PANEL = None
+                        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                                     "yah_half_norm.fused=0"], nm_ + ".hal", outdir)
+                        out.append((nm_ + ".hal", B // 4, 32 * 4 * 4, 0))
         finally:
             GU.CG = cg_
         out.append(("npuswdown", 1, 0, 0))
