@@ -2630,7 +2630,8 @@ class LoomNpuSplit : public NpuSplit {
                                               {&flags_, slot + kSignal, 2 * plan_.gate_record}})));
     return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
   }
-  std::uint32_t BindSwap(const std::string& image, NpuView a, NpuView w, NpuView c) override {
+  std::uint32_t BindSwap(const std::string& image, NpuView a, NpuView w, NpuView c,
+                         const std::string& family = "ffnswap") override {
     const auto key = std::make_tuple(image, a.offset, a.length, w.offset, w.length, c.offset, c.length);
     if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
     const std::size_t slot = GateSlot();
@@ -2640,7 +2641,7 @@ class LoomNpuSplit : public NpuSplit {
                                      {&flags_, slot, plan_.gate_record},
                                      {&flags_, slot + kTick, plan_.gate_record},
                                      {&flags_, slot + kSignal, 2 * plan_.gate_record}};
-    const std::uint32_t id = BindViews(image, image, kSwapDec, "ffnswap", std::move(views));
+    const std::uint32_t id = BindViews(image, image, kSwapDec, family, std::move(views));
     instances_[image]->ask_early = true;   // (gen_npu_gemm: its tail's gate waits at the top of the core function)
     instances_[image]->panel = static_cast<int>(plan_.panel);
     return ids_[key] = id;

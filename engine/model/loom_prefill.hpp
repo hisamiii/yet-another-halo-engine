@@ -189,9 +189,17 @@ class LoomPrefill {
       }
       return q;
     };
-    const NpuPlan qkv = need("qkv"), gate = need("gate");   // (C: qkv's + gate's of either family, an upper bound)
+    NpuPlan qkv = need("qkv"), gate = need("gate");   // (C: qkv's + gate's of either family, an upper bound)
+    std::size_t sw_a = 0;
+    if (const std::uint32_t rq = SwSiteMaxR("qkv"), rg = SwSiteMaxR("gate"); rq || rg) {   // (swap-form sites)
+      if (!rq || !rg) throw LoomError("prefill: swap-form qkv sites without gate sites, or the reverse");
+      if (halves_) throw LoomError("YAH_PP_HALVES: swap-form sites are not built for halves");
+      sw_a = SwSiteGateA() + NpuBytesOf("npubytes_swsite_" + std::to_string(rg)).a;
+      qkv.c_bytes = std::max(qkv.c_bytes, SwSiteC(rq)), gate.c_bytes = std::max(gate.c_bytes, SwSiteC(rg));
+      p.w_bytes = std::max(p.w_bytes, std::size_t{geom_.at("npu_swpanel.hal").tt});
+    }
     // (out: a DeltaNet layer's out C follows its qkv and gate C)
-    for (const NpuPlan& q : {NpuPlan{std::max(qkv.a_bytes, gate.a_bytes), 0, qkv.c_bytes + gate.c_bytes + need("out").c_bytes},
+    for (const NpuPlan& q : {NpuPlan{std::max({qkv.a_bytes, gate.a_bytes, sw_a}), 0, qkv.c_bytes + gate.c_bytes + need("out").c_bytes},
                              need("q"), need("out")})
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
@@ -2501,6 +2509,54 @@ class LoomPrefill {
   }
   // The NPU calls of one matrix: per chunk, per NpuCallRows() rows; C panels from c_off, chunk-major (the unpack sums the chunks).
   // Returns the C view they fill. Decoder-column sets: wname's image, its raw rows w (NpuRawRows).
+  // (swap-form sites, emit YAH_NPU_SWSITE) layer L's site image rows R: dispatch.txt "npuswsite_<site>@<L> <nb> <real
+  // rows>" (R = 64 nb), 0: in-core; the largest R over the layers; a site's C (B / 512 calls of the image's C bytes:
+  // panel p at p R 1024 B); gate's stream in A after the largest qkv stream (qkv's at 0)
+  std::uint32_t SwSiteR(const std::string& site, std::uint32_t l, std::uint32_t rows) const {
+    const auto it = geom_.find("npuswsite_" + site + "@" + std::to_string(l));
+    if (it == geom_.end()) return 0;
+    if (it->second.rowgrp != rows)
+      throw LoomError("prefill: npuswsite_" + site + "@" + std::to_string(l) + "'s rows differ from the split's");
+    return it->second.tokens * 64;
+  }
+  std::uint32_t SwSiteMaxR(const std::string& site) const {
+    std::uint32_t m = 0;
+    for (auto j = geom_.lower_bound("npuswsite_" + site + "@"); j != geom_.end() && j->first.starts_with("npuswsite_" + site + "@"); ++j)
+      m = std::max(m, j->second.tokens * 64);
+    return m;
+  }
+  std::size_t SwSiteC(std::uint32_t r) const {
+    const NpuBytes b = NpuBytesOf("npubytes_swsite_" + std::to_string(r));
+    if (b.c != std::size_t{r} * 1024) throw LoomError("prefill: npubytes_swsite_" + std::to_string(r) + "'s C is not R 512 bf16");
+    return std::size_t{B_} / 512 * b.c;
+  }
+  std::size_t SwSiteGateA() const { return Up4k(NpuBytesOf("npubytes_swsite_" + std::to_string(SwSiteMaxR("qkv"))).a); }
+  // Site rows of wname (its last rows: the NPU's) decoded to the swap's plain stream at A offset a (npu_swsdec_<fmt>_<rows>)
+  void SwSiteDecode(const std::string& wname, std::uint32_t rows, std::size_t a) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    FmtOf(static_cast<std::uint32_t>(t->type), &f);
+    const std::string h = "npu_swsdec_" + std::string(f.name) + "_" + std::to_string(rows) + ".hal";
+    const Geom& gd = geom_.at(h);
+    const std::size_t M = t->dims[1], trb = static_cast<std::size_t>(t->bytes) / M;
+    hrx_buffer_ref_t wr = TRef(*t);
+    wr.offset += (M - rows) * trb, wr.length = rows * trb;
+    std::vector<hrx_buffer_ref_t> db = {wr};
+    if (const auto gw = GemmWeights(*t, f); gw.size() > 1) db.push_back(gw[1]);   // (a grid format's grid)
+    db.push_back(ARef(a, gd.tt));
+    Dispatch(Exe(h), std::strcmp(f.name, "iq4xs") == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp", (gd.tokens + gd.rowgrp - 1) / gd.rowgrp,
+             1, 1, gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
+  }
+  // A swap-form site's job: one npu_swsite_<r> call a 512-token panel (stream at A offset a, panel t at W t w, C at
+  // c_off on); returns its C view
+  NpuView SwSiteCalls(std::uint32_t r, std::size_t a, std::size_t& c_off, std::vector<std::uint32_t>& calls) {
+    const NpuBytes b = NpuBytesOf("npubytes_swsite_" + std::to_string(r));
+    const std::size_t start = c_off;
+    for (std::uint32_t t = 0; t < B_ / 512; ++t, c_off += b.c)
+      calls.push_back(npu_->BindSwap(dir_ + "/npu_swsite_" + std::to_string(r) + ".xdna", HA({a, b.a}), HW({t * b.w, b.w}),
+                                     HC({c_off, b.c}), "swsite_" + std::to_string(r)));
+    return {start, c_off - start};
+  }
   NpuView NpuCalls(const std::string& site, const std::vector<NpuView>& a, const std::vector<std::vector<NpuView>>& w,
                    std::size_t& c_off, std::vector<std::uint32_t>& calls, const std::string& wname) {
     const auto chunks = NpuChunks(site);
@@ -3284,18 +3340,41 @@ class LoomPrefill {
       // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows: a qkv job, then a gate job (the same
       // activations), so the GPU's conv and DeltaNet run while the NPU computes gate
       // decoder-column sets: each matrix's activations in its decoder's k-block order
-      const bool kq = NpuPk(pre + "attn_qkv.weight"), kg = NpuPk(pre + "attn_gate.weight");
-      std::vector<NpuView> a4, ak;
-      if (!kq || !kg) a4 = NpuEncode("qkv", ab_t ? *normt_ : *scratch_, ab_t);   // (ab_t: no row-major copy)
-      if (kq || kg) ak = NpuEncode("qkv", ab_t ? *normt_ : *scratch_, ab_t, true);
       std::size_t c_off = 0;
-      const auto wq = NpuRawRows("qkv", pre + "attn_qkv.weight", nq);
-      const auto wg = NpuRawRows("gate", pre + "attn_gate.weight", ng);
       std::vector<std::uint32_t> calls;
-      const NpuView cq = NpuCalls("qkv", kq ? ak : a4, wq, c_off, calls, pre + "attn_qkv.weight");
-      const std::uint32_t qkv_job = NpuEnqueue(std::exchange(calls, {}), "qkv");
-      cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
-      gate_job = NpuEnqueue(std::move(calls), "gate");
+      NpuView cq{};
+      std::uint32_t qkv_job = 0;
+      const std::uint32_t rq = SwSiteR("qkv", l, nq), rg = SwSiteR("gate", l, ng);
+      if ((rq == 0) != (rg == 0)) throw LoomError("prefill: " + pre + " has one of qkv / gate in swap form");
+      if (rq) {
+        // (swap-form sites) the GPU decodes the NPU's rows to the plain bfp16 stream (qkv's at A 0, gate's at
+        // SwSiteGateA), the norm's tiled output to the token panel in W; the image reads both (its job's side)
+        if (!ab_t) throw LoomError("prefill: " + pre + " swap-form sites need the tiled norm output");
+        const std::size_t ag = SwSiteGateA();
+        const NpuBytes bq = NpuBytesOf("npubytes_swsite_" + std::to_string(rq)),
+                       bg = NpuBytesOf("npubytes_swsite_" + std::to_string(rg));
+        const Geom& gp = geom_.at("npu_swpanel.hal");
+        SwSiteDecode(pre + "attn_qkv.weight", nq, 0);
+        Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1,
+                 gp.rowgrp, 1, 1, {Ref(*normt_), WRef(0, gp.tt)}, 2);
+        cq = SwSiteCalls(rq, 0, c_off, calls);
+        qkv_job = NpuEnqueue(std::exchange(calls, {}), "swqkv",
+                             {{ARef(0, bq.a), WRef(0, gp.tt)}, CRef(cq.offset, cq.length)});
+        SwSiteDecode(pre + "attn_gate.weight", ng, ag);
+        cg = SwSiteCalls(rg, ag, c_off, calls);
+        gate_job = NpuEnqueue(std::move(calls), "swgate", {{ARef(ag, bg.a), WRef(0, gp.tt)}, CRef(cg.offset, cg.length)});
+      } else {
+        const bool kq = NpuPk(pre + "attn_qkv.weight"), kg = NpuPk(pre + "attn_gate.weight");
+        std::vector<NpuView> a4, ak;
+        if (!kq || !kg) a4 = NpuEncode("qkv", ab_t ? *normt_ : *scratch_, ab_t);   // (ab_t: no row-major copy)
+        if (kq || kg) ak = NpuEncode("qkv", ab_t ? *normt_ : *scratch_, ab_t, true);
+        const auto wq = NpuRawRows("qkv", pre + "attn_qkv.weight", nq);
+        const auto wg = NpuRawRows("gate", pre + "attn_gate.weight", ng);
+        cq = NpuCalls("qkv", kq ? ak : a4, wq, c_off, calls, pre + "attn_qkv.weight");
+        qkv_job = NpuEnqueue(std::exchange(calls, {}), "qkv");
+        cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
+        gate_job = NpuEnqueue(std::move(calls), "gate");
+      }
       dn_c_end_ = c_off;   // (the out job's C goes after qkv's and gate's: dnc parts read qkv's, postnorm b gate's)
       RunPendingNorm();
       RunAlphaBeta(pre, ab_t);
