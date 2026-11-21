@@ -37,6 +37,16 @@ LANES, WGS = 512, 512         # decode lanes a workgroup, workgroups that decode
 HORDER = None                 # (host block order) the swap image's rows' first blocks, e.g. (0, 2, 1, 3); None: in order
 PART = None                   # (two-chunk overlap) 0 / 1: this carrier decodes workgroups G of [PART F / 32, ..) only
 FS_OK = (8192, 8704)          # (F whole 64-row M blocks of 32 gate + 32 up rows, F / 16 even)
+# (bench only, R5_SITE=<rows>) a second payload: one IQ4_XS site tensor's rows (its NPU rows, K 5120) into the site
+# decoders' plain stream (gen_iq4xs_bfp plain: 64 rows of the tensor a block, slab (r / 16) % 4), two more launch
+# buffers after %dz_out (%dz_sw raw rows, %dz_sout stream). Workgroup nwg - rows / 16 + g owns row group g, its pass
+# p / 2 at even K phases p (one more record a lane every other phase); the last rows / 16 workgroups (the 64 that
+# decode no gate / up and 256 that do).
+SITE = int(os.environ.get("R5_SITE", "0"))
+# (R5_SITE_BAL=1) the balanced map: unit u = 40 G + p (G the workgroup id, p the K phase) decodes slab s = u / 3 when
+# u % 3 == 0 and s < 20 rows / 16 (row group s % (rows / 16), pass s / (rows / 16)): a slab every third phase in
+# each workgroup from id 0 on, the last ids (dispatched last) none
+SITE_BAL = os.environ.get("R5_SITE_BAL") == "1"
 
 
 @contextlib.contextmanager
@@ -284,9 +294,10 @@ def _loads(e, pays, kpv, t, ind):
     return [nm for nm, _ in got], [ty for _, ty in got]
 
 
-def _record(x, got, t, FMF):
+def _record(x, got, t, FMF, site=False):
     """The 9-byte record of phase %kp from 8 exact weights (the shared bfp rounding) or a payload's own (E, words);
-    stored at its slab offset. Local names tagged with t."""
+    stored at its slab offset. Local names tagged with t. site: the R5_SITE stream's record (pass %<t>pq of row group
+    %ssg, workgroup uniform: slab ((g / 4) 20 + P) 4 + g % 4)."""
     if isinstance(got, tuple):   # the payload's own E (i32) and mantissa words fma(w, jq, magic) as i32
         e1, ms = got[0], list(got[1])
     else:
@@ -343,6 +354,19 @@ def _record(x, got, t, FMF):
         words.append(f"%{t}o{w}")
     # the record: slab ((blk 20 + P) 4 + slab) SB + 288 w + 9 L, blk = g16 / 2, slab = 2 t + g16 % 2 of q = 2 G + p % 2
     # (host block order: blk's position block_pos, r F / 128 + f for blk = 4 f + HORDER[r]; workgroup uniform)
+    if site:
+        for ln in ("%s0 = index.mul %gb, %c20 : index", "%s1 = index.add %s0, %pq : index",
+                   "%s2 = index.mul %s1, %c4 : index", "%s3 = index.add %s2, %gs : index",
+                   "%s4 = index.mul %s3, %csb : index", "%rd = index.add %s4, %olane : index",
+                   "%rec = index.min %rd, %sstmax : index", "%rec1 = index.add %rec, %c1 : index"):
+            x(re.sub(r"%(s0|s1|s2|s3|s4|rd|rec|rec1|pq|gb|gs)\b", lambda m: f"%{t}" + m.group(1), ln))
+        x(f"%{t}eb8 = scalar.trunci {e1} : i32 to i8")
+        x(f"%{t}ev = vector.from_elements %{t}eb8 : vector<1xi8>")
+        x(f"vector.store %{t}ev, %sov[%{t}rec] : vector<1xi8>, view<[%snout]xi8>")
+        x(f"%{t}mw = vector.from_elements {words[0]}, {words[1]} : vector<2xi32>")
+        x(f"%{t}mv = vector.bitcast %{t}mw : vector<2xi32> to vector<8xi8>")
+        x(f"vector.store %{t}mv, %sov[%{t}rec1] : vector<8xi8>, view<[%snout]xi8>")
+        return
     fq = "%%c%d" % (F // 16)
     ho = []
     if HORDER is not None:
@@ -375,15 +399,37 @@ def _record(x, got, t, FMF):
     x(f"vector.store %{t}mv, %ov[%{t}rec1] : vector<8xi8>, view<[%nout]xi8>")
 
 
-def _decode(e, pays, carried, ind):
+def _decode(e, pays, carried, ind, site=0):
     """Phase %kp's record from the carried values (one payload: a pair is loop-versioned), under the %act guard."""
     FMF = "<nnan|nsz>"   # finite values; only the max's exponent bits and the 127.5 compare are read
     L = []
     x = L.append
     x("scf.if %act {")
     x("%pq = index.div %kp, %c2 : index")
-    _record(x, pays[0].decode(x, carried, ""), "", FMF)
+    _record(x, pays[0].decode(x, carried[:2], ""), "", FMF)
     x("}")
+    if site and SITE_BAL:   # (R5_SITE_BAL) unit 40 G + kp's slab when it has one (workgroup uniform)
+        _site_unit(x, "%kp", "st")
+        x("%stok = index.cmp eq, %stur, %c0 : index")
+        x("%stin = index.cmp ult, %stus, %cnu : index")
+        x("scf.if %stok {")
+        x("scf.if %stin {")
+        x("%stgb = index.div %stug, %c4 : index")
+        x("%stgs = index.rem %stug, %c4 : index")
+        _record(x, pays[0].decode(x, carried[2:], "", t="st"), "st", FMF, site=True)
+        x("}")
+        x("}")
+    elif site:   # (R5_SITE) the site row group's record at even phases (workgroup uniform)
+        x("%sodd = index.rem %kp, %c2 : index")
+        x("%sev = index.cmp eq, %sodd, %c0 : index")
+        x("scf.if %sact {")
+        x("scf.if %sev {")
+        x("%stpq = index.div %kp, %c2 : index")
+        x("%stgb = index.add %ssgb, %c0 : index")
+        x("%stgs = index.add %ssgs, %c0 : index")
+        _record(x, pays[0].decode(x, carried[2:], "", t="st"), "st", FMF, site=True)
+        x("}")
+        x("}")
     for ln in L:
         e(ind + ln)
 
@@ -421,7 +467,9 @@ def _fuse_f(text, n, nwg, lanes, pay):
     for p in pays:
         extra += [_bufname(b) for b in p.buffers if _bufname(b) not in extra]
     if len(pays) == 1:
-        return _fuse(text, n, pays, nin, extra)
+        site = SITE if isinstance(pays[0], IQ4XS) and pays[0].toff is None and not PART else 0
+        assert not site or (site % 64 == 0 and nwg >= site // 16), (site, nwg)
+        return _fuse(text, n, pays, nin, extra, site=site, nwg=nwg)
     g = _fuse(text, n, pays[:1], nin, extra, mark=True).rstrip("\n").split("\n")
     u = _fuse(text, n, pays[1:], nin, extra, mark=True).rstrip("\n").split("\n")
     mg, mu = g.index(MARK), u.index(MARK)
@@ -439,21 +487,75 @@ def _fuse_f(text, n, nwg, lanes, pay):
 MARK = "  // r5: frame prologue end"
 
 
-def _fuse(text, n, pays, nin, extra, mark=False):
+def _site_prologue(e, site, nwg):
+    """(R5_SITE) the site payload's constants and views: workgroup nwg - site / 16 + g owns row group g (%ssg)."""
+    for nm, v in (("snin", site * RBG), ("sldmax", site * RBG - 8), ("snout", site * KB * 9),
+                  ("sstmax", site * KB * 9 - 9), ("cs0", nwg - site // 16)):
+        e(f"  %{nm} = index.constant {v} : index")
+    e("  %ssw = buffer.view %dz_sw_na[%base] : buffer -> view<[%snin]xi8>")
+    e("  %sov = buffer.view %dz_sout_na[%base] : buffer -> view<[%snout]xi8>")
+    e("  %sact = index.cmp uge, %stg_lin, %cs0 : index")
+    e("  %sgm = index.max %stg_lin, %cs0 : index")
+    e("  %ssg = index.sub %sgm, %cs0 : index")
+    e("  %ssgb = index.div %ssg, %c4 : index")
+    e("  %ssgs = index.rem %ssg, %c4 : index")
+    e("  %ssr0 = index.mul %ssg, %c16 : index")
+    e("  %ssr1 = index.mul %ssr0, %crb : index")
+    for nm, v in (("c40s", PHASES), ("c3", 3), ("cng", site // 16), ("cnu", site // 16 * PASSES)):
+        e(f"  %{nm} = index.constant {v} : index")
+
+
+def _site_unit(x, kpv, t):
+    """(R5_SITE_BAL) unit u = 40 G + kpv: %<t>us (slab), %<t>ur (u % 3), %<t>ug (row group), %<t>pq (pass)."""
+    x(f"%{t}uu0 = index.mul %stg_lin, %c40s : index")
+    x(f"%{t}uu = index.add %{t}uu0, {kpv} : index")
+    x(f"%{t}us = index.div %{t}uu, %c3 : index")
+    x(f"%{t}ur = index.rem %{t}uu, %c3 : index")
+    x(f"%{t}ug = index.rem %{t}us, %cng : index")
+    x(f"%{t}pq = index.div %{t}us, %cng : index")
+
+
+def _site_loads(e, kpv, t, ind):
+    """(R5_SITE) phase kpv's site header and qs half (pass kpv / 2 of row group %ssg; IQ4XS's lane offsets)."""
+    x = lambda s: e(ind + s)
+    if SITE_BAL:
+        _site_unit(x, kpv, t)
+        x(f"%{t}gr0 = index.mul %{t}ug, %c16 : index")
+        x(f"%{t}gr1 = index.mul %{t}gr0, %crb : index")
+        x(f"%{t}h0 = index.add %{t}gr1, %rbo : index")
+    else:
+        x(f"%{t}pq = index.div {kpv}, %c2 : index")
+        x(f"%{t}h0 = index.add %ssr1, %rbo : index")
+    x(f"%{t}po = index.mul %{t}pq, %c136 : index")
+    x(f"%{t}ha = index.add %{t}h0, %{t}po : index")
+    x(f"%{t}qa = index.add %{t}ha, %qoff : index")
+    x(f"%{t}hl = index.min %{t}ha, %sldmax : index")
+    x(f"%{t}ql = index.min %{t}qa, %sldmax : index")
+    x(f"%{t}hv = vector.load %ssw[%{t}hl] : view<[%snin]xi8> -> vector<8xi8>")
+    x(f"%{t}hp = vector.bitcast %{t}hv : vector<8xi8> to vector<2xi32>")
+    x(f"%{t}qv = vector.load %ssw[%{t}ql] : view<[%snin]xi8> -> vector<8xi8>")
+    x(f"%{t}qp = vector.bitcast %{t}qv : vector<8xi8> to vector<2xi32>")
+    return [f"%{t}hp", f"%{t}qp"], ["vector<2xi32>", "vector<2xi32>"]
+
+
+def _fuse(text, n, pays, nin, extra, mark=False, site=0, nwg=0):
     """fuse's body for one payload or a per-phase pair; mark: MARK after the frame prologue (the versioned pair's
-    split point)."""
+    split point). site: R5_SITE's rows (0: none)."""
     nout = out_bytes(F)
     L = text.rstrip("\n").split("\n")
     assert sum("= scf.for %kp = [" in ln for ln in L) == 1
+    sb = ["sw", "sout"] if site else []
     li = next(i for i, ln in enumerate(L) if ln.startswith("} launch("))
     L[li] = L[li].replace(") {", ", %dz_w: buffer" + "".join(f", %dz_{b}: buffer" for b in extra)
-                          + ", %dz_out: buffer) {")
+                          + ", %dz_out: buffer" + "".join(f", %dz_{b}: buffer" for b in sb) + ") {")
     ai = next(i for i, ln in enumerate(L) if "buffer.assume.noalias" in ln)
     lhs, rhs = L[ai].split(" = buffer.assume.noalias ")
     names, types = rhs.split(" : ")
-    L[ai] = (lhs + ", %dz_w_na" + "".join(f", %dz_{b}_na" for b in extra) + ", %dz_out_na = buffer.assume.noalias "
-             + names + ", %dz_w" + "".join(f", %dz_{b}" for b in extra) + ", %dz_out : " + types
-             + ", buffer" * (2 + len(extra)))
+    L[ai] = (lhs + ", %dz_w_na" + "".join(f", %dz_{b}_na" for b in extra) + ", %dz_out_na"
+             + "".join(f", %dz_{b}_na" for b in sb) + " = buffer.assume.noalias "
+             + names + ", %dz_w" + "".join(f", %dz_{b}" for b in extra) + ", %dz_out"
+             + "".join(f", %dz_{b}" for b in sb) + " : " + types
+             + ", buffer" * (2 + len(extra) + len(sb)))
     ki = next(i for i, ln in enumerate(L) if "= scf.for %kp = [" in ln)
     P = []
     _frame_prologue(P.append, n, nin, nout)
@@ -461,7 +563,12 @@ def _fuse(text, n, pays, nin, extra, mark=False):
         P.append(MARK)
     for p in pays:
         p.prologue(P.append, n, nin, nout)
+    if site:
+        _site_prologue(P.append, site, nwg)
     init, tys = _loads(P.append, pays, "%c0", "p", "  ")
+    if site:
+        si_, st_ = _site_loads(P.append, "%c0", "ps", "  ")
+        init, tys = init + si_, tys + st_
     P, init = _pre(P), _pre(init)
     cur = ["%dz_ch", "%dz_cq"] if len(init) == 2 else [f"%dz_cc{i}" for i in range(len(init))]
     res = ["%dz_r0", "%dz_r1"] if len(init) == 2 else [f"%dz_rr{i}" for i in range(len(init))]
@@ -474,13 +581,15 @@ def _fuse(text, n, pays, nin, extra, mark=False):
     ri = next(i for i in range(ki, yi) if L[i].strip().startswith("%r0 = vector.mma"))
     NX = ["    %kp1 = index.add %kp, %c1 : index"]
     nxt, _ = _loads(NX.append, pays, "%kp1", "n", "    ")
+    if site:
+        nxt += _site_loads(NX.append, "%kp1", "ns", "    ")[0]
     NX, nxt = _pre(NX), _pre(nxt)
     ops, ytypes = L[yi].split(" : ", 1)
     L[yi] = ops + ", " + ", ".join(nxt) + " : " + ytypes + "".join(f", {ty}" for ty in tys)
     b2 = [i for i in range(ki, yi) if L[i].strip().startswith("kernel.barrier")][1]
     assert L[b2 - 1].strip() == "}"
     D = []
-    _decode(D.append, pays, [c.replace("%dz_", "%") for c in cur], "    ")
+    _decode(D.append, pays, [c.replace("%dz_", "%") for c in cur], "    ", site)
     D = _pre(D)
     # the next phase's payload loads right after step 0's B fragment loads (port's ps1v: half the IQ4_XS carrier's idle);
     # a schedule that issues those before the barrier (AFRAG b0early) keeps them before the last mma
