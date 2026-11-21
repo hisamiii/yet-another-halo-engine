@@ -773,6 +773,8 @@ NPU_SPLIT_LAYERS = {(k.split("@")[0], int(k.split("@")[1])): int(v) for k, v in
 # (Q' P1K) the production split when YAH_NPU_SPLIT / YAH_NPU_SPLIT_LAYERS are unset (set, even empty: they win):
 # NPU_SPLIT_DEFAULT, and the per-layer rows of tables/npu_split_layers_<model file stem>.txt (YAH_NPU_SPLIT_LAYERS's
 # syntax) when the model has one. 11-21: raise3 (port) + gate 3840, -29.9 ms pp2048 vs qkv/gate/q/out 5120/3200/5120/3200
+# 11-21 (tile): + ffn@L=8704 on 16 layers (mem's share-up, the layers whose NPU wait did not grow), with AHORD
+# and their swap images (RSWAP_FS): -6.7 ms pp2048, drift tier S (ln PPL +0.57 SE vs production)
 NPU_SPLIT_DEFAULT = {"qkv": 5120, "gate": 3840, "q": 5120, "out": 3200}
 
 
@@ -787,6 +789,8 @@ def split_defaults(model):
     if "YAH_NPU_SPLIT_LAYERS" not in os.environ and os.path.exists(tab):
         NPU_SPLIT_LAYERS.update({(k.split("@")[0], int(k.split("@")[1])): int(v) for k, v in
                                  (x.split("=") for x in open(tab).read().strip().split(",") if x)})
+    if "YAH_NPU_RSWAP_FS" not in os.environ:   # (the table's share-up F' swap images)
+        RSWAP_FS[:] = sorted({v for (s_, _), v in NPU_SPLIT_LAYERS.items() if s_ == "ffn"})
 # The NPU image waits for each job's ready word itself (gen_npu_gemm GATE, HRX patch 0016): no host relay sits between
 # the GPU and the NPU. dispatch.txt: "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*), and npu_flag_wait.hal
 # waits for a job's done word (gen_npu_unpack.gen_flag_wait).
@@ -987,7 +991,8 @@ RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "256" if NPU_FFNBLKS and NPU_F
 # YAH_NPU_AHORD=1: the swap stream in tile's host order (gen_r5fuse.stream_offsets: row r's blocks one run a call),
 # the image's A a dense run a row (gen_npu_q GN_QAHORD), so a row may take > 64 blocks (RSWAP_NB > 256, F 8704). The
 # GPU carriers must write the same order: one switch for both.
-AHORD = os.environ.get("YAH_NPU_AHORD") == "1"
+# (default on in production, QP1K: 11-21, with the F' 8704 share-up; YAH_NPU_AHORD=0 turns it off)
+AHORD = os.environ.get("YAH_NPU_AHORD", "1" if NPU_QP1K else "0") == "1"
 # YAH_NPU_RSWAP_FS=<F>[,<F>...] (with RSWAP_EMIT): one more swap image a layer F' besides the FFN block's F (tile's
 # share-up, F' = F + 256 k): "npu_ffnswap_iq4xs_<F'>" at one call a token panel (NB F' / 32, > 256 needs AHORD), its
 # H rows hpass = ffnblk_apass(F') apart; dispatch.txt "npurswap_<F'> <F'>", "npubytes_ffnswap_<F'>"
