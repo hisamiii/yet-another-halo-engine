@@ -208,7 +208,7 @@ class LoomPrefill {
     }
     if (RSwapOn()) {   // (YAH_NPU_RSWAP) the swap's weight stream at A's end (SwapA), its token panel at W's start
       const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
-      p.a_bytes = (p.a_bytes + 4095) / 4096 * 4096 + (R5Fuse() ? 2 : 1) * SwapStream();
+      p.a_bytes = (p.a_bytes + 4095) / 4096 * 4096 + (R5Fuse() ? 2 : 1) * SwapStreamMax();
       p.w_bytes = std::max(p.w_bytes, std::size_t{B_} / 512 * bw.w);
     }
     if (const auto it = geom_.find("npugate"); it != geom_.end())
@@ -1371,37 +1371,59 @@ class LoomPrefill {
   }
   // the swap image's weight M blocks (64 stream rows of 5120 x 9 / 8 B) a call: 32 = 1024 features (emit_prefill_pp
   // YAH_NPU_RSWAP_NB); a token panel's calls each take SwapNb() / 32 of today's 1024-feature blocks
-  std::uint32_t SwapNb() const {
-    const std::size_t a = NpuBytesOf("npubytes_ffnswap").a, blk = std::size_t{64} * 5120 * 9 / 8;
-    const std::uint32_t F = geom_.at("npurswap").tokens;
-    if (a % blk || a / blk % 32 || F / 32 % (a / blk)) throw LoomError("prefill: npubytes_ffnswap's A is not whole blocks");
+  // (share-up, F of 256-feature units: dispatch.txt "npurswap_<F> <F>", its image npu_ffnswap_iq4xs_<F>.xdna, bytes
+  // "npubytes_ffnswap_<F>", decoders npu_swdec_<fmt>_<g>_<F>.hal; the set's own F, "npurswap", unsuffixed). F 0: that.
+  std::uint32_t SwapF0() const { return geom_.at("npurswap").tokens; }
+  std::string SwapTag(std::uint32_t F) const { return !F || F == SwapF0() ? "" : "_" + std::to_string(F); }
+  bool RSwapF(std::uint32_t F) const { return F == SwapF0() || geom_.count("npurswap_" + std::to_string(F)) != 0; }
+  // (A whole blocks; the share-up's NB = F / 32 need not be a multiple of 32: one call a token panel)
+  std::uint32_t SwapNb(std::uint32_t F = 0) const {
+    const std::size_t a = NpuBytesOf("npubytes_ffnswap" + SwapTag(F)).a, blk = std::size_t{64} * 5120 * 9 / 8;
+    F = F ? F : SwapF0();
+    if (a % blk || (a / blk % 32 && a / blk != F / 32) || F / 32 % (a / blk))
+      throw LoomError("prefill: npubytes_ffnswap" + SwapTag(F) + "'s A is not whole blocks");
     return static_cast<std::uint32_t>(a / blk);
   }
-  std::size_t SwapStream() const {   // one layer's swap weight stream: F / 32 blocks, F / (32 SwapNb()) calls' A
-    return std::size_t{geom_.at("npurswap").tokens} / 32 / SwapNb() * NpuBytesOf("npubytes_ffnswap").a;
+  std::size_t SwapStream(std::uint32_t F = 0) const {   // one layer's swap weight stream: F / 32 blocks
+    const std::uint32_t f = F ? F : SwapF0();
+    return std::size_t{f} / 32 / SwapNb(F) * NpuBytesOf("npubytes_ffnswap" + SwapTag(F)).a;
   }
-  std::size_t SwapA(std::uint32_t half = 0) const {   // the swap's weight stream in A: its last F / 1024 calls' streams
-    const std::size_t r = SwapStream();
+  std::size_t SwapStreamMax() const {   // (A's swap halves: the largest F's stream)
+    std::size_t m = SwapStream();
+    for (const auto& kv : geom_)
+      if (kv.first.starts_with("npurswap_")) m = std::max(m, SwapStream(kv.second.tokens));
+    return m;
+  }
+  std::size_t SwapA(std::uint32_t half = 0) const {   // the swap's weight stream in A: its halves at A's end
+    const std::size_t r = SwapStreamMax();
     return npu_->A().size - (R5Fuse() ? 2 : 1) * r + half * r;
+  }
+  // (share-up) layer pre's NPU FFN features: dispatch.txt "npusplit_ffn@<L> <F'>", else base
+  std::uint32_t LayerFfnF(const std::string& pre, std::uint32_t base) const {
+    const auto it = geom_.find("npusplit_ffn@" + pre.substr(4, pre.find('.', 4) - 4));
+    return it == geom_.end() ? base : it->second.tokens;
   }
   // the pk (Q4_K order) stream's start in A (npu_plan dcol: A holds the p4 stream, then the pk one): the middle of A
   // before the swap's streams at its end (A's size / 2 put it inside the swap's stream since RSwapOn; harmless while
   // each stream was written right before its job, not once the double buffer keeps one across layers)
   std::size_t PkA() const {
     std::size_t s = halves_ ? a_one_ : npu_->A().size;   // (halves: one half's A, its p4 stream then the pk one)
-    if (RSwapOn() && !halves_) s -= (R5Fuse() ? 2 : 1) * SwapStream();
+    if (RSwapOn() && !halves_) s -= (R5Fuse() ? 2 : 1) * SwapStreamMax();
     return s / 2;
   }
   struct R5Layer {
     std::string pre;
-    std::string carrier;   // its GPU split's name before ".af.to.npu.hal" ("": it cannot carry)
+    std::string carrier;   // its GPU split's name before ".af.to.npu[_n<F>].hal" ("": it cannot carry)
     std::string pay;       // its gate / up as a payload: "" (IQ4_XS), "_<gate>_<up>"; payok: they fit gen_r5fuse's map
-    bool payok;            // (17408 x 5120, up after gate, F 8192, no rseg)
+    bool payok;            // (17408 x 5120, up after gate, a swap F, no rseg)
+    std::uint32_t f = 0;   // (share-up) its F: the carrier's rows "_n<F>", the payload's "_f<F>" (the swap's F: none)
   };
   // (R5Fuse) layer k's split carries layer k + 1's decode: the set has that fused split
   std::string R5Hal(std::size_t k) const {
     if (k + 1 >= r5_.size() || r5_[k].carrier.empty() || !r5_[k + 1].payok) return "";
-    const std::string h = r5_[k].carrier + ".af.to.r5" + r5_[k + 1].pay + ".npu.hal";
+    const std::string h = r5_[k].carrier + ".af.to.r5" + r5_[k + 1].pay +
+                          (SwapTag(r5_[k + 1].f).empty() ? "" : "_f" + SwapTag(r5_[k + 1].f).substr(1)) + ".npu" +
+                          (SwapTag(r5_[k].f).empty() ? "" : "_n" + SwapTag(r5_[k].f).substr(1)) + ".hal";
     return geom_.count(h) ? h : "";
   }
   std::vector<R5Layer> r5_;   // (R5Fuse) the swap layers in order, recorded by the planning pass
@@ -1482,7 +1504,12 @@ class LoomPrefill {
     return std::size_t{B / 64} * units * 18432;
   }
   // H's bytes in C (from 0), then down's partials from FfnBlkDown().
-  std::size_t FfnBlkH() const { return FfnBlkHOf(B_, FfnBlkF()); }
+  std::size_t FfnBlkH() const {   // (share-up: the largest layer F's)
+    std::size_t h = FfnBlkHOf(B_, FfnBlkF());
+    for (const auto& kv : geom_)
+      if (kv.first.starts_with("npusplit_ffn@")) h = std::max(h, FfnBlkHOf(B_, kv.second.tokens));
+    return h;
+  }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
     static const char* const kDecoders[] = {"iq4xs", "iq3s",  "iq3xxs", "q4k",  "q3k",
@@ -1511,10 +1538,17 @@ class LoomPrefill {
     const bool bmix = pair && geom_.count("npuffnbx_" + std::string(f.name) + "_" + fu.name) != 0;
     if (tg->dims != tu->dims || (!pair && tu->offset != tg->offset + tg->bytes) || (pair && !geom_.count("npuffnpair")))
       return false;
-    const std::uint32_t F = pair ? geom_.at("npuffnpair").tokens : ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
+    // (share-up: the layer's own F, "npusplit_ffn@<L>"; its GPU splits "<hal>.npu_n<F>.hal")
+    const std::uint32_t F0 = pair ? geom_.at("npuffnpair").tokens : ffnblk_, F = LayerFfnF(pre, F0),
+                        M = static_cast<std::uint32_t>(tg->dims[1]);
+    const auto npuhal = [&](const std::string& h) {
+      if (F == F0 || h.empty()) return NpuHal(h);
+      const std::string v = h.substr(0, h.size() - 4) + ".npu_n" + std::to_string(F) + ".hal";
+      return geom_.count(v) ? v : std::string();
+    };
     // the GPU's features: the fused ffn's split, or (pairs) gate kstore + up swiglu splits, fragment-major into ffnup_
     // (rseg: the split of that layout, its up rows F rows on, emit_prefill_pp FFUP)
-    const std::string sh = pair ? "" : NpuHal(weights_.RSegOf(*tg) ? AfHal(RSegHal(GemmHal("gemm_ffn", *tg, &f), *tg), ".af.to.hal") : hal);
+    const std::string sh = pair ? "" : npuhal(weights_.RSegOf(*tg) ? AfHal(RSegHal(GemmHal("gemm_ffn", *tg, &f), *tg), ".af.to.hal") : hal);
     // (a pair whose gate and up rows are contiguous: the fused GPU gate / up's split when the set has it, emit_prefill_pp
     // GN_FFNMIXSPLIT, "gemm_ffn_<gate>[_<up>]_<mt>_<kb>.af.to.npu.hal"; YAH_FFNMIXSPLIT=0: gate kstore + up swiglu)
     static const bool mixsplit = [] { const char* e = std::getenv("YAH_FFNMIXSPLIT"); return !e || std::strcmp(e, "0"); }();
@@ -1522,14 +1556,14 @@ class LoomPrefill {
     if (pair && mixsplit && tu->offset == tg->offset + tg->bytes) {
       Fmt fx{};
       std::string b = GemmHal("gemm_ffn", *tg, &fx);
-      if (tg->type == tu->type) fh = NpuHal(AfHal(b, ".af.to.hal"));
+      if (tg->type == tu->type) fh = npuhal(AfHal(b, ".af.to.hal"));
       if (fh.empty()) {
         b.insert(std::strlen("gemm_ffn_") + std::strlen(f.name), "_" + std::string(fu.name));
-        fh = NpuHal(AfHal(b, ".af.to.hal"));
+        fh = npuhal(AfHal(b, ".af.to.hal"));
       }
     }
-    const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
-    const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
+    const std::string gs = pair ? npuhal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
+    const std::string us = pair ? npuhal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
     // the GPU's down over its features: f32 for npu_unpack_ffnblk
     const std::string rem = "npuffnrem_" + std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
@@ -1565,7 +1599,9 @@ class LoomPrefill {
     // into W ("<norm>_pn.hal", gen_half_norm PANEL) and the swap skips npu_swpanel.hal
     const bool rsw0 = RSwapOn() && (!pair || mix) && (pair || !geom_.count("npuffnsw5")) && geom_.count("npuffnq") &&
                       !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) && hord == "_p4" && (apass == 0 || hap) &&
-                      geom_.at("npurswap").tokens == F && B_ % 512 == 0 && parts[0].p % 4 == 0;
+                      RSwapF(F) && B_ % 512 == 0 && parts[0].p % 4 == 0 &&
+                      (SwapTag(F).empty() || (geom_.count("npu_swdec_" + std::string(f.name) + "_g" + SwapTag(F) + ".hal") &&
+                                              geom_.count("npu_swdec_" + std::string(fu.name) + "_u" + SwapTag(F) + ".hal")));
     const bool panel = rsw0 && !dfr && PanelNorm();
     const bool panelq = panel && PanelQ();   // (the norm runs below, once the swap's calls are bound)
     if (!panelq) RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk", false, panel);
@@ -1641,7 +1677,7 @@ class LoomPrefill {
     const std::uint32_t qc = parts[0].p, qu = hap ? apass : qc;
     const std::size_t qpart = std::size_t{B_ / 64} * qu * 18432;
     for (const FfnPart& u : parts)
-      if (qffn && (u.p != parts[0].p || u.r != u.p) && !np5)
+      if (qffn && (u.p != parts[0].p || u.r != u.p) && !np5 && !(rsw0 && hap))
         throw LoomError("prefill: the Q' FFN block's K parts differ in size");
     // a part's H start: apass, unit U of the M block's [M block][units] (the image's hpass apass); else its own region
     const auto hbase = [&](std::size_t ci) {
@@ -1668,7 +1704,7 @@ class LoomPrefill {
     // calls 4 b .. 4 b + 3) and writes H where they do, its 8 M blocks qc x 18432 B apart (gen_npu_q GN_QSWHT)
     // (a single format's layer or a mixed pair's: the image reads bfp16 only, the GPU decodes each tensor's format)
     const bool rswap = RSwapOn() && (!pair || mix) && !np5 && qffn && !bmix && RSwapFmt(f.name) && RSwapFmt(fu.name) &&
-                       hord == "_p4" && (apass == 0 || hap) && geom_.at("npurswap").tokens == F && B_ % 512 == 0 && qc % 4 == 0;
+                       hord == "_p4" && (apass == 0 || hap) && rsw0 && B_ % 512 == 0 && qc % 4 == 0;
     if (rswap != rsw0) throw LoomError("prefill: " + pre + " swap decided differently before the norm");
     for (std::uint32_t j = 0; j < F / 256 && cpair && !rswap; ++j)
       csw.push_back(npu_->BindRawPair(sw + ".xdna", sw + ".xdna", 100 + 16 * DecoderId(f.name) + DecoderId(fu.name), HA(ag),
@@ -1681,12 +1717,13 @@ class LoomPrefill {
     std::string r5h;
     if (rswap && R5Fuse()) {
       const std::string& cs = pair ? fh : sh;   // (the carrier: the fused gate / up split)
-      const bool shape = M == 17408 && F == 8192 && tg->dims[0] == 5120 && !weights_.RSegOf(*tg);
-      const bool can = shape && cs.size() > 14 && cs.compare(cs.size() - 14, 14, ".af.to.npu.hal") == 0;
+      const bool shape = M == 17408 && RSwapF(F) && tg->dims[0] == 5120 && !weights_.RSegOf(*tg);
+      const std::string cx = ".af.to.npu" + (F == F0 ? std::string() : "_n" + std::to_string(F)) + ".hal";
+      const bool can = shape && cs.size() > cx.size() && cs.compare(cs.size() - cx.size(), cx.size(), cx) == 0;
       const bool iq4 = std::strcmp(f.name, "iq4xs") == 0 && std::strcmp(fu.name, "iq4xs") == 0;
       if (npu_planning_) {
-        r5_.push_back({pre, can ? cs.substr(0, cs.size() - 14) : "", iq4 ? "" : "_" + std::string(f.name) + "_" + fu.name,
-                       shape && tu->offset == tg->offset + tg->bytes});
+        r5_.push_back({pre, can ? cs.substr(0, cs.size() - cx.size()) : "", iq4 ? "" : "_" + std::string(f.name) + "_" + fu.name,
+                       shape && tu->offset == tg->offset + tg->bytes, F});
         if (r5_.size() > 1 && !R5Hal(r5_.size() - 2).empty())
           Exe(R5Hal(r5_.size() - 2));   // (loaded here: the timed pass's first carry would load it)
       }
@@ -1711,20 +1748,22 @@ class LoomPrefill {
       const std::vector<hrx_buffer_ref_t> gg = GemmWeights(*tgn, fg), gn = GemmWeights(*tun, fn);
       if (gg.size() > 1) b.push_back(gg[1]);
       if (gn.size() > 1 && std::strcmp(fg.name, fn.name)) b.push_back(gn[1]);
-      b.push_back(AViewAbs({SwapA((r5k + 1) % 2), SwapStream()}));
+      b.push_back(AViewAbs({SwapA((r5k + 1) % 2), SwapStream(r5_[r5k + 1].f)}));
       wmask |= std::uint64_t{1} << (b.size() - 1);
     };
     if (rswap) {
-      const NpuBytes bw = NpuBytesOf("npubytes_ffnswap");
+      const NpuBytes bw = NpuBytesOf("npubytes_ffnswap" + SwapTag(F));
       const std::size_t sa = SwapA(R5Fuse() ? r5k % 2 : 0);
-      const std::uint32_t nbc = SwapNb(), bpc = nbc / 32;   // (a call's 64-row blocks; today's 1024-feature b's)
-      if (nbc / 8 > qu || qu % (nbc / 8)) throw LoomError("prefill: a swap call's H spans more than a down part");
-      if (R5Fuse() && SwapStream() != std::size_t{F} * 5120 * 9 / 4)
+      // (a call's 64-row blocks, its H units uc; nbk calls a token panel; one call a panel: its H all qu units of an
+      // M block, the pads its image skips)
+      const std::uint32_t nbc = SwapNb(F), uc = nbc / 8, nbk = F / 32 / nbc;
+      if (uc > qu || (nbk > 1 && qu % uc)) throw LoomError("prefill: a swap call's H spans more than a down part");
+      if (R5Fuse() && SwapStream(F) != std::size_t{F} * 5120 * 9 / 4)
         throw LoomError("prefill: the swap stream is not gen_r5fuse's (2 F K / 8 records of 9 B)");
       for (const auto& [t, x, gu] : {std::tuple<const core::TensorInfo*, const Fmt*, const char*>{tg, &f, "g"},
                                      {tu, &fu, "u"}}) {
         if (carried) break;
-        const std::string h = "npu_swdec_" + std::string(x->name) + "_" + gu + ".hal";
+        const std::string h = "npu_swdec_" + std::string(x->name) + "_" + gu + SwapTag(F) + ".hal";
         const Geom& gd = geom_.at(h);
         const std::size_t trb = static_cast<std::size_t>(t->bytes) / M;
         hrx_buffer_ref_t wr = TRef(*t);
@@ -1746,13 +1785,14 @@ class LoomPrefill {
       static const bool bouter = std::getenv("YAH_NPU_RSWAP_BOUTER") != nullptr;
       // (diag, wrong output) YAH_NPU_RSWAP_DIAG=a0: every call reads weight block 0's A (a bound on fresh-stream reads)
       static const bool a0 = [] { const char* e = std::getenv("YAH_NPU_RSWAP_DIAG"); return e && std::strcmp(e, "a0") == 0; }();
-      const std::uint32_t nt = B_ / 512, nbk = F / 1024 / bpc;
+      const std::uint32_t nt = B_ / 512;
       for (std::uint32_t i = 0; i < nt * nbk; ++i) {
-        const std::uint32_t t = bouter ? i % nt : i / nbk, b = bouter ? i / nt : i % nbk;   // (call b: blocks bpc b ..)
-          const std::uint32_t j = 4 * bpc * b;
-          csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs.xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a}, {t * bw.w, bw.w},
+        const std::uint32_t t = bouter ? i % nt : i / nbk, b = bouter ? i / nt : i % nbk;   // (call b: units uc b ..)
+          const std::uint32_t j = uc * b;
+          csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs" + SwapTag(F) + ".xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a},
+                                       {t * bw.w, bw.w},
                                        {j / qu * qpart + std::size_t{j % qu} * 18432 + std::size_t{8} * t * qu * 18432,
-                                        std::size_t{7 * qu + nbc / 8} * 18432}));
+                                        std::size_t{nbk == 1 ? 8 * qu : 7 * qu + uc} * 18432}));
         }
     }
     for (std::uint32_t j = 0; j < F / fc && !cpair && !rswap; ++j)   // (np5: a call's rows span 4 x 256 + 64)
