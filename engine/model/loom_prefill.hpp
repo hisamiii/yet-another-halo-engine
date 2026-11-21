@@ -2660,6 +2660,7 @@ class LoomPrefill {
   std::size_t SwSitePanel(const std::string& hal = "npu_swpanel.hal", const LoomBuffer* input = nullptr) {
     const Geom& gp = geom_.at(hal);
     if (hal == "npu_swpanel.hal" && !input && std::exchange(site_panel_, false)) return gp.tt;   // (the norm wrote it)
+    if (input && hal.rfind("npu_swpanel_o", 0) == 0 && std::exchange(out_panel_, false)) return gp.tt;   // (postnorm a)
     Dispatch(Exe(hal), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1, gp.rowgrp, 1, 1,
              {Ref(input ? *input : *normt_), WRef(0, gp.tt)}, 2);
     return gp.tt;
@@ -3651,6 +3652,7 @@ class LoomPrefill {
                      trim_row_ == kAllRows && tail_ == kAllRows;
     // (a Q4_K ssm_out reads the Q4_K-order stream: "_a_bfp_pk.hal" writes it into A's second half instead)
     const bool pk = bfp && NpuPk(pre + "ssm_out.weight") && geom_.count("npupostnormbfppk");
+    const bool swo = dnsplit_a_ && on && SwSiteR("out", BlkOf(pre), on);   // (the out site in swap form)
     // gc: the postnorm parts read the gate's NPU columns straight from C ("<pn>_a_bfp[_pk]_gc<sfx>.hal", "<pn>_b_gc<sfx>.hal",
     // gen_postnorm_bfp gc), so the gate unpack goes; the out job's C must not overlap the gate's (RunResidual checks)
     std::string gc_sfx;
@@ -3661,9 +3663,8 @@ class LoomPrefill {
       NpuJoin(gate_job);
       const std::string un = RowsHal(Np4Hal("npu_unpack_gate", pre + "attn_gate.weight"), "gate", ng, Np4(pre + "attn_gate.weight"));
       const std::string sfx = un.substr(15, un.size() - 19);   // "npu_unpack_gate<sfx>.hal"
-      // (a swap-form out: part a writes no stream, "<pn>_a_gc<sfx>.hal")
-      if ((bfp || (dnsplit_a_ && on && SwSiteR("out", BlkOf(pre), on))) &&
-          geom_.count(pn + (pk ? "_a_bfp_pk_gc" : bfp ? "_a_bfp_gc" : "_a_gc") + sfx + ".hal") &&
+      // (a swap-form out: part a writes the out site's token panel, "<pn>_a_pn_gc<sfx>.hal")
+      if ((bfp || swo) && geom_.count(pn + (pk ? "_a_bfp_pk_gc" : bfp ? "_a_bfp_gc" : "_a_pn_gc") + sfx + ".hal") &&
           geom_.count(pn + "_b_gc" + sfx + ".hal"))
         gc_sfx = "_gc" + sfx, gc_read_ = cg;
       else
@@ -3681,8 +3682,15 @@ class LoomPrefill {
       norm_pk_ = pk ? "out" : "";
       std::vector<hrx_buffer_ref_t> b{Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)};
       if (bfp) b.push_back(ARef(pk ? PkA() : 0, NpuK(5120).a));
+      // (swap-form out with gc: the out site's token panel in W, RunResidual's SwSitePanel skips npu_swpanel_o)
+      const bool opn = swo && !gc_sfx.empty();
+      if (opn) {
+        const char* ph = geom_.count("npu_swpanel_o_t.hal") ? "npu_swpanel_o_t.hal" : "npu_swpanel_o.hal";
+        b.push_back(WRef(0, geom_.at(ph).tt));
+        out_panel_ = true;
+      }
       if (!gc_sfx.empty()) b.push_back(gcb);
-      Dispatch(Exe(pn + (pk ? "_a_bfp_pk" : bfp ? "_a_bfp" : "_a") + gc_sfx + ".hal"), "yah_ssm_postnorm_fp16",
+      Dispatch(Exe(pn + (pk ? "_a_bfp_pk" : bfp ? "_a_bfp" : opn ? "_a_pn" : "_a") + gc_sfx + ".hal"), "yah_ssm_postnorm_fp16",
                dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1, b);
       const auto part_b = [this, pn, gate, gc_sfx, gcb, w = TRef(*Find(pre + "ssm_norm.weight"))] {
         std::vector<hrx_buffer_ref_t> bb{Ref(*raw2_), w, gate, Ref(*scratch_)};
@@ -3763,6 +3771,7 @@ class LoomPrefill {
   bool out_np4_ = false;           // ... from an NP 4 image (npu_unpack_out_4.hal)
   bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
   bool ffn_pendingsw_ = false;
+  bool out_panel_ = false;         // the DeltaNet postnorm part a wrote the out site's token panel (_a_pn_gc)
   bool site_panel_ = false;        // the attention norm wrote the q / qkv sites' token panel (norm_t_pn.hal)     // ... from the swap-form down (npu_unpack_ffnblk_sw.hal, npu_unormsw_rr_*)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
   NormOut pending_mode_{};

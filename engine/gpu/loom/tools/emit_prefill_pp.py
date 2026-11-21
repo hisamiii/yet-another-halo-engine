@@ -1528,16 +1528,19 @@ def npu_split(rows, combos, B, outdir):
             pn_bfp = "out" in NPU_SPLIT and DNSPLIT[0] * 128 == NPU_KCALL and not SWSITE
             pvars = [(t, "_a_bfp" + pk, 0, DNSPLIT[0], True, perm) for t in (False, True)
                      for pk, perm in (("", "p4"), ("_pk", "pk")) if pn_bfp]
-            # (swap-form out: part a writes no stream, "_a_gc")
-            pvars += [(t, "_a", 0, DNSPLIT[0], False, "p4") for t in (False, True) if SWSITE]
+            # (swap-form out: part a writes the out site's token panel instead, "_a_pn_gc", gen_postnorm_bfp panel)
+            assert not SWSITE or DNSPLIT[0] * 128 == 5120, ("the out panel is K 0 .. 5120", DNSPLIT)
+            pvars += [(t, "_a_pn", 0, DNSPLIT[0], True, "p4") for t in (False, True) if SWSITE]
             pvars += [(t, "_b", DNSPLIT[0], DNSPLIT[1], False, "p4") for t in (False, True)]
             for tiled, part, h0, nh, bfp, perm in pvars:
                 gname = "postnorm%s%s_gc%s.hal" % ("_t" if tiled else "", part, sfx)
                 src = os.path.join(tmp, gname[:-4] + ".loom")
                 GE.ACT_PERM = perm
                 try:
-                    text = gen_postnorm_bfp.gen(B, h0, nh, list(NPU_KS), NPU_PASSES, tiled, True, bfp=bfp, gc=n,
-                                                gcswap=sw)
+                    pnl = part == "_a_pn"
+                    text = gen_postnorm_bfp.gen(B, h0, nh, list(RSWAP_KS if pnl else NPU_KS),
+                                                RSWAP_PASSES if pnl else NPU_PASSES, tiled, True, bfp=bfp, gc=n,
+                                                gcswap=sw, panel=pnl)
                 finally:
                     GE.ACT_PERM = "p4"
                 open(src, "w").write(text)

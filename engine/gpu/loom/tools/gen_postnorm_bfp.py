@@ -17,8 +17,10 @@ import gen_bfp16_encode as GE
 import gen_npu_unpack as GU
 
 
-def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcswap=None):
-    """gcswap (with gc): the gate's NPU C is the swap-form site image's (npu_swsite, R = gcswap rows,
+def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcswap=None, panel=False):
+    """panel (with bfp; ks, passes the swap's): the stream is the swap out site's token panel (gen_bfp16_encode "wgt",
+    p1k, no k-block permutation: npu_swpanel_o's W bytes), its fragments the same 72 bytes of 8 rows.
+    gcswap (with gc): the gate's NPU C is the swap-form site image's (npu_swsite, R = gcswap rows,
     gen_npu_unpack.swapc_base); the same values and rounding."""
     import gen_npu_gemm as GN
     assert B % 16 == 0 and (not bfp or (h0 + nh) * 128 <= 1024 * passes)
@@ -56,7 +58,7 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcsw
     e("  %weight_view = buffer.view %weight_na[%base] : buffer -> view<[%c128]xf32>")
     e("  %out_view = buffer.view %out_na[%base] : buffer -> view<[%io_total]xf16>")
     if bfp:
-        nab = GE.layout_bytes("act", B, ks, passes)
+        nab = GE.layout_bytes("wgt" if panel else "act", B, ks, passes)
         e(f"  %nab = index.constant {nab} : index")
         e("  %abv = buffer.view %ab[%base] : buffer -> view<[%nab]xi8>")
         e("  %bs_bytes = index.constant 1152 : offset")   # 16 fragments x 72 bytes
@@ -205,7 +207,9 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcsw
         e("    %cp_w = index.rem %tid, %c9 : index")
         e("    %cp_k0 = index.mul %hd, %c16 : index")
         e("    %cp_kbi = index.add %cp_k0, %cp_f : index")
-        frag = GE.emit_offset(e, "act", B, list(ks), passes, 64, True, "%tg", "%cp_kbi", p="cp_", ind="    ")
+        frag = (GE.emit_offset(e, "wgt", B, list(ks), passes, 64, True, "%tg", "%cp_kbi", p="cp_", ind="    ",
+                               perm=False, p1k=True) if panel else
+                GE.emit_offset(e, "act", B, list(ks), passes, 64, True, "%tg", "%cp_kbi", p="cp_", ind="    "))
         e("    %cp_wo = index.mul %cp_w, %c8 : index")
         e(f"    %cp_ga = index.add {frag}, %cp_wo : index")
         e("    %cp_fb = index.mul %cp_f, %c72 : index")
