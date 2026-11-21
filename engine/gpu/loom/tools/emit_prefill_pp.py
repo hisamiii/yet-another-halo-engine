@@ -1584,6 +1584,10 @@ def npu_split(rows, combos, B, outdir):
     open(src, "w").write(GU.gen_flag_wait(log=True))
     E.emit(src, ["nop=0"], "npu_flag_wait_log.hal", outdir)
     out.append(("npu_flag_wait_log.hal", 1, 32, 0))
+    src = os.path.join(tmp, "npu_flag_wait_stamp.loom")   # the same wait, REALTIME at entry and exit (YAH_CLK_PROBE)
+    open(src, "w").write(GU.gen_flag_wait(stamp=True))
+    E.emit(src, ["nop=0"], "npu_flag_wait_stamp.hal", outdir)
+    out.append(("npu_flag_wait_stamp.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
     bfp_site_rows(bsites, outdir)
     out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
@@ -2882,6 +2886,10 @@ def main():
         raise SystemExit("emit_prefill_pp: the embed kernel reads a Q8_0 token_embd")
     open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B))
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
+    # YAH_CLK_PROBE (diag): one wave that measures the GPU clock over 20 us (gen_npu_unpack.gen_clk_probe)
+    clk_src = os.path.join(tmp, "yah_clk_probe.loom")
+    open(clk_src, "w").write(GU.gen_clk_probe())
+    geom.append(("clk_probe.hal", 1, 32, 0))
     geom.append(("native", 0, 0, 0))   # the engine loads the GGUF as it is (core/gguf_convert.cpp)
     # the output head: the tile-free GEMV (gen_gemv) for Q8_0 (a GGUF head that is not Q6_K, which
     # yah_gemv_q6k_f32 reads), rows per workgroup / lanes / workgroups in its row
@@ -2918,6 +2926,7 @@ def main():
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
     fixed = [
         (embed_src, "embed.hal", ["nop=0"]),
+        (clk_src, "clk_probe.hal", ["nop=0"]),
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
         (norm_src, "norm.hal",

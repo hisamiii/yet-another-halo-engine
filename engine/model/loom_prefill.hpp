@@ -237,6 +237,57 @@ class LoomPrefill {
     for (const auto& [tag, n] : per_tag)
       std::fprintf(f, "npu wait: %-8s %llu polls\n", tag.c_str(), static_cast<unsigned long long>(n));
   }
+  // YAH_CLK_PROBE: one probe (16-byte slot: t0, t1, c0, c1). Ordered after the hidden state's last write as if it
+  // read it ("after": nothing later waits for it), so it runs beside the layer's kernels, off their chain.
+  void ClkProbe() {
+    if (!clk_ || npu_planning_ || warming_ || halves_) return;
+    if (clk_n_ == kClkSlots) throw LoomError("YAH_CLK_PROBE: more probes than slots");
+    if (split_armed_ && graph_) SplitGraph();
+    const LoomExecutable& exe = Exe("clk_probe.hal");
+    const std::uint32_t ordinal = exe.OrdinalOrZero("yah_clk_probe");
+    const hrx_dispatch_config_t config = LoomDevice::Config(1, 1, 1, 32, 1, 1);
+    const hrx_buffer_ref_t b{clk_->handle, clk_n_++ * 16, 16};
+    const std::vector<hrx_buffer_ref_t> after{Ref(*hidden_)};
+    if (graph_)
+      graph_->Dispatch(exe, ordinal, config, &b, 1, 1, &after);
+    else
+      gpu_.Dispatch(exe, ordinal, config, nullptr, 0, &b, 1);
+  }
+  // YAH_CLK_PROBE: after the run, one line: the GPU span from the first probe to the last (REALTIME), the flag waits
+  // inside it, work = span - waits, and work in G cycles (each interval between probes at the mean clock of its two
+  // probes) with the ms that is at 2600 MHz; the probes' clock mean / min / max. YAH_CLK_PROBE=2: a line per interval.
+  void ReportClk(std::FILE* f) {
+    if (!clk_ || clk_n_ < 2) return;
+    std::vector<std::uint32_t> p(clk_n_ * 4), s(stamp_n_ * 2);
+    gpu_.D2H(*clk_, p.data(), p.size() * 4);
+    if (stamp_n_) gpu_.D2H(*stamp_, s.data(), s.size() * 4);
+    std::vector<double> mhz(clk_n_);
+    double fsum = 0, fmin = 1e9, fmax = 0;
+    for (std::size_t i = 0; i < clk_n_; ++i) {
+      const std::uint32_t dt = p[4 * i + 1] - p[4 * i], dc = (p[4 * i + 3] - p[4 * i + 2]) & 0xfffffu;
+      mhz[i] = dt ? dc * 100.0 / dt : 0;
+      fsum += mhz[i], fmin = std::min(fmin, mhz[i]), fmax = std::max(fmax, mhz[i]);
+    }
+    const bool each = std::string(std::getenv("YAH_CLK_PROBE")) == "2";
+    const std::uint32_t a0 = p[0], span_t = p[4 * (clk_n_ - 1)] - a0;
+    double waits = 0, cyc = 0, outside = 0;
+    std::vector<double> wi(clk_n_, 0);
+    for (std::size_t k = 0; k < stamp_n_; ++k) {
+      const std::uint32_t te = s[2 * k], d = s[2 * k + 1] - te, at = te - a0;
+      if (at >= span_t) { outside += d * 1e-5; continue; }
+      std::size_t i = 0;
+      while (i + 2 < clk_n_ && p[4 * (i + 1)] - a0 <= at) ++i;
+      wi[i] += d * 1e-5, waits += d * 1e-5;
+    }
+    for (std::size_t i = 0; i + 1 < clk_n_; ++i) {
+      const double len = (p[4 * (i + 1)] - p[4 * i]) * 1e-5, work = len - wi[i];
+      cyc += work * 1e-3 * (mhz[i] + mhz[i + 1]) * 0.5e6;
+      if (each) std::fprintf(f, "clk: %zu %.0f MHz, %.3f ms, waits %.3f ms\n", i, mhz[i], len, wi[i]);
+    }
+    std::fprintf(f, "clk: span %.2f ms, waits %.2f ms (%zu, %.2f ms outside), work %.2f ms, work %.4f Gcyc = %.2f ms at "
+                 "2600 MHz; clock %.0f MHz mean, %.0f..%.0f, %zu probes\n", span_t * 1e-5, waits, stamp_n_, outside,
+                 span_t * 1e-5 - waits, cyc * 1e-9, cyc / 2.6e6, fsum / clk_n_, fmin, fmax, clk_n_);
+  }
   // YAH_NPU_PROF in a GPU + NPU run: after it, the first NPU chunk's per-job counters as CPU-driven runs print them
   // (tools/npu_prof.py; no per-job host time: 0).
   void ReportNpuProf() {
@@ -499,6 +550,7 @@ class LoomPrefill {
     if (npu_attn_ && ci >= na_from_) ++na_seq_;  // the layers' ready / done values (words are reused per chunk)
     flagged_.clear();
     npu_job_ = 0, npu_cleared_ = 0, npu_joined_ = 0;
+    if (ci == 0) clk_n_ = 0, stamp_n_ = 0;   // (YAH_CLK_PROBE: ReportClk reads the last pass's chunks)
     swap_layer_.clear(), swap_reader_[0] = swap_reader_[1] = -1, part_done_[0] = part_done_[1] = -1;   // (halves: a chunk's job indices start again; its graph runs after the last)
     job_side_.clear();
     NewGraph();
@@ -735,11 +787,13 @@ class LoomPrefill {
              {EmbedTable(), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) RecordLayer(l, ci, hook);
     FlushFfn();
+    ClkProbe();
   }
   void RecordLayer(std::uint32_t l, std::uint32_t ci, const KvHook& hook) {
     const std::string pre = "blk." + std::to_string(l) + ".";
     split_armed_ = split_layer_ && l == split_layer_;
     layer_ = l;
+    ClkProbe();
     tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
     if (cfg_.IsFullAttention(l)) {
       const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
@@ -1081,6 +1135,15 @@ class LoomPrefill {
     // The norms' residual and sum_out bindings: the emitted norms (gen_half_norm.gen_split) never touch them (only
     // gen(resadd) does), so one 4-byte buffer stands for both, read-only in the graph (no false waits between norms)
     normnil_ = &Alloc(4);
+    // YAH_CLK_PROBE=1 (diag, off by default; mem 11-21): the GPU clock without the dispatch profiler. A 1-wave probe
+    // (yah_clk_probe) at each layer start and after the last layer measures the clock over 20 us (REALTIME 100 MHz,
+    // SHADER_CYCLES); with the NPU split each flag wait stamps REALTIME at entry and exit (npu_flag_wait_stamp.hal).
+    // ReportClk prints the span, the waits and the GPU's work in cycles. Slots restart at each chunk 0.
+    if (std::getenv("YAH_CLK_PROBE")) {
+      if (!geom_.count("clk_probe.hal")) throw LoomError("YAH_CLK_PROBE: the set has no clk_probe.hal (re-emit it)");
+      clk_ = &Alloc(kClkSlots * 16);
+      if (geom_.count("npu_flag_wait_stamp.hal")) stamp_ = &Alloc(kWaitLogSlots * 8);
+    }
     scratch_ = &Alloc(B * kFfn * 2);
     qkv_ = &Alloc(B * kQProj * 4);
     gate_ = &Alloc(B * kInner * 4);
@@ -2616,6 +2679,11 @@ class LoomPrefill {
       w.words.push_back({waitlog_->handle, waitlog_tag_.size() * 4, 4});
       waitlog_tag_.push_back(std::to_string(q.layer) + " " + q.tag);
       Dispatch(Exe("npu_flag_wait_log.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 12, &w.npu_side);
+    } else if (stamp_) {   // YAH_CLK_PROBE: REALTIME at the wait's entry and exit to its own 8-byte slot (ReportClk)
+      const bool rec = !npu_planning_ && !warming_;
+      if (rec && stamp_n_ == kWaitLogSlots) throw LoomError("YAH_CLK_PROBE: more waits than stamp slots");
+      w.words.push_back({stamp_->handle, (rec ? stamp_n_++ : 0) * 8, 8});
+      Dispatch(Exe("npu_flag_wait_stamp.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 12, &w.npu_side);
     } else {
       Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 4, &w.npu_side);
     }
@@ -3508,6 +3576,10 @@ class LoomPrefill {
   }
   hrx_buffer_ref_t EmbedTable() const { return embed_rows_ ? Ref(*embed_rows_) : TRef(*Find("token_embd.weight")); }
   static constexpr std::size_t kWaitLogSlots = 65536;
+  static constexpr std::size_t kClkSlots = 4096;
+  LoomBuffer* clk_ = nullptr;     // YAH_CLK_PROBE: 16 bytes a probe (ClkProbe, ReportClk)
+  LoomBuffer* stamp_ = nullptr;   // YAH_CLK_PROBE: 8 bytes a flag wait (NpuJoin)
+  std::size_t clk_n_ = 0, stamp_n_ = 0;
   LoomBuffer* waitlog_ = nullptr;          // YAH_NPU_WAITLOG: a poll count per GPU wait (NpuJoin, ReportWaitLog)
   std::vector<std::string> waitlog_tag_;   // each slot's layer and job tag
   std::vector<std::string> prof_tags_;     // YAH_NPU_PROF: the first NPU chunk's job tags (ReportNpuProf)

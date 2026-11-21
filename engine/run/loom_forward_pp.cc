@@ -343,6 +343,7 @@ int main(int argc, char** argv) {
     if (rowstats) std::fclose(rowstats);
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
+    pf.ReportClk(stdout);
 #ifdef YAH_WITH_NPU
     if (npu) npu->Report(stdout);
     if (npu_attn) npu_attn->Report(stdout), npu_attn->Finish();
