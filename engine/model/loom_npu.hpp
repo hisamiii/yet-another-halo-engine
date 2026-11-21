@@ -107,6 +107,9 @@ class LoomNpu {
     // (gen_npu_gemm GN_QPANEL) calls a token panel: the job opens panel by panel, and the host pushes each later
     // panel's first call after that panel's go (GoPart). 0: one gate a job.
     int panel = 0;
+    // (gen_npu_gemm GN_QPDONE, plain images) each panel's done too: after the next panel's go, the done's signal task
+    // alone (DonePart) into the panel's last call's signal binding; the job's last panel's is the job's done.
+    bool pdone = false;
     // Streamed: calls queued ahead of their waits (QueueDepth: 2, or 1 where one call's pushes fill a DMA channel's
     // task queue past half, e.g. layout Q''s 4 W tasks a call: a second call's would overflow it)
     int depth = 2;
@@ -526,9 +529,15 @@ class LoomNpu {
     // (diag) NPU_RUN_PANEL=<k>: the image's GN_QPANEL (the flag binding then holds the job's final ready value)
     const int panel = std::getenv("NPU_RUN_PANEL") ? std::atoi(std::getenv("NPU_RUN_PANEL")) : 0;
     const std::vector<std::uint8_t> go = panel > 0 ? GoPart(c.gate) : std::vector<std::uint8_t>{};
+    // (diag) NPU_RUN_PDONE=1 with NPU_RUN_PANEL: the image's GN_QPDONE (each panel's done after the next panel's go)
+    const bool pdone = panel > 0 && std::getenv("NPU_RUN_PDONE") && std::atoi(std::getenv("NPU_RUN_PDONE")) == 1;
+    const std::vector<std::uint8_t> dpart = pdone ? DonePart(c.done) : std::vector<std::uint8_t>{};
     if (!k.streamed) {
       for (int i = 0; i < calls; ++i) {
-        if (panel > 0 && i > 0 && i % panel == 0) seq.push_back(&go);
+        if (panel > 0 && i > 0 && i % panel == 0) {
+          seq.push_back(&go);
+          if (pdone) seq.push_back(&dpart);
+        }
         seq.push_back(&c.call);
       }
     } else {
@@ -1844,6 +1853,10 @@ class LoomNpu {
   // find the stream empty. The pending ask is the record after the tick task's last (the queue runs in order), so the
   // sync also waits for the waiter to send it.
   static constexpr std::uint32_t kAskDropBd = 14, kAskDropOps = 10;
+  // (Kernel::pdone) a panel's done before the job's end: the done invocation's signal task alone, as GoPart takes the
+  // go's (BD, control, queue and sync on the relay's column; the done's other sync, on the waiter's tick task, waits
+  // for the job's leftover supply and would stall mid-job).
+  static std::vector<std::uint8_t> DonePart(const std::vector<std::uint8_t>& done) { return GoPart(done); }
   // (Kernel::panel) a later panel's go: the gate's go task alone (the shim S2MM task of no repeat: its BD, channel
   // control, queue write and the token sync on its column), with its own header.
   static std::vector<std::uint8_t> GoPart(const std::vector<std::uint8_t>& gate) {
@@ -2046,12 +2059,21 @@ class LoomNpu {
       append(calls[0]->gate);
       if (prof_) append_ops(prof_->Setup(calls[0]->k->path), prof_->SetupOps());
       const int panel = calls[0]->k->panel;   // (a later panel's first call after its go)
+      const bool pdone = panel > 0 && calls[0]->k->pdone;
+      if (pdone && calls[0]->k->streamed) throw LoomError("npu: per-panel done (GN_QPDONE) needs a plain image");
       if (!calls[0]->k->streamed) {
+        // the relay's signal records, in order: go(0), then per later panel q go(q), done(q - 1), then the last done
+        // (gen_npu_gemm qpdone); the drains below follow it: n panels, n gos, n dones (pdone) or 1
+        std::size_t gos = 1, dones = 0;
         for (std::size_t i = 0; i < calls.size(); ++i) {
-          if (panel > 0 && i > 0 && i % panel == 0) append(GoPart(calls[i]->gate));
+          if (panel > 0 && i > 0 && i % panel == 0) {
+            append(GoPart(calls[i]->gate)), ++gos;
+            if (pdone) append(DonePart(calls[i - 1]->done)), ++dones;   // (panel i / panel - 1's C: synced in its call)
+          }
           append(calls[i]->call);
         }
-        append(calls.back()->done);
+        append(calls.back()->done), ++dones;
+        if (pdone && dones != gos) throw LoomError("npu: per-panel done: drains do not match the relay's records");
         remember(calls);
         if (prof_) append_ops(prof_->Read(), 1), RecMap('D', calls[0]->k);
         continue;

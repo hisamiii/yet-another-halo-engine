@@ -255,7 +255,8 @@ class LoomPrefill {
     }
     if (const auto it = geom_.find("npugate"); it != geom_.end())
       p.gate_calls = it->second.rowgrp, p.gate_record = it->second.tt;
-    if (const auto it = geom_.find("npupanel"); it != geom_.end()) p.panel = it->second.tokens;
+    if (const auto it = geom_.find("npupanel"); it != geom_.end())
+      p.panel = it->second.tokens, p.pdone = it->second.rowgrp == 1;
     return p;
   }
   // YAH_NPU_WAITLOG: after the run, one line per GPU wait for an NPU job (layer, the job's tag, polls of its done word,

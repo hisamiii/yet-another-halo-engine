@@ -1035,6 +1035,8 @@ if AHORD:
 # YAH_NPU_PANEL=1 (with RSWAP_EMIT): the swap image opens a job panel by panel (gen_npu_gemm GN_QPANEL: its calls a
 # 512-token panel, F / 32 / RSWAP_NB), dispatch.txt "npupanel <k>"; the GPU may then open each panel on its own
 PANEL = os.environ.get("YAH_NPU_PANEL") == "1"
+# YAH_NPU_PDONE=1 (with YAH_NPU_PANEL): each panel's done too (gen_npu_gemm GN_QPDONE), dispatch.txt "npupanel <k> 1"
+PDONE = PANEL and os.environ.get("YAH_NPU_PDONE") == "1"
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
 # Swap-form sites (the default with the Q' P1K set; YAH_NPU_SWSITE=0: the in-core baseline): every dequant site in swap form, qkv, gate, q (attn_q) and out (attn_output /
 # ssm_out: its NPU K 5120, the GPU keeps the last 1024 as today). Per layer its NPU rows on a plain
@@ -2014,6 +2016,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                         QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QHPAN"] = "1"
                     if PANEL:
                         QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QPANEL"] = str(FS // 32 // RSWAP_NB)
+                        QJOB_ENV["npu_ffnswap_iq4xs"]["GN_QPDONE"] = "1" if PDONE else "0"
                     for F_ in (f for f in RSWAP_FS if f != FS):   # (share-up layers' F')
                         nb_, nm_ = rswap_nb(F_), "npu_ffnswap_iq4xs_%d" % F_
                         hp_ = ffnblk_apass(F_) or ffnblk_units(F_)[0][2]
@@ -2022,6 +2025,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                         QJOB_ENV[nm_] = dict(RSWAP_ENV)
                         if PANEL:
                             QJOB_ENV[nm_]["GN_QPANEL"] = str(F_ // 32 // nb_)
+                            QJOB_ENV[nm_]["GN_QPDONE"] = "1" if PDONE else "0"
                 continue
             jobs.append((npu_cfg(B, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, swiglu=True, dgu=mt * 16 * kb * blk,
                                  swcol=32, hpass=FS // 1024, hord=hord, fmt=gu_fmt(fmt), dfr=int(dfr)),
@@ -2333,7 +2337,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(("npu_swpanel.hal", B // 8 * 640, GE.WG, GE.layout_bytes("wgt", B, RSWAP_KS, RSWAP_PASSES)))
         out.append(("npurswap", FS, 0, 0))
         if PANEL:
-            out.append(("npupanel", FS // 32 // RSWAP_NB, 0, 0))
+            out.append(("npupanel", FS // 32 // RSWAP_NB, int(PDONE), 0))
         if hapass(ffnblk_units(FS)):
             out.append(("npuhapass", 1, 0, 0))
         with GN.np_override(4):

@@ -637,6 +637,17 @@ def qpanel_lead():
     return int(os.environ.get("GN_QPANEL_LEAD", "2"))
 
 
+def qpdone():
+    """GN_QPDONE=1 (with GN_QPANEL): the relay also sends done at each panel's last firing but the job's last, so the
+    GPU can take a panel's C while the job runs on (LoomNpu FusedCommand drains it: the done's signal task alone, after
+    the next panel's go). The relay's signal records for a job of n panels: n go + n done (without: n go + 1 done), in
+    the order go(0), then per panel q < n - 1: go(q + 1) (GN_QPANEL_LEAD >= 1 firings before panel q ends, at a
+    firing's start), done(q) (at the end of panel q's last firing), and done(n - 1) last: the host's drain order."""
+    on = os.environ.get("GN_QPDONE") == "1"
+    assert not on or (qpanel() and qpanel_lead() >= 1), "GN_QPDONE: needs GN_QPANEL and GN_QPANEL_LEAD >= 1"
+    return on
+
+
 def decoder(fmt, gord="P4", g8=True):
     """gen_npu_dec for fmt (its constants follow DQ_FMT, DQ_GORD and DQ_G8 at import). g8: IQ3_S from the byte grid,
     which the gate / up images and every Q' image need (the 8 KB bf16 grid does not fit beside their rings); the other
@@ -3725,19 +3736,20 @@ def gate_record(e, words, idr):
         e(f"  mov.ms{'.last' if i == 3 else ''} {v}")
 
 
-def gate_done_late(e):
+def gate_done_late(e, p="%gd", tag=0):
     """GN_QPSHARE: the job's done at the relay's last firing, from the hand-off kept in job state (20 ready, 24 status,
-    28 polls)."""
-    e("  %gdv = lda %gsp, 20")
-    e("  %gds = lda %gsp, 24")
-    e("  %gdp = lda %gsp, 28")
-    e("  %gd0 = mova.i32 0")
-    e("  %gd1 = mova.i32 1")
-    e("  %gdbad = lt %gd1, %gds")
-    e(f"  %gdfb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
-    e("  %gdmark = mul %gdbad, %gdfb")
-    e("  %gddone = add.rr %gdv, %gdmark")
-    gate_record(e, ("%gddone", "%gds", "%gdp", "%gd0"), "%gdid")
+    28 polls). (GN_QPDONE: a panel's done too, under its own name prefix p, word 3 = tag: 1, a panel's; readers take
+    word 0 only, the tag shows which record a binding last took)"""
+    e(f"  {p}v = lda %gsp, 20")
+    e(f"  {p}s = lda %gsp, 24")
+    e(f"  {p}p = lda %gsp, 28")
+    e(f"  {p}0 = mova.i32 {tag}")
+    e(f"  {p}1 = mova.i32 1")
+    e(f"  {p}bad = lt {p}1, {p}s")
+    e(f"  {p}fb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
+    e(f"  {p}mark = mul {p}bad, {p}fb")
+    e(f"  {p}done = add.rr {p}v, {p}mark")
+    gate_record(e, (f"{p}done", f"{p}s", f"{p}p", f"{p}0"), f"{p}id")
 
 
 def qprefill_on(q):
@@ -3789,7 +3801,10 @@ def gate_first(e, cfg, gate, gn):
             e("  st %gfexp, %gsp0, 20")
             e("  st %gfsts, %gsp0, 24")
             e("  st %gfpol, %gsp0, 28")
-            panel_arm(e, "%gfnc", FPC, 8)   # (relay state: 0, 4 firings; 8, 12 panel; 20-28 done)
+            panel_arm(e, "%gfnc", FPC, 8)   # (relay state: 0, 4 firings; 8, 12 panel; 16 panel done; 20-28 done)
+            if qpdone():   # firings to panel 0's end (gate_count counts every firing, this one too)
+                e(f"  %gfpd = {imm32(P * FPC)} {P * FPC}")
+                e("  st %gfpd, %gsp0, 16")
         elif not notick():
             gate_signal(e, "%gfexp", "%gfsts", "%gfpol", "%gf1")
         if pshare():   # (done at the job's last firing: gate_count)
@@ -4160,7 +4175,24 @@ def gate_count(e, cfg, gate):
         e("  %gNn = mul %gN, %gcont")
         e("  st %gFn, %gsp, 0")
         e("  st %gNn, %gsp, 4")
-        if pshare() or qpanel():   # the job's last firing: its done
+        if qpdone():   # an in-job firing ending a panel: the panel's done (the job's last firing: the job's, below)
+            P, FPC = qpanel(), cfg.nb // QF.get("rows", 1) if qpass_on() else cfg.nb * cfg.passes
+            e("  low.cond_br %gcont, ^grp, ^grd : reg<aie2p.er>")
+            e("^grp:")
+            e("  %gpc = lda %gsp, 16")
+            e("  %gpc1 = add %gpc, -1")
+            e("  st %gpc1, %gsp, 16")
+            e("  low.cond_br %gpc1, ^grx, ^grq : reg<aie2p.er>")
+            e("^grq:")
+            e(f"  %gpr = {imm32(P * FPC)} {P * FPC}")
+            e("  st %gpr, %gsp, 16")
+            gate_done_late(e, "%gpd", 1)
+            e("  low.br ^grx")
+            e("^grd:")
+            gate_done_late(e)
+            e("  low.br ^grx")
+            e("^grx:")
+        elif pshare() or qpanel():   # the job's last firing: its done
             e("  low.cond_br %gcont, ^grx, ^grd : reg<aie2p.er>")
             e("^grd:")
             gate_done_late(e)

@@ -24,6 +24,9 @@ struct NpuPlan {
   // dispatch.txt "npupanel <k>" (gen_npu_gemm GN_QPANEL): the swap image opens a job panel by panel, k calls a panel;
   // its job's gate value ends at sequence * gate_calls + calls + 3 * 16 (the GPU may store + 16 q after panel q first)
   std::uint32_t panel = 0;
+  // dispatch.txt "npupanel <k> 1" (gen_npu_gemm GN_QPDONE): the image also sends done at each panel's end; the host
+  // drains it after the panel's C (into the panel's last call's signal binding)
+  bool pdone = false;
   // dispatch.txt "npudcol": the NPU decodes the weights itself from raw GGUF rows (gen_npu_gemm dcol 2; w_bytes is
   // then one call's unread panel binding).
   bool dcol = false;
