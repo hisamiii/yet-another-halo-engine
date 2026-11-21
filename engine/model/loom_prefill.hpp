@@ -2542,7 +2542,26 @@ class LoomPrefill {
         // token tiles, blocks x tt workgroups, is faster: IQ4_XS 1582 -> 1288 us, Q4_K / Q5_K equal; YAH_NPU_OUTP3=1:
         // the persistent part + the tiled last tile)
         static const bool outp3 = std::getenv("YAH_NPU_OUTP3") != nullptr;
-        if (outp3 && af && geom_.count(p3) && tt == g.tt && gs.tt == g.tt) {
+        // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
+        const std::string rh = "npurem_" + std::string(site) + "_" + f.name + ".hal";
+        const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / M;
+        auto rb = GemmWeights(*t, f);
+        rb[0].offset += (M - nn) * row_bytes, rb[0].length = std::size_t{nn} * row_bytes;
+        for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_}) rb.push_back(Ref(*x));
+        rb.push_back({npurem_->handle, 0, std::size_t{B_} * nn * 4});
+        // Both as one dispatch when the set has "npuseg_out_<fmt>.hal" (emit_prefill_pp outseg; gen_segcat linear: the
+        // kres workgroups first, the remainder's fill its last round); bindings the kres's, then the remainder's weights
+        // and output. The same values; 11-21 pp2048: out site GPU kernels 113.9 -> 106.9 ms. YAH_NPU_OUTSEG=0: two.
+        static const bool outseg = [] { const char* e = std::getenv("YAH_NPU_OUTSEG"); return !e || std::strcmp(e, "0"); }();
+        const std::string segh = "npuseg_out_" + std::string(f.name) + ".hal";
+        const auto sg = outseg && !outp3 ? geom_.find(segh) : geom_.end();
+        if (sg != geom_.end()) {
+          auto sb = b;
+          sb.insert(sb.end(), rb.begin(), rb.end() - 4);   // (the remainder's weights: all but input, wstage, ostage, out)
+          sb.push_back(rb.back());
+          Dispatch(Exe(segh), "yah_seg", sg->second.rowgrp, 1, 1, 512, 1, 1, sb,
+                   GemmWrites(b, f, {hidden2_}) | std::uint64_t{1} << (sb.size() - 1));
+        } else if (outp3 && af && geom_.count(p3) && tt == g.tt && gs.tt == g.tt) {
           const std::size_t T = tt - 1;
           const std::size_t tile = B_ / tt;
           // per-token bytes of input, residual and output (bindings first, first + 1, first + 4)
@@ -2560,16 +2579,11 @@ class LoomPrefill {
           // its own token tiles (emit_prefill_pp.split_tile: 256 tokens; the split runs untrimmed chunks only)
           Dispatch(Exe(sh), kname.c_str(), blocks, gs.tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
         }
-        // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
-        const std::string rh = "npurem_" + std::string(site) + "_" + f.name + ".hal";
-        const Geom& gr = geom_.at(rh);
-        const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / M;
-        auto rb = GemmWeights(*t, f);
-        rb[0].offset += (M - nn) * row_bytes, rb[0].length = std::size_t{nn} * row_bytes;
-        for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_}) rb.push_back(Ref(*x));
-        rb.push_back({npurem_->handle, 0, std::size_t{B_} * nn * 4});
-        Dispatch(Exe(rh), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), nn / 16 / gr.rowgrp, gr.tt, 1, 32, 1, 1, rb,
-                 std::uint64_t{1} << (rb.size() - 1));
+        if (sg == geom_.end()) {
+          const Geom& gr = geom_.at(rh);
+          Dispatch(Exe(rh), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), nn / 16 / gr.rowgrp, gr.tt, 1, 32, 1, 1, rb,
+                   std::uint64_t{1} << (rb.size() - 1));
+        }
         NpuJoin();
         // the sum waits for the FFN block's norm, which fuses it ("npu_onorm[_4].hal", RunNorm; YAH_NPU_NOONORM=1 at
         // emit: the unpack here)

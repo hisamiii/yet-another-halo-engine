@@ -1077,6 +1077,11 @@ def split_tile(site):
     return dict(zip(("bm", "bn", "wm", "wn"), map(int, v.split(",")))) if v != "0" else None
 
 
+# The out site's kres split and K remainder as one dispatch too (npu_split outseg; the engine uses it unless
+# YAH_NPU_OUTSEG=0). YAH_EMIT_OUTSEG=0: not emitted.
+OUTSEG = os.environ.get("YAH_EMIT_OUTSEG", "1") == "1"
+
+
 # YAH_NPU_NOONORM=1: no "npu_onorm" (the out site's sum as its own unpack, then the FFN block's norm)
 NO_ONORM = os.environ.get("YAH_NPU_NOONORM") == "1"
 
@@ -1164,6 +1169,49 @@ def npu_split(rows, combos, B, outdir):
             # a split's narrower row group may not emit (spills): the engine runs that form unsplit
             print("npu split %s: not emitted with row group %d (%s)" % (name, tf.rowgrp, str(ex)[:120]))
 
+    def outseg(fmt, mt, kb, nn, kbw):
+        """(OUTSEG) the out site's GPU kres split (the ".af.npu.hal" tile, split_tile) and its K remainder
+        (npurem, the same tile) as one dispatch, "npuseg_out_<fmt>.hal": gen_segcat linear, every kres workgroup
+        dispatches before the remainder's, which fill the kres's last round (tile/outseg/sched.py: NP 4 layers 29 -> 24
+        units, IQ4_XS 23 -> 23; 11-21 pp2048: 113.9 -> 106.9 ms). Each segment's text is the standalone one, gated as such;
+        the same values."""
+        import gen_segcat
+        import hrx_paths
+        knobs = dict(AF[(fmt, "kres", mt, kb)])
+        knobs.pop("persist", None)
+        st = split_tile("out")
+        ts = dataclasses.replace(dataclasses.replace(TG.default_tile(fmt, "kres", kb), **AF_TILE, **knobs), **st)
+        TG.check(ts)
+        mtg = mt - nn // 16
+        tk = fit_rowgrp(ts, mtg)
+        tr = fit_rowgrp(dataclasses.replace(npu_rem_tile(fmt, kbw, kb), **st), nn // 16)
+        TG.check(tk)
+        TG.check(tr)
+        assert tk.bn == tr.bn and tk.lanes == tr.lanes and B % tk.bn == 0, (fmt, tk, tr)
+        assert nn // 16 not in O16_MT, "the remainder writes f32"
+        texts = []
+        for kind, t, m, k, ostride, kwin in (("kres", tk, mtg, kb, mt * 16, None), ("kstore", tr, nn // 16, kbw, 0, (kb - kbw, kb))):
+            out16 = TG.OUT16
+            TG.OUT16, TG.OSTRIDE, TG.KWIN = False, ostride, kwin
+            try:
+                with kseg_for(fmt, m, kb):
+                    raw = TG.gen(fmt, kind, t, False)
+            finally:
+                TG.OUT16, TG.OSTRIDE, TG.KWIN = out16, 0, None
+            tt = B // t.bn
+            sym = "yah_ffn_gemm_%s%s" % (fmt, "_kres" if kind == "kres" else "")
+            E._gate("npuseg_out_%s_%s" % (fmt, kind), raw, [sym, fmt, kind, str(m), str(k), str(tt), str(B)]
+                    + (["ostride=%d" % ostride] if ostride else ["kfull=%d" % kb]), hrx_paths.env())
+            texts.append((raw, (m, k, tt)))
+        name = "npuseg_out_%s.hal" % fmt
+        text, nwg = gen_segcat.segcat("yah_seg", texts, wgs=tk.lanes, linear=True)
+        src = os.path.join(tmp, name[:-4] + ".loom")
+        open(src, "w").write(text)
+        E.emit(src, [], name, outdir)
+        print("outseg %s: kres %d x %d + rem %d x %d = %d workgroups, %d VGPRs" % (
+            name, mtg // tk.rowgrp, B // tk.bn, nn // 16 // tr.rowgrp, B // tr.bn, nwg, hal_vgprs(os.path.join(outdir, name))))
+        return (name, tk.bn, nwg, 1)
+
     def variants(fmt, kind, mt, kb, base, nn, site, osfx=""):
         """Every form of GEMM base the set emits (tile_kstore, afrag_variants): its split."""
         t = TG.default_tile(fmt, kind, kb)
@@ -1235,6 +1283,8 @@ def npu_split(rows, combos, B, outdir):
                 assert nn // 16 not in O16_MT, "the remainder writes f32"
                 out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s.hal" % (site, fmt), outdir,
                                      "kstore", tr.rowgrp, kfull=kb))
+                if OUTSEG and site == "out" and (fmt, "kres", mt, kb) in AF:
+                    out.append(outseg(fmt, mt, kb, nn, kbw))
     # per-layer rows (NPU_SPLIT_LAYERS): the GPU's split HALs per (format, site, rows); the unpacks below
     lfmt = {}
     for nm, dims, ty in rows:

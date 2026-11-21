@@ -7,6 +7,11 @@ i's body with wg_x = id - off_i (a uniform branch on the workgroup id). Each seg
 row tile and epilogue, so a small GEMM (ssm_alpha / ssm_beta, attn_k / attn_v) rides along with the large one that
 reads the same activations (attn_qkv, the q + gate kqg) instead of paying a launch with too few rows to fill the GPU.
 
+linear=True: a 1-D grid instead, sum(groups_i * token_tiles_i) workgroups; segment i owns the linear ids
+[off_i, off_i + groups_i * tt_i) as (row group = id % groups_i, token tile = id / groups_i), so every workgroup of
+segment 0 dispatches before any of segment 1 (the out site's kres split, then its K remainder: the long workgroups
+first, the short ones fill the tail; tile/outseg/sched.py). Segments may then differ in token tiles, not in tile size.
+
 segs: [(text, (m_tiles, k_blocks, token_tiles))]: each text a complete gen_gemm_tile kernel, its configs baked in as
 constants. Bindings: segment 0's in order, then each later segment's own ones (all but SHARED) with suffix _s<i>.
 Shared LDS: one alloca per buffer name at the largest size (one segment runs per workgroup)."""
@@ -44,7 +49,7 @@ def _items(hdr):
     return out
 
 
-def segcat(sym, segs, wgs=512):
+def segcat(sym, segs, wgs=512, linear=False):
     out_binds, bodies, lds, groups = [], [], {}, []
     head = None
     for i, (text, (mt, kb, tt)) in enumerate(segs):
@@ -79,10 +84,25 @@ def segcat(sym, segs, wgs=512):
         # already guarantees it; the clamp lets the bounds analysis see the standalone kernel's range)
         iw = [j for j, l in enumerate(body) if l.strip() == "%wg_x = kernel.workgroup.id<x> : index"]
         assert len(iw) == 1, ssym
-        body[iw[0]:iw[0] + 1] = [f"  %seg_lo = index.max %seg_wx, %seg_off{i} : index",
-                                 f"  %seg_rel = index.sub %seg_lo, %seg_off{i} : index",
-                                 f"  %seg_last = index.constant {groups[-1] - 1} : index",
-                                 f"  %wg_x = index.min %seg_rel, %seg_last : index"]
+        if linear:
+            assert "%wg_rx" not in "\n".join(body), "linear: a tokfast body"
+            iy = [j for j, l in enumerate(body) if l.strip() == "%wg_y = kernel.workgroup.id<y> : index"]
+            assert iy == [iw[0] + 1], ssym
+            # (both clamps: the bounds analysis sees the standalone kernel's ranges; the arithmetic already holds them)
+            body[iw[0]:iw[0] + 2] = [f"  %seg_lo = index.max %seg_wx, %seg_off{i} : index",
+                                     f"  %seg_rel = index.sub %seg_lo, %seg_off{i} : index",
+                                     f"  %seg_g = index.constant {groups[-1]} : index",
+                                     f"  %seg_rx = index.rem %seg_rel, %seg_g : index",
+                                     f"  %seg_last = index.constant {groups[-1] - 1} : index",
+                                     f"  %wg_x = index.min %seg_rx, %seg_last : index",
+                                     f"  %seg_ry = index.div %seg_rel, %seg_g : index",
+                                     f"  %seg_tlast = index.constant {tt - 1} : index",
+                                     f"  %wg_y = index.min %seg_ry, %seg_tlast : index"]
+        else:
+            body[iw[0]:iw[0] + 1] = [f"  %seg_lo = index.max %seg_wx, %seg_off{i} : index",
+                                     f"  %seg_rel = index.sub %seg_lo, %seg_off{i} : index",
+                                     f"  %seg_last = index.constant {groups[-1] - 1} : index",
+                                     f"  %wg_x = index.min %seg_rel, %seg_last : index"]
         if i:
             own = [b for b in binds if b not in SHARED]
             body = _rename(body, _defs(body) | {"%" + b for b in own}, f"_s{i}")
@@ -90,10 +110,16 @@ def segcat(sym, segs, wgs=512):
         else:
             out_binds += binds
         bodies.append(body)
-    total = sum(groups)
-    offs = [sum(groups[:i]) for i in range(len(groups))]
-    tt = segs[0][1][2]
-    assert all(s[1][2] == tt for s in segs), "one token tiling"
+    tts = [s[1][2] for s in segs]
+    if linear:
+        sizes = [g * t for g, t in zip(groups, tts)]
+        total, tt = sum(sizes), 1
+        offs = [sum(sizes[:i]) for i in range(len(sizes))]
+    else:
+        total = sum(groups)
+        offs = [sum(groups[:i]) for i in range(len(groups))]
+        tt = tts[0]
+        assert all(x == tt for x in tts), "one token tiling"
     L = list(head)
     L.append(f"kernel.def target(@yah_tile_w32) @{sym}() {{")
     L += ["  %unit = index.constant 1 : index", f"  %wgs = index.constant {wgs} : index",
