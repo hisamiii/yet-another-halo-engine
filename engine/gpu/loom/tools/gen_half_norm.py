@@ -897,18 +897,20 @@ def unpack_x(e, k, tokens, dim, parts, remres=False):
     e(f"  %x{k} = scalar.addf %ux{k}, %urs{k} : f32")
 
 
-def gen_osum(tokens, g, n, parts, split, bfp, dim=5120, wpr=4):
+def gen_osum(tokens, g, n, parts, split, bfp, dim=5120, wpr=4, swap=None):
     """The out site's NPU sum (gen_npu_unpack.gen resid rem: hidden + ((C chunks) + rem) for columns [g, g + n), `parts`
     K chunks of GU.CG groups at the current GN.TN / NP) for a workgroup's own wpr rows, then a workgroup barrier and the
     FFN block's norm of those rows (gen_split tiled, bfp) reading them back (cache-hot). The GPU's columns [0, g) are
     already in x (its kres output). Phase 1 is the unpack's vector code item for item (8 columns of one token, the same
     sums in the same order) and phase 2 is gen_split's text, so the bits are those of the unpack and then the norm.
     Bindings c, hres (the residual hidden), rem (f32 [tokens][n]), then gen_split's (x, residual, weight, sum_out, out,
-    ab): x is read and its columns [g, g + n) written."""
+    ab): x is read and its columns [g, g + n) written. swap = R (one part): C is a swap-form site image's (R rows,
+    gen_npu_unpack.swapc_base, one value an element)."""
     import gen_npu_gemm as GN
     import gen_npu_unpack as GU
     TN, NJ, CG = GN.TN, GN.TN // 8, GU.CG
     assert g + n == dim and n % TN == 0 and tokens % 64 == 0
+    assert not swap or (parts == 1 and tokens % 512 == 0 and n <= swap)
     NTH = 32 * wpr * split
     items = wpr * n // 8
     text = gen_split(dim, wpr=wpr, split=split, tiled=True, bfp=bfp)
@@ -921,7 +923,9 @@ def gen_osum(tokens, g, n, parts, split, bfp, dim=5120, wpr=4):
         e(f"  %o1c{nm} = index.constant {v} : index")
     e("  %o1c16i = scalar.constant 16 : i32")
     e("  %o1chii = scalar.constant -65536 : i32")
-    e(f"  %o1nc = index.constant {tokens * n * CG * parts // 2} : index")
+    e(f"  %o1nc = index.constant {tokens * swap // 2 if swap else tokens * n * CG * parts // 2} : index")
+    if swap:
+        e(f"  %o1cslast = index.constant {GU.swapc_last(tokens, n, swap)} : index")
     e("  %o1cv = buffer.view %c[%base] : buffer -> view<[%o1nc]xi32>")
     e("  %o1rv = buffer.view %hres[%base] : buffer -> view<[%total_elems]xf32>")
     e(f"  %o1nrem = index.constant {tokens * n} : index")
@@ -981,7 +985,11 @@ def gen_osum(tokens, g, n, parts, split, bfp, dim=5120, wpr=4):
         e(f"    %{q}tb = index.mul %{q}tok, %o1cdim : index")
         e(f"    %{q}oa = index.add %{q}tb, %{q}jo : index")
         val = None
-        for p in range(parts):
+        if swap:   # (swap form) one value per element: NPU column j2's, its base clamped for the bound proof
+            sb = GU.swapc_base(e, q + "s", f"%{q}j2", f"%{q}tok", swap)
+            e(f"    %{q}cs = index.min {sb}, %o1cslast : index")
+            val = load8(q + "sw_", f"%{q}cs")
+        for p in range(0 if swap else parts):
             gv = None
             for gi in range(CG):
                 t = f"{q}p{p}g{gi}_"
