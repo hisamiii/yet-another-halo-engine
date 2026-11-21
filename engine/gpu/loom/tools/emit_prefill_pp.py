@@ -770,6 +770,23 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # (LoomPrefill::NpuRows, RowsHal)
 NPU_SPLIT_LAYERS = {(k.split("@")[0], int(k.split("@")[1])): int(v) for k, v in
                     (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT_LAYERS", "").split(",") if x)}
+# (Q' P1K) the production split when YAH_NPU_SPLIT / YAH_NPU_SPLIT_LAYERS are unset (set, even empty: they win):
+# NPU_SPLIT_DEFAULT, and the per-layer rows of tables/npu_split_layers_<model file stem>.txt (YAH_NPU_SPLIT_LAYERS's
+# syntax) when the model has one. 11-21: raise3 (port) + gate 3840, -29.9 ms pp2048 vs qkv/gate/q/out 5120/3200/5120/3200
+NPU_SPLIT_DEFAULT = {"qkv": 5120, "gate": 3840, "q": 5120, "out": 3200}
+
+
+def split_defaults(model):
+    """main(): fill NPU_SPLIT / NPU_SPLIT_LAYERS with the production split (Q' P1K, env unset)."""
+    if not NPU_QP1K:
+        return
+    if "YAH_NPU_SPLIT" not in os.environ:
+        NPU_SPLIT.update(NPU_SPLIT_DEFAULT)
+    tab = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tables",
+                       "npu_split_layers_%s.txt" % os.path.splitext(os.path.basename(model))[0])
+    if "YAH_NPU_SPLIT_LAYERS" not in os.environ and os.path.exists(tab):
+        NPU_SPLIT_LAYERS.update({(k.split("@")[0], int(k.split("@")[1])): int(v) for k, v in
+                                 (x.split("=") for x in open(tab).read().strip().split(",") if x)})
 # The NPU image waits for each job's ready word itself (gen_npu_gemm GATE, HRX patch 0016): no host relay sits between
 # the GPU and the NPU. dispatch.txt: "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*), and npu_flag_wait.hal
 # waits for a job's done word (gen_npu_unpack.gen_flag_wait).
@@ -2094,6 +2111,7 @@ def main():
     global MODEL, NPU_FFNBLK, GSIG_ON, QSPLIT_ON
     model, outdir = sys.argv[1], sys.argv[2]
     MODEL = model
+    split_defaults(model)
     E.ASYNC = True
     B = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
     # GEMM tokens per workgroup of the hand-written sources
