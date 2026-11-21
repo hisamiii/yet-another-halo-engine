@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
 #else
     if (opt.npu) throw LoomError("--npu: this build has no NPU support");
 #endif
-    const std::uint32_t B = pf.chunk(), T_run = want ? want : B;
+    const std::uint32_t B = pf.chunk_tokens(), T_run = want ? want : B;   // (YAH_PP_HALVES: 2 B of the set)
     if (T_run == 0 || T_run > pf.context()) {
       std::fprintf(stderr, "tokens=%u must be at most the context %u\n", T_run, pf.context());
       return 2;
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
 #endif
 
     {
-      std::vector<float> out(std::size_t{B} * LoomPrefill::kHidden);
+      std::vector<float> out(std::size_t{pf.chunk()} * LoomPrefill::kHidden);   // (halves: the last half's rows)
       gpu.D2H(pf.hidden(), out.data(), out.size() * 4, 0);
       FILE* fo = OpenOut(prefix + ".hidden");
       std::fwrite(out.data(), 4, out.size(), fo);
