@@ -1966,6 +1966,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = F)
         variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), F, "ffn")
         variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), F, "ffn")
+        for f_ in FV:   # (share-up: RunFfnBlock checks a pair's kstore / swiglu splits at its layer's F' too)
+            variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), f_, "ffn", osfx="_n%d" % f_)
+            variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), f_, "ffn", osfx="_n%d" % f_)
         # (GN_FFNMIXSPLIT=0: off) the fused GPU gate / up's split for the pair, AF_FFN_MIX or one AF_FFN format
         # ("gemm_ffn_<gate>[_<up>]_<mt>_<kb>.af.to.npu.hal", ffn_fused's knobs): one GEMM instead of kstore + swiglu
         if os.environ.get("GN_FFNMIXSPLIT", "1") != "0" and B % AF_TILE["bn"] == 0:
