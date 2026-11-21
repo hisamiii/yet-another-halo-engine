@@ -151,15 +151,20 @@ class LoomPrefill {
   // Buffer sizes of the NPU column split this set carries (dispatch.txt "npusplit_<site>", "npubytes_<K>"); zero: none.
   // A job is the NPU work behind one cut: the DeltaNet qkv + gate, or one other site; the buffers fit the largest
   // (W: one call's unread panel binding, the NPU decodes raw rows).
-  // (YAH_PP_HALVES) A and C hold two halves' regions, each one B plan's, 4096-aligned; the swap is not in this form yet
+  // (YAH_PP_HALVES) A, W and C hold two halves' regions, each one B plan's, 4096-aligned; the swap's weight stream at
+  // A's end stays one (both halves run a layer's same weights: the first half to reach the layer decodes it)
   [[nodiscard]] NpuPlan npu_plan() const {
     NpuPlan p = NpuPlanOne();
     if (halves_) {
-      if (RSwapOn()) throw LoomError("YAH_PP_HALVES: the swap image's halves are not built yet (emit YAH_NPU_RSWAP_EMIT=0)");
-      p.a_bytes = 2 * Up4k(p.a_bytes), p.c_bytes = 2 * Up4k(p.c_bytes);
+      if (R5Fuse()) throw LoomError("YAH_PP_HALVES: the r5 carriers' halves are not built yet (emit YAH_NPU_R5CAR=0)");
+      if (PanelQ()) throw LoomError("YAH_PP_HALVES: YAH_NPU_PANELQ is not built for halves");
+      p.a_bytes = 2 * HalfA(p) + SwapAll(), p.w_bytes = 2 * Up4k(p.w_bytes), p.c_bytes = 2 * Up4k(p.c_bytes);
     }
     return p;
   }
+  std::size_t SwapAll() const { return RSwapOn() ? (R5Fuse() ? 2 : 1) * SwapStream() : 0; }
+  // one half's A region: the one-B plan's A before the swap's stream (NpuPlanOne rounds it to 4096 when the swap is on)
+  std::size_t HalfA(const NpuPlan& one) const { return Up4k(one.a_bytes - SwapAll()); }
   static std::size_t Up4k(std::size_t b) { return (b + 4095) / 4096 * 4096; }
   [[nodiscard]] NpuPlan NpuPlanOne() const {
     NpuPlan p;
@@ -280,9 +285,9 @@ class LoomPrefill {
     if (ffnblk_ && geom_.count("npu_unpack_ffnblk.hal")) ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);   // (npuffnrem)
     if (halves_) {   // (YAH_PP_HALVES) half 1's remainders; each half's NPU regions
       const NpuPlan one = NpuPlanOne();
-      a_one_ = Up4k(one.a_bytes), c_one_ = Up4k(one.c_bytes);
+      a_one_ = HalfA(one), w_one_ = Up4k(one.w_bytes), c_one_ = Up4k(one.c_bytes);
       for (std::uint32_t h = 0; h < 2; ++h) {
-        hs_[h].npu_a0_ = h * a_one_, hs_[h].npu_c0_ = h * c_one_;
+        hs_[h].npu_a0_ = h * a_one_, hs_[h].npu_w0_ = h * w_one_, hs_[h].npu_c0_ = h * c_one_;
         if (h == 1) {
           if (npurem_) hs_[1].npurem_ = &Alloc(rem);
           if (ffnrem_) hs_[1].ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);
@@ -291,7 +296,7 @@ class LoomPrefill {
         }
       }
       half_ = 0;
-      npu_a0_ = 0, npu_c0_ = 0;
+      npu_a0_ = 0, npu_w0_ = 0, npu_c0_ = 0;
     }
     if (std::getenv("YAH_NPU_WAITLOG")) {
       if (!geom_.count("npu_flag_wait_log.hal"))
@@ -434,6 +439,7 @@ class LoomPrefill {
     if (npu_attn_ && ci >= na_from_) ++na_seq_;  // the layers' ready / done values (words are reused per chunk)
     flagged_.clear();
     npu_job_ = 0, npu_cleared_ = 0, npu_joined_ = 0;
+    swap_layer_.clear(), swap_reader_ = -1;   // (halves: a chunk's job indices start again; its graph runs after the last)
     job_side_.clear();
     NewGraph();
     // Layer 0 goes first in a graph of its own, so the GPU runs it while the host records the other layers. The split
@@ -1764,9 +1770,20 @@ class LoomPrefill {
       if (uc > qu || (nbk > 1 && qu % uc)) throw LoomError("prefill: a swap call's H spans more than a down part");
       if (R5Fuse() && SwapStream(F) != std::size_t{F} * 5120 * 9 / 4)
         throw LoomError("prefill: the swap stream is not gen_r5fuse's (2 F K / 8 records of 9 B)");
+      // (YAH_PP_HALVES) the stream is one: the half that reaches a swap layer second finds its weights decoded (the GPU
+      // queue runs the first half's decode before this half's job's ready store); a new layer's decode waits for every
+      // swap job that reads the stream (without handing over: the other half must not reach the stream between)
+      bool decoded = false;
+      if (halves_ && !npu_planning_) {
+        decoded = swap_layer_ == pre;
+        if (!decoded) {
+          if (swap_reader_ >= 0 && static_cast<std::size_t>(swap_reader_) >= npu_joined_) NpuJoin(swap_reader_, false);
+          swap_layer_ = pre;
+        }
+      }
       for (const auto& [t, x, gu] : {std::tuple<const core::TensorInfo*, const Fmt*, const char*>{tg, &f, "g"},
                                      {tu, &fu, "u"}}) {
-        if (carried) break;
+        if (carried || decoded) break;
         const std::string h = "npu_swdec_" + std::string(x->name) + "_" + gu + SwapTag(F) + ".hal";
         const Geom& gd = geom_.at(h);
         const std::size_t trb = static_cast<std::size_t>(t->bytes) / M;
@@ -1783,7 +1800,7 @@ class LoomPrefill {
       const Geom& gp = geom_.at("npu_swpanel.hal");
       if (!panel)
         Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1,
-                 gp.rowgrp, 1, 1, {Ref(*normt_), {npu_->W().handle, 0, gp.tt}}, 2);
+                 gp.rowgrp, 1, 1, {Ref(*normt_), WRef(0, gp.tt)}, 2);
       // (diag) YAH_NPU_RSWAP_BOUTER=1: calls b-outer, t-inner (a weight block's token panels back to back: its reads
       // after the first can hit the MALL; the panel changes every call); the default t-outer keeps a panel 8 / bpc calls
       static const bool bouter = std::getenv("YAH_NPU_RSWAP_BOUTER") != nullptr;
@@ -1795,9 +1812,9 @@ class LoomPrefill {
           // (FfnBlkFront: H's real units from the first part's pads on)
           const std::uint32_t j = uc * b, hf = FfnBlkFront(F) ? parts[0].p - parts[0].r : 0;
           csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs" + SwapTag(F) + ".xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a},
-                                       {t * bw.w, bw.w},
-                                       {j / qu * qpart + std::size_t{j % qu + hf} * 18432 + std::size_t{8} * t * qu * 18432,
-                                        std::size_t{nbk == 1 ? 8 * qu - hf : 7 * qu + uc} * 18432}));
+                                       HW({t * bw.w, bw.w}),
+                                       HC({j / qu * qpart + std::size_t{j % qu + hf} * 18432 + std::size_t{8} * t * qu * 18432,
+                                           std::size_t{nbk == 1 ? 8 * qu - hf : 7 * qu + uc} * 18432})));
         }
     }
     for (std::uint32_t j = 0; j < F / fc && !cpair && !rswap; ++j)   // (np5: a call's rows span 4 x 256 + 64)
@@ -1850,9 +1867,10 @@ class LoomPrefill {
       Dispatch(Exe(zpad), "yah_npu_zpad", geom_.at(zpad).tokens, 1, 1, geom_.at(zpad).rowgrp, 1, 1,
                {CView({0, FfnBlkHOf(B_, F)})});
     }
-    if (rswap)
+    if (rswap) {
       NpuEnqueue(std::move(csw), "ffnswap", {{Ref(npu_->A()), Ref(npu_->W())}, Ref(npu_->C())});
-    else
+      swap_reader_ = last_job_;   // (halves: the stream's latest reader)
+    } else
       NpuEnqueue(std::move(csw), "ffnsw");
     // the down's K parts as one job when they run one image (no GPU work between them: a job boundary, ~120 us, saved;
     // YAH_NPU_DNJOBS=1: a job per part)
@@ -2071,7 +2089,7 @@ class LoomPrefill {
     if (panel && (!g1 || g1s || mode != NormOut::kTiled)) throw LoomError("prefill: a panel norm off the FFN block");
     // (the NPU input binding, built only where a norm writes one: npu_ is null on GPU-only norms)
     const auto ab = [&] {
-      return panel ? hrx_buffer_ref_t{npu_->W().handle, 0, geom_.at("npu_swpanel.hal").tt}
+      return panel ? WRef(0, geom_.at("npu_swpanel.hal").tt)
                    : ARef(0, NpuK(5120).a);
     };
     const std::string pn = panel ? "_pn" : "";
@@ -2410,6 +2428,18 @@ class LoomPrefill {
     return r;
   }
   hrx_buffer_ref_t CView(NpuView v) const { return CRef(v.offset, v.length); }
+  // (halves) this half's W region: the swap's token panel
+  hrx_buffer_ref_t WRef(std::size_t off, std::size_t len) const {
+    HalfBound(npu_w0_ + off, len, npu_w0_, w_one_, npu_->W(), "W");
+    hrx_buffer_ref_t r;
+    r.buffer = npu_->W().handle, r.offset = npu_w0_ + off, r.length = len;
+    return r;
+  }
+  NpuView HW(NpuView v) const {
+    v.offset += npu_w0_;
+    HalfBound(v.offset, v.length, npu_w0_, w_one_, npu_->W(), "call W");
+    return v;
+  }
   hrx_buffer_ref_t ARef(std::size_t off, std::size_t len) const {
     HalfBound(npu_a0_ + off, len, npu_a0_, a_one_, npu_->A(), "A");
     hrx_buffer_ref_t r;
@@ -2457,7 +2487,7 @@ class LoomPrefill {
     return job;
   }
   // Queue the GPU work that runs beside job (default: the last enqueued one) before this.
-  void NpuJoin(std::int64_t job = -1) {
+  void NpuJoin(std::int64_t job = -1, bool handover = true) {
     if (npu_planning_) return;
     // YAH_PP_YIELD=<tag,..> (diag, HALVES 2): hand over only at joins of jobs whose tag starts with one of these
     static const std::vector<std::string> yield_tags = [] {
@@ -2477,7 +2507,7 @@ class LoomPrefill {
       if (jj >= 0)
         for (const std::string& t : yield_tags) yield = yield || flagged_.at(static_cast<std::size_t>(jj)).tag.rfind(t, 0) == 0;
     }
-    if (yield) YieldHalf();
+    if (yield && handover) YieldHalf();
     if (job < 0 && halves_) job = last_job_;
     // (halves) a job before one already joined is done (the NPU runs its queue in order) and its words are cleared:
     // no wait (it would poll a zero done word until the timeout)
@@ -3393,15 +3423,17 @@ class LoomPrefill {
   std::uint32_t halves_ = 0, half_ = 0;
   bool in_half_embed_ = false;
   std::int64_t last_job_ = -1;              // this half's last enqueued job (NpuJoin's default)
-  std::size_t npu_a0_ = 0, npu_c0_ = 0;     // this half's A / C region starts
-  std::size_t a_one_ = 0, c_one_ = 0;       // one half's A / C region bytes
+  std::size_t npu_a0_ = 0, npu_w0_ = 0, npu_c0_ = 0;   // this half's A / W / C region starts
+  std::size_t a_one_ = 0, w_one_ = 0, c_one_ = 0;      // one half's A / W / C region bytes
+  std::string swap_layer_;                  // (shared) the layer whose swap weights the stream holds
+  std::int64_t swap_reader_ = -1;           // (shared) the last swap job (it reads the stream)
 #define YAH_PF_HALF(X)                                                                                                \
   X(hidden_) X(hidden2_) X(partial_) X(scratch_) X(qkv_) X(gate_) X(alpha_) X(beta_) X(ab_) X(q_) X(q16_) X(qr16_)     \
   X(kbuf_) X(vbuf_) X(kqbuf_) X(lse_) X(normt_) X(raw_) X(raw2_) X(conv_out_) X(ffnup_) X(gateffn_) X(ostage_)         \
   X(npurem_) X(ffnrem_) X(ids_) X(embed_rows_) X(valid_) X(kv16_) X(n_) X(keep_rows_) X(tail_) X(trim_row_) X(layer_) \
   X(norm_bfp_) X(norm_pk_) X(ffn_pending_) X(out_pending_) X(out_nn_) X(out_np4_) X(ffn_pending4_) X(ffn_rr_)         \
   X(pending_norm_) X(pending_mode_) X(gc_read_) X(qc_hal_) X(qc_c_) X(dn_c_end_) X(after_release_) X(panel_job_)       \
-  X(last_job_) X(npu_a0_) X(npu_c0_)
+  X(last_job_) X(npu_a0_) X(npu_w0_) X(npu_c0_)
   struct HalfState {
 #define YAH_PF_FIELD(m) decltype(LoomPrefill::m) m{};
     YAH_PF_HALF(YAH_PF_FIELD)
