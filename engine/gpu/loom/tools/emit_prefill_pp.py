@@ -1018,7 +1018,8 @@ if AHORD:
 # 512-token panel, F / 32 / RSWAP_NB), dispatch.txt "npupanel <k>"; the GPU may then open each panel on its own
 PANEL = os.environ.get("YAH_NPU_PANEL") == "1"
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
-# YAH_NPU_SWSITE=1 (tile's swap coverage, step 1): qkv and gate in swap form. Per layer its NPU rows on a plain
+# YAH_NPU_SWSITE=1 (tile's swap coverage): every dequant site in swap form, qkv, gate, q (attn_q) and out (attn_output /
+# ssm_out: its NPU K 5120, the GPU keeps the last 1024 as today). Per layer its NPU rows on a plain
 # bfp16-A image "npu_swsite_<R>" (the swap image without SwiGLU: the weights its stream in the act layout
 # [64-row block][pass][..], the swap's token panel npu_swpanel resident, K 5120 in 20 passes, one call a 512-token
 # panel; npu chk/swd.py, 11-21: bit-exact). R = nb x 64, nb the real rows' blocks up to a multiple of 4 (the image's
@@ -1385,12 +1386,13 @@ def npu_split(rows, combos, B, outdir):
                 variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn, site, osfx=sfx_)
         lrows.add((fmt, site, nn))
         out.append(("npusplit_%s@%d" % (site, L), nn, 0, 0))
-    if SWSITE:   # (YAH_NPU_SWSITE) each layer's qkv / gate NPU rows in swap form (the sites the NPU computes today)
+    if SWSITE:   # (YAH_NPU_SWSITE) each layer's NPU rows of its split sites in swap form
         for nm in sorted(lfmt):
-            m = re.match(r"blk\.(\d+)\.attn_(qkv|gate)\.weight$", nm)
-            if not m or m[2] not in NPU_SPLIT or not (lfmt[nm] in QSITE_FMTS or np4(lfmt[nm])):
+            m = re.match(r"blk\.(\d+)\.(attn_qkv|attn_gate|attn_q|attn_output|ssm_out)\.weight$", nm)
+            site = m and {"attn_output": "out", "ssm_out": "out"}.get(m[2], m[2][5:])
+            if not m or site not in NPU_SPLIT or not (lfmt[nm] in QSITE_FMTS or np4(lfmt[nm])):
                 continue
-            L, site = int(m[1]), m[2]
+            L = int(m[1])
             nn = NPU_SPLIT_LAYERS.get((site, L)) or (npu_rows4(site) if np4(lfmt[nm]) else NPU_SPLIT[site])
             nb = -(-nn // 256) * 4
             SWSITE_NB.add(nb)
