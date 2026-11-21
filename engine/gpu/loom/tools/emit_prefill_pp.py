@@ -1001,7 +1001,7 @@ RSWAP_FS = sorted({int(v) for v in os.environ.get("YAH_NPU_RSWAP_FS", "").split(
 # H as the down's token panels (gen_npu_q GN_QHPAN: [64-token block][128-feature group][slab][4 x 576 B]); the down
 # image "npu_swdown" (the swap site image at R 5120, 16 passes a K part, GN_QWCS: a block of H apart) reads them as
 # its W, the GPU-decoded weights as its A ("npu_swddec_<fmt>.hal": gen_iq4xs_bfp / gen_kq_bfp kdown, a K part of the
-# 17408-wide rows in H's K order); C per (K part, panel) in swapc form, read by "npu_unpack_ffnblk_sw[_rr].hal" and
+# 17408-wide rows in H's K order); C per (K part, panel) in swapc form, read by "npu_unpack_ffnblk_sw_rr.hal" and
 # "npu_unormsw_rr_<r|t|rt>[_pk].hal"; dispatch.txt "npuswdown", "npubytes_swdown". 11-21: checker 8.04 M a job vs
 # the in-core down's ~8.3 (both bit-exact on the checker's operands).
 SWDOWN = RSWAP_EMIT and os.environ.get("YAH_NPU_SWDOWN", "1") != "0"
@@ -2094,12 +2094,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         try:
             with GN.np_override(4):
                 cols_ = 5120 // GN.TN
-                for rr in (False, True):
-                    nm_ = "npu_unpack_ffnblk_sw" + ("_rr" if rr else "")
-                    src = os.path.join(tmp, nm_ + ".loom")
-                    open(src, "w").write(GU.gen(B, cols_, 5120, 0, resid=True, parts=2, rem=True, remres=rr, swap=5120))
-                    E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
-                    out.append((nm_ + ".hal", B * cols_ * (GN.TN // 8) // GU.wg(cols_), GU.wg(cols_), 0))
+                nm_ = "npu_unpack_ffnblk_sw_rr"   # (the "_rr" order only: rem holds hidden + the GPU's down)
+                src = os.path.join(tmp, nm_ + ".loom")
+                open(src, "w").write(GU.gen(B, cols_, 5120, 0, resid=True, parts=2, rem=True, remres=True, swap=5120))
+                E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+                out.append((nm_ + ".hal", B * cols_ * (GN.TN // 8) // GU.wg(cols_), GU.wg(cols_), 0))
                 if {"qkv", "q"} & set(NPU_SPLIT):
                     for pk in () if SWSITE else (False, True):   # (swap-form sites: "_ns" only)
                         for f16 in ("r", "t", "rt"):

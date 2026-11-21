@@ -2186,10 +2186,11 @@ class LoomPrefill {
     // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
     // GPU waits for the NPU's down here anyway), so the sum after the NPU's down reads one f32 tensor less
     // ("npu_unpack_ffnblk[_4]_rr.hal": (hidden + GPU down) + NPU partials, a summation order of its own; YAH_NPU_REMEXACT=1:
-    // hidden + (NPU partials + GPU down), bit-exact with the sets before it)
+    // hidden + (NPU partials + GPU down), bit-exact with the sets before it; not with a swap-form down)
     static const bool remexact = std::getenv("YAH_NPU_REMEXACT") != nullptr;
     const std::string rem_rr = rem.substr(0, rem.size() - 4) + "_rr.hal";
     ffn_rr_ = !remexact && geom_.count(rem_rr) && geom_.count(dn4 ? "npu_unpack_ffnblk_4_rr.hal" : "npu_unpack_ffnblk_rr.hal");
+    if (swdown && !ffn_rr_) throw LoomError("prefill: " + pre + "a swap-form down sums in the \"_rr\" order only (no YAH_NPU_REMEXACT)");
     const Geom& gr = geom_.at(ffn_rr_ ? rem_rr : rem);
     auto r = GemmWeights(*td, fd);
     for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{ffnup_, wstage_, ostage_}) r.push_back(Ref(*x));
@@ -2219,7 +2220,7 @@ class LoomPrefill {
                 std::exchange(ffn_pending_, {}),
                 {remv, Ref(*hidden2_)}, 4);
     else
-      NpuUnpack(ffn_pendingsw_ ? "npu_unpack_ffnblk_sw.hal" : ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal",
+      NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal",
                 std::exchange(ffn_pending_, {}),
                 {Ref(*hidden_), remv, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
@@ -3780,7 +3781,7 @@ class LoomPrefill {
   bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
   bool ffn_pendingsw_ = false;
   bool out_panel_ = false;         // the DeltaNet postnorm part a wrote the out site's token panel (_a_pn_gc)
-  bool site_panel_ = false;        // the attention norm wrote the q / qkv sites' token panel (norm_t_pn.hal)     // ... from the swap-form down (npu_unpack_ffnblk_sw.hal, npu_unormsw_rr_*)
+  bool site_panel_ = false;        // the attention norm wrote the q / qkv sites' token panel (norm_t_pn.hal)     // ... from the swap-form down (npu_unpack_ffnblk_sw_rr.hal, npu_unormsw_rr_*)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
   NormOut pending_mode_{};
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
