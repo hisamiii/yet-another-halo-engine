@@ -902,6 +902,7 @@ NPU_FFNBLKS = int(os.environ.get("YAH_NPU_FFNBLKS", "0")) or NPU_FFNBLK
 FFNSW5 = os.environ.get("YAH_NPU_FFNSW5", "1") == "1"
 RSEG_GEMMS = set()   # (fmt, m_tiles, k_blocks) of the FFNSW5 layers' gate / up (row-segmented, gen_gemv RSEG)
 FFNBLKS_DOWNS = set()   # (fmt, m_tiles, k_blocks) of the single-format layers' downs when their F differs (npu_ffnblk)
+FL_DOWNS = {}   # (share-up) {(fmt, m_tiles, k_blocks): {F'}}: the "ffn@L=F'" layers' downs, their GEMMs in F''s K segments
 KSEG_F = [0]   # (kseg_f) the F whose K segments kseg_for gives the K-segmented downs, 0: NPU_FFNBLK's (DNSEG)
 # YAH_NPU_DNSEG (Q', default 1): ffn_down's rows in K segments, reordered in place at load ([segment][row][its blocks]:
 # the GPU's K part, then each NPU K part, gen_gemv.kseg_layout; LoomWeights, dispatch.txt "npudnseg_<fmt> <F>"). The
@@ -1901,6 +1902,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             ("ffn@%d=%d: an NPU FFN block layer, F' above its F in 256-feature units" % (L, f_))
         out.append(("npusplit_ffn@%d" % L, f_, 0, 0))
         out.append(("npudnsegl_%d" % L, f_, 0, 0))   # (its down in F''s K segments, LoomWeights / DownKSegs)
+        FL_DOWNS.setdefault(tuple(l["ffn_down"]), set()).add(f_)   # (its GPU-only form's down GEMMs, main)
     lfg = lambda l: FL.get(lid[id(l)], lf(l))   # (a layer's F' on the GPU side: its down's K window)
     if FS != F:   # (the single-format layers' downs in FS's K segments: their GEMMs, main; their layers, npudnsegl)
         FFNBLKS_DOWNS.update(l["ffn_down"] for l in ok)
@@ -2147,7 +2149,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(("npuffnsw5", 320, 0, 0))
         out.extend(("npursegl_" + n, FS, 0, 0) for n, l in sorted(by.items()) if l in ok)
         RSEG_GEMMS.update(l["ffn_gate"] for l in ok)
-    for tag in sorted({dn_tag(r, p, ffnblk_apass(f_)) for f_ in {F, FS} for _, r, p in ffnblk_units(f_)}):
+    for tag in sorted({dn_tag(r, p, ffnblk_apass(f_)) for f_ in {F, FS} | set(FV) for _, r, p in ffnblk_units(f_)}):
         dns = [j for j in jobs if j[1].startswith("npu_ffndn%s_" % tag)]
         dn = next((j for j in dns if j[2] == NPU_NP), dns[0])
         with GN.np_override(dn[2]):
@@ -2362,10 +2364,14 @@ def main():
                 geom.extend(npu_split(rows, combos, B, outdir))
         finally:
             GE.GROUPS, GU.CG = groups, cg
-    for kind, fmt, port, mt, kb in sorted(c for c in combos if c[1:2] + c[3:] in FFNBLKS_DOWNS):
-        sfx = gen_gemv.kseg_suffix(dn_kseg(kb, NPU_FFNBLKS))
+    # (the downs in another F's K segments than the format's: the FFNBLKS layers' and the share-up layers' F'; every
+    # layer's GPU-only form, e.g. a chunk without the NPU, runs them)
+    kdowns = sorted({(c, NPU_FFNBLKS) for c in combos if c[1:2] + c[3:] in FFNBLKS_DOWNS} |
+                    {(c, f_) for c in combos for f_ in FL_DOWNS.get(c[1:2] + c[3:], ()) if f_ != NPU_FFNBLK})
+    for (kind, fmt, port, mt, kb), fk in kdowns:
+        sfx = gen_gemv.kseg_suffix(dn_kseg(kb, fk))
         name = lambda k: "gemm_%s_%s_%d_%d%s.hal" % (k, fmt, mt, kb, sfx)
-        with kseg_f(NPU_FFNBLKS):
+        with kseg_f(fk):
             for k in gemm_kinds(kind, mt):
                 r = gemm(fmt, mt, kb, B, name(k), outdir, kind=k)
                 assert r, name(k)
