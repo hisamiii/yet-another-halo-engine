@@ -2106,6 +2106,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     for f16 in ("r", "t", "rt"):
                         unorm["npu_unorm_rr_%s%s.hal" % (f16, "_pk" if pk else "")] = gen_half_norm.gen_unorm(
                             B, list(NPU_KS), NPU_PASSES, len(parts), pk, remres=True, f16=f16)
+                for f16 in ("r", "t", "rt") if SWSITE else ():   # (swap-form sites: no stream, "_ns")
+                    unorm["npu_unorm_rr_%s_ns.hal" % f16] = gen_half_norm.gen_unorm(
+                        B, list(NPU_KS), NPU_PASSES, len(parts), False, remres=True, f16=f16, stream=False)
     finally:
         GU.CG = cg
     src = os.path.join(tmp, name + ".loom")
@@ -2142,6 +2145,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                         for f16 in ("r", "t", "rt"):
                             unorm["npu_unorm4_rr_%s%s.hal" % (f16, "_pk" if pk else "")] = gen_half_norm.gen_unorm(
                                 B, list(NPU_KS), NPU_PASSES, len(parts), pk, remres=True, f16=f16)
+                    for f16 in ("r", "t", "rt") if SWSITE else ():   # (swap-form sites: no stream, "_ns")
+                        unorm["npu_unorm4_rr_%s_ns.hal" % f16] = gen_half_norm.gen_unorm(
+                            B, list(NPU_KS), NPU_PASSES, len(parts), False, remres=True, f16=f16, stream=False)
                 nj4, wg4 = GN.TN // 8, GU.wg(calls4 * NPU_COLS)
         finally:
             GU.CG = cg

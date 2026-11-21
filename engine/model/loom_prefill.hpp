@@ -878,7 +878,7 @@ class LoomPrefill {
                    q_af && k_af && v_af   ? NormOut::kTiled
                    : q_af || k_af || v_af ? NormOut::kBoth
                                           : NormOut::kRow,
-                   q_npu ? "q" : nullptr, q_npu && NpuPk(pre + "attn_q.weight"));
+                   q_npu ? "q" : nullptr, q_npu && NpuPk(pre + "attn_q.weight"), q_npu && SwSiteOf(pre + "attn_q.weight"));
       RunAttention(l, ci, pre, hook, q_af, k_af, v_af);
     } else {
       // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
@@ -892,7 +892,8 @@ class LoomPrefill {
       // ab_t: alpha / beta read the fragment-major copy too (gemm_kst2 .at.hal), so no row-major copy is written
       const bool ab_t = qkv_npu && qkv_af && gate_af && !AlphaBetaHal(pre, true).empty();
       RunLayerNorm(pre + "attn_norm.weight", ab_t ? NormOut::kTiled : qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow,
-                   qkv_npu ? "qkv" : nullptr, qkv_npu && (NpuPk(pre + "attn_qkv.weight") || NpuPk(pre + "attn_gate.weight")));
+                   qkv_npu ? "qkv" : nullptr, qkv_npu && (NpuPk(pre + "attn_qkv.weight") || NpuPk(pre + "attn_gate.weight")),
+                   qkv_npu && SwSiteOf(pre + "attn_qkv.weight") && SwSiteOf(pre + "attn_gate.weight"));
       RunDeltaNet(l, pre, qkv_af, gate_af, ab_t);
     }
     if (!pending_norm_.empty()) throw LoomError("prefill: " + pre + " fused norm without its f16 output");
@@ -2203,14 +2204,34 @@ class LoomPrefill {
   // not wait for them.
   // The fused sum + norm after the "_rr" sum with the f16 output(s) for mode (YAH_NPU_NOUNORMF=1: none, the sum and
   // the norm as two passes).
-  std::string UnormRr(bool pk, NormOut mode) const {
+  // (ns: the no-stream form, "_ns.hal")
+  std::string UnormRr(bool pk, NormOut mode, bool ns = false) const {
     static const bool off = std::getenv("YAH_NPU_NOUNORMF") != nullptr;
     if (off) return "-";
     return std::string(ffn_pending4_ ? "npu_unorm4_rr_" : "npu_unorm_rr_") +
-           (mode == NormOut::kRow ? "r" : mode == NormOut::kTiled ? "t" : "rt") + (pk ? "_pk.hal" : ".hal");
+           (mode == NormOut::kRow ? "r" : mode == NormOut::kTiled ? "t" : "rt") + (ns ? "_ns.hal" : pk ? "_pk.hal" : ".hal");
   }
-  void RunLayerNorm(const std::string& wname, NormOut mode, const char* npu_site, bool pk) {
+  // swap: the layer's NPU sites are in swap form (their stream the GPU's decoders write): no BFP16 stream, npu_site unused
+  void RunLayerNorm(const std::string& wname, NormOut mode, const char* npu_site, bool pk, bool swap = false) {
     FlushOut();
+    if (swap) {
+      if (ffn_pending_.length && ffn_rr_ && geom_.count(UnormRr(false, mode, true))) {
+        std::vector<hrx_buffer_ref_t> b{CView(std::exchange(ffn_pending_, {})),
+                                        {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, TRef(*Find(wname)),
+                                        Ref(*hidden2_)};
+        if (mode != NormOut::kTiled) b.push_back(Ref(*scratch_));
+        if (mode != NormOut::kRow) b.push_back(Ref(*normt_));
+        const LoomExecutable& exe = Exe(UnormRr(false, mode, true));
+        Dispatch(exe, "yah_half_norm", B_ / 4, 1, 1, exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm")), 1, 1, b,
+                 ~std::uint64_t{0} << 3);
+        std::swap(hidden_, hidden2_);
+        norm_bfp_.clear(), norm_pk_.clear();
+        return;
+      }
+      FlushFfn();
+      RunNorm(wname, mode);
+      return;
+    }
     if (ffn_pending_.length && ffn_rr_ && npu_site && geom_.count("npunormbfp") && geom_.count(UnormRr(pk, mode))) {
       const std::size_t a = NpuK(5120).a;
       std::vector<hrx_buffer_ref_t> b{CView(std::exchange(ffn_pending_, {})),
@@ -2462,7 +2483,18 @@ class LoomPrefill {
     return SiteBfp(wname) ? bfp_.at("npu_bfp_" + wname + ".bin") : gguf_.tensor_data_base();
   }
   // The NPU can take wname's rows (a decoder-column set needs its format's decoder).
-  bool NpuOk(const std::string& wname) const { return !npu_ || !DcolImage(wname).empty(); }
+  bool NpuOk(const std::string& wname) const { return !npu_ || SwSiteOf(wname) || !DcolImage(wname).empty(); }
+  // A site tensor ("blk.<L>.attn_q / attn_qkv / attn_gate / attn_output / ssm_out.weight") in swap form in its layer
+  bool SwSiteOf(const std::string& wname) const {
+    if (wname.rfind("blk.", 0) != 0) return false;
+    const std::size_t d = wname.find('.', 4);
+    static const std::pair<const char*, const char*> kSites[] = {{"attn_q.weight", "q"}, {"attn_qkv.weight", "qkv"},
+        {"attn_gate.weight", "gate"}, {"attn_output.weight", "out"}, {"ssm_out.weight", "out"}};
+    for (const auto& [t, site] : kSites)
+      if (wname.compare(d + 1, std::string::npos, t) == 0)
+        return geom_.count(std::string("npuswsite_") + site + "@" + wname.substr(4, d - 4)) != 0;
+    return false;
+  }
   // wname's decoder pushes Q4_K's k-block order (the activations' "pk" stream, NpuEncode pk).
   bool NpuPk(const std::string& wname) const {
     Fmt f{};
