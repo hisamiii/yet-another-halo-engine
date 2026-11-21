@@ -511,7 +511,7 @@ def bfp_copy_out(e, nkb, wpr, nth, tokens, ks, passes, abv, pre):
             e("  }")
 
 
-def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=False, remres=False, f16=None):
+def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=False, remres=False, f16=None, swap=None):
     """yah_unorm in one pass: the NPU FFN block's sum (hidden + the GPU's f32 down + the NPU's `parts` bf16 partials,
     gen_npu_unpack.gen's order) fused with the next layer's RMS norm into the NPU's BFP16 activation stream
     (gen_bfp16_encode "act" (tokens, ks, passes), as gen_split bfp writes it; with pk also in Q4_K's k-block order).
@@ -527,7 +527,9 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     stream (RunNorm's kRow / kTiled / kBoth), so no second norm pass follows.
     The f16 outputs go out as lane pairs (default; YAH_UNORM_NOPAIR=1: one 2-byte store a lane and k): for k, k + 1 the
     even lane stores its k and its odd neighbour's (one xor-1 shuffle a pair), the odd lane its neighbour's k + 1 and its
-    own, as one 4-byte word; the same halves at the same places."""
+    own, as one 4-byte word; the same halves at the same places.
+    swap = R (= dim, the down in swap form): C is the swap-form image's (gen_npu_unpack.swapc_base), part p's tokens R
+    elements on."""
     import gen_bfp16_encode as GE
     import gen_npu_gemm as GN
     import gen_npu_unpack as GU
@@ -574,6 +576,7 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     else:
         e("  %c_na, %x_na, %rem_na, %weight_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %weight, %out : "
           "buffer, buffer, buffer, buffer, buffer")
+    assert not swap or (swap == dim and tokens % 512 == 0)
     e(f"  %nc = index.constant {tokens * dim * parts // 2} : index")   # bf16 pairs
     e("  %cv = buffer.view %c_na[%base] : buffer -> view<[%nc]xi32>")
     if not remres:
@@ -640,11 +643,11 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
             e(f"  %wl_v{c} = vector.load %weight_view[%wl_i{c}] : view<[%dim]xf32> -> vector<4xf32>")
             e(f"  vector.store %wl_v{c}, %wl_view[%wl_i{c}] : vector<4xf32>, view<{dim}xf32>")
     # the sums, stored as they form
-    unpack_lane(e, m, tokens)
+    unpack_lane(e, m, tokens, swap)
     for k in range(m):
         e(f"  %o{k} = index.constant {32 * k} : index")
         e(f"  %a{k} = index.add %lane_base, %o{k} : index")
-        unpack_x(e, k, tokens, dim, parts, remres)
+        unpack_x(e, k, tokens, dim, parts, remres, swap)
         e(f"  view.store %x{k}, %hout_view[%a{k}] : f32, view<[%total_elems]xf32>")
     for k in range(m):
         e(f"  %q{k} = scalar.mulf %x{k}, %x{k} : f32")
@@ -813,7 +816,7 @@ def gen_unorm(tokens, ks, passes, parts, pk, dim=5120, wpr=4, split=4, wlds=Fals
     return "\n".join(L) + "\n"
 
 
-def unpack_lane(e, m, tokens):
+def unpack_lane(e, m, tokens, swap=None):
     """yah_unorm's per-lane C word base. Lane l of part p reads output columns o = 32 m p + l + 32 k (k < m); at TN = 64
     (gen_npu_unpack c_lane / c_tok) o's element is c_tok(row) + (o / 64) * 64 tokens + 512 (k % 2) + 256 (l / 16) +
     64 ((l / 8) % 2) + l % 8, a constant per k past the lane's base. Its parity is the lane's: the bf16 is the low half of
@@ -823,6 +826,18 @@ def unpack_lane(e, m, tokens):
     import gen_npu_unpack as GU
     for nm, v in (("c8u", 8), ("c16u", 16), ("c64u", 64), ("c256u", 256), ("cpcol", m // 2 * 64 * tokens)):
         e(f"  %{nm} = index.constant {v} : index")
+    if swap:   # (swap form) column lane_w's element: swapc_base(its 8-column block, row) + lane_w % 8; column lane_w
+        # + 32 k's is 2048 k on (its rb / 2 + 2 k)
+        e("  %usf0 = index.div %lane_w, %c8u : index")
+        e("  %usf = index.mul %usf0, %c8u : index")
+        e("  %usr = index.rem %lane_w, %c8u : index")
+        sb = GU.swapc_base(e, "usw_", "%usf", "%row", swap)
+        e(f"  %ula = index.add {sb}, %usr : index")
+        e("  %uw = index.div %ula, %c2 : index")
+        e("  %upar = index.rem %lane, %c2 : index")
+        e("  %uodd = index.cmp eq, %upar, %c1i : index")
+        e("  %ush = scf.select %uodd, %c0i32, %c16i : i32")
+        return
     tb = GU.c_tok(e, "ut_", "%row")
     if GN.TN != 64:
         e(f"  %utn = index.constant {GN.TN} : index")
@@ -850,11 +865,12 @@ def unpack_lane(e, m, tokens):
     e("  %ush = scf.select %uodd, %c0i32, %c16i : i32")
 
 
-def unpack_x(e, k, tokens, dim, parts, remres=False):
+def unpack_x(e, k, tokens, dim, parts, remres=False, swap=None):
     """x{k} of yah_unorm's first pass: resid + ((C part 0 + part 1 + ..) + rem), gen_npu_unpack.gen's order (remres:
     (C part 0 + part 1 + ..) + rem, as gen_npu_unpack remres)."""
     import gen_npu_gemm as GN
-    if GN.TN != 64:   # column o = lane_w + 32 k: col * tokens * TN + (np * 4 + nh) * 64 + jj + the token part
+    import gen_npu_unpack as GU
+    if GN.TN != 64 and not swap:   # column o = lane_w + 32 k: col * tokens * TN + (np * 4 + nh) * 64 + jj + the token part
         e(f"  %xo{k} = index.add %lane_w, %o{k} : index")
         e(f"  %xc{k} = index.div %xo{k}, %utn : index")
         e(f"  %xq{k} = index.rem %xo{k}, %utn : index")
@@ -872,7 +888,12 @@ def unpack_x(e, k, tokens, dim, parts, remres=False):
         e(f"  %uwk{k} = index.div %xa6{k}, %c2 : index")
     val = None
     for p in range(parts):
-        if GN.TN != 64:
+        if swap:   # (the word clamped to the part's last for the bound proof: a no-op for real rows)
+            e(f"  %uo{k}_{p} = index.constant {1024 * k + p * tokens * dim // 2} : index")
+            e(f"  %uj{k}_{p} = index.add %uw, %uo{k}_{p} : index")
+            e(f"  %ul{k}_{p} = index.constant {(GU.swapc_last(tokens, dim, swap) + 7) // 2 + p * tokens * dim // 2} : index")
+            e(f"  %ui{k}_{p} = index.min %uj{k}_{p}, %ul{k}_{p} : index")
+        elif GN.TN != 64:
             e(f"  %uo{k}_{p} = index.constant {p * tokens * dim // 2} : index")
             e(f"  %ui{k}_{p} = index.add %uwk{k}, %uo{k}_{p} : index")
         else:
