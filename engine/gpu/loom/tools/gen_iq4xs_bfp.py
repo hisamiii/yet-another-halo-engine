@@ -23,13 +23,15 @@ KVALUES = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 
 
 def out_bytes(rows, K, stream=None):
     if stream:
-        return BE.layout_bytes("act", 2 * rows, stream["ks"], stream["passes"], stream["tile"])
+        return BE.layout_bytes("act", rows if stream.get("plain") else 2 * rows, stream["ks"], stream["passes"],
+                               stream["tile"])
     return rows // 8 * (K // 8) * 72
 
 
 def gen(rows, K, stream=None):
     """stream (row 5 swap): dict(ks, passes, tile, up): write the swap's weight stream instead (gen_bfp16_encode act,
-    2 rows rows: 32-row block b of this tensor at stream rows 64 b (gate, up 0) or 64 b + 32 (up 1), k ascending)."""
+    2 rows rows: 32-row block b of this tensor at stream rows 64 b (gate, up 0) or 64 b + 32 (up 1), k ascending).
+    stream["plain"] (a swap-form site, one tensor): act rows rows, row r at stream row r (no up, no host order)."""
     assert rows % 8 == 0 and K % 256 == 0
     rb = K // 256 * 136
     n = items(rows, K)
@@ -234,15 +236,17 @@ def prologue(e, rows, K, rb, koff=0, stream=None, blk=136):
     if stream:   # stream row group 8 (g8 / 4) + 4 up + g8 % 4 (a 32-row block's 4 groups), its act offset
         assert sum(stream["ks"]) * stream["passes"] == kb and rows % 32 == 0
         for nm, v in (("s_c2", 2), ("s_c144", 144), ("s_c72", 72), ("s_csub", stream["tile"] // 16),
-                      ("s_cpk", sum(stream["ks"])), ("s_cpass", stream["passes"]), ("s_cup", 4 * stream["up"])):
+                      ("s_cpk", sum(stream["ks"])), ("s_cpass", stream["passes"]),
+                      ("s_cup", 0 if stream.get("plain") else 4 * stream["up"])):
             e(f"    %{nm} = index.constant {v} : index")
         e("    %s_gb = index.div %g8, %c4 : index")
         e("    %s_gr = index.rem %g8, %c4 : index")
         e("    %s_gb8 = index.mul %s_gb, %c8 : index")
         e("    %s_gu = index.add %s_gb8, %s_cup : index")
         e("    %s_g8 = index.add %s_gu, %s_gr : index")
-        g8v = "%s_g8"
+        g8v = "%g8" if stream.get("plain") else "%s_g8"   # (plain: one tensor, its row groups in order)
         ho = stream.get("horder")
+        assert not (ho is not None and stream.get("plain")), stream
         if ho is not None:   # (host block order, gen_r5fuse.block_pos) 64-row block gb at stream block
             # pos = r rows / 128 + gb / 4 for gb = 4 f + horder[r]: the act layout is linear in the block, so the
             # offset is emit_offset's at row group 8 pos + 4 up + g8 % 4 (each block's records unchanged)
@@ -265,7 +269,8 @@ def prologue(e, rows, K, rb, koff=0, stream=None, blk=136):
             e("    %h_pu = index.add %h_p8, %s_cup : index")
             e("    %h_g8 = index.add %h_pu, %s_gr : index")
             g8v = "%h_g8"
-        fr = BE.emit_offset(e, "act", 2 * rows, list(stream["ks"]), stream["passes"], stream["tile"], True,
+        fr = BE.emit_offset(e, "act", rows if stream.get("plain") else 2 * rows, list(stream["ks"]), stream["passes"],
+                            stream["tile"], True,
                             g8v, "%kbi", p="s_", perm=False)
         e(f"    %frag = index.add {fr}, %c0i : index")
     else:
