@@ -363,6 +363,37 @@ class LoomPrefill {
   void Embed(const std::uint32_t* ids, std::uint32_t n) {
     if (halves_ && !in_half_embed_) {   // (YAH_PP_HALVES) full chunks of 2 B only: each half its own bank's rows
       if (n != 2 * B_) throw LoomError("YAH_PP_HALVES: a chunk of 2 B tokens only");
+      static const bool ov = !(std::getenv("YAH_EMBED_OVERLAP") && !std::strcmp(std::getenv("YAH_EMBED_OVERLAP"), "0"));
+      if (embed_rows_ && ov) {   // both halves' rows in one gather on the thread (host_rows_ holds 2 B), FinishEmbed
+        for (std::uint32_t t = 0; t < 2 * B_; ++t)
+          if (ids[t] >= kVocab) throw LoomError("token id " + std::to_string(ids[t]) + " is outside the vocabulary");
+        FinishEmbed();
+        gather_ids_.assign(ids, ids + 2 * B_);
+        half_rows_ = true;
+        gather_.t = std::thread([this] {
+          try {
+            const auto e0 = std::chrono::steady_clock::now();
+            LoomDevice::WaitFor(rows_copied_);
+            const auto e1 = std::chrono::steady_clock::now();
+            gguf_.Rows(*Find("token_embd.weight"), gather_ids_.data(), 2 * B_, host_rows_.data());
+            gather_ms_[0] = std::chrono::duration<double, std::milli>(e1 - e0).count();
+            gather_ms_[1] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e1).count();
+          } catch (...) {
+            gather_error_ = std::current_exception();
+          }
+        });
+        for (std::uint32_t t = 0; t < B_; ++t) host_ids_[t] = t;
+        const std::int32_t valid = static_cast<std::int32_t>(B_);
+        for (std::uint32_t h = 0; h < 2; ++h) {
+          LoadHalf(h);
+          gpu_.Update(*ids_, host_ids_.data(), host_ids_.size() * 4);
+          gpu_.Update(*valid_, &valid, 4);
+          n_ = B_;
+          SaveHalf(h);
+        }
+        LoadHalf(0);
+        return;
+      }
       in_half_embed_ = true;
       for (std::uint32_t h = 0; h < 2; ++h) {
         LoadHalf(h);
@@ -407,7 +438,7 @@ class LoomPrefill {
       const auto e1 = std::chrono::steady_clock::now();
       gguf_.Rows(*Find("token_embd.weight"), host_ids_.data(), B_, rows.data());
       const auto e2 = std::chrono::steady_clock::now();
-      rows_copied_ = gpu_.StreamH2D(*embed_rows_, rows.data(), rows.size());
+      rows_copied_ = gpu_.StreamH2D(*embed_rows_, rows.data(), embed_rows_->size);   // (halves: one half of rows)
       if (std::getenv("YAH_HOST_TIMES"))
         std::fprintf(stderr, "host: embed wait %.2f ms, gather %.2f ms (%zu B), stream %.2f ms\n",
                      std::chrono::duration<double, std::milli>(e1 - e0).count(),
@@ -445,7 +476,8 @@ class LoomPrefill {
     // Layer 0 goes first in a graph of its own, so the GPU runs it while the host records the other layers. The split
     // falls before its deferred down GEMM (the first dispatch while recording layer 1), which waits for all of the
     // layer's last kernel anyway. The NPU split's flagged jobs keep one graph.
-    split_layer_ = !npu_on_ && cfg_.main_block_count() > 1 ? 1 : 0;
+    split_layer_ = (!npu_on_ || NpuEarly()) && cfg_.main_block_count() > 1 ? 1 : 0;
+    npu_enq_ = 0;
     // YAH_HOST_TIMES=1 (diag): the host's recording and launch times per chunk
     static const bool host_times = std::getenv("YAH_HOST_TIMES") != nullptr;
     const auto h0 = std::chrono::steady_clock::now();
@@ -643,7 +675,8 @@ class LoomPrefill {
       for (const auto& q : jobs) prof_tags_.push_back(q.tag), prof_layers_.push_back(q.layer);
     // in recording order: each attention job after the GEMM jobs recorded before it (the two NPU contexts run in the
     // order their commands were built, LoomNpu::SetPeer)
-    std::size_t from = 0;
+    std::size_t from = npu_enq_;   // (NpuEarly: the jobs before it went at the split)
+    npu_enq_ = 0;
     auto gemm_to = [&](std::size_t to) {
       if (to <= from) return;
       try {
@@ -2401,9 +2434,26 @@ class LoomPrefill {
   // records. Stream order runs the new graph after the whole old one: no dependencies cross.
   void SplitGraph() {
     split_armed_ = false;
+    split_layer_ = 0;   // (once a chunk: with halves both reach the layer)
     FinishEmbed();
     chunk_graph_->Launch();
+    if (npu_on_ && npu_enq_ < flagged_.size()) {   // (NpuEarly) the jobs so far, before any later one (NPU order)
+      try {
+        npu_->Enqueue({flagged_.begin() + static_cast<std::ptrdiff_t>(npu_enq_), flagged_.end()});
+      } catch (...) {
+        gpu_.Synchronize();
+        throw;
+      }
+      npu_enq_ = flagged_.size();
+    }
     NewGraph();
+  }
+  // YAH_NPU_EARLY=1: with the NPU split on, the chunk's graph splits after layer 0 too (SplitGraph): the GPU starts
+  // while the host records the other layers, and the jobs recorded so far go to the NPU at the split (the rest at
+  // LaunchChunk, in order). Not with NPU attention (its jobs interleave by recording order), YAH_NPU_FAKE / _CPU.
+  bool NpuEarly() const {
+    static const bool on = [] { const char* e = std::getenv("YAH_NPU_EARLY"); return e && std::strcmp(e, "1") == 0; }();
+    return on && !npu_attn_ && !std::getenv("YAH_NPU_FAKE") && !std::getenv("YAH_NPU_CPU");
   }
 
 
@@ -3301,6 +3351,7 @@ class LoomPrefill {
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
   std::unique_ptr<LoomGraph> chunk_graph_;
+  std::size_t npu_enq_ = 0;        // (NpuEarly) this chunk's jobs already enqueued (SplitGraph)
   std::uint32_t split_layer_ = 0;  // RunLayers: SplitGraph before this layer's first dispatch (0: none)
   bool split_armed_ = false;       // recording split_layer_: its first dispatch splits
   bool warming_ = false;           // WarmExecutables' pass: Dispatch records nothing
@@ -3386,6 +3437,7 @@ class LoomPrefill {
     ~Joined() { Join(); }
   } gather_;
   std::vector<std::uint32_t> gather_ids_;
+  bool half_rows_ = false;   // (YAH_PP_HALVES) the gather holds both halves' rows (FinishEmbed streams two)
   std::exception_ptr gather_error_;
   double gather_ms_[2] = {};
   // The overlapped gather's end: join it, stream the rows (in stream order before the graph that reads them)
@@ -3394,7 +3446,14 @@ class LoomPrefill {
     gather_.Join();
     if (gather_error_) std::rethrow_exception(std::exchange(gather_error_, nullptr));
     const auto e2 = std::chrono::steady_clock::now();
-    rows_copied_ = gpu_.StreamH2D(*embed_rows_, host_rows_.data(), host_rows_.size());
+    if (half_rows_) {   // (YAH_PP_HALVES) the rows of half h to its bank (one stream: the later point covers both)
+      const std::size_t hb = host_rows_.size() / 2;
+      gpu_.StreamH2D(*hs_[0].embed_rows_, host_rows_.data(), hb);
+      rows_copied_ = gpu_.StreamH2D(*hs_[1].embed_rows_, host_rows_.data() + hb, hb);
+      half_rows_ = false;
+    } else {
+      rows_copied_ = gpu_.StreamH2D(*embed_rows_, host_rows_.data(), host_rows_.size());
+    }
     if (std::getenv("YAH_HOST_TIMES"))
       std::fprintf(stderr, "host: embed wait %.2f ms, gather %.2f ms (%zu B, overlapped), stream %.2f ms\n",
                    gather_ms_[0], gather_ms_[1], host_rows_.size(),
@@ -3485,7 +3544,7 @@ class LoomPrefill {
     hidden2_ = &Alloc(B * kHidden * 4);
     valid_ = &Alloc(4);
     ids_ = &Alloc(B * 4);
-    if (embed_rows_) embed_rows_ = &Alloc(host_rows_.size());
+    if (embed_rows_) embed_rows_ = &Alloc(host_rows_.size()), host_rows_.resize(2 * host_rows_.size());
     SaveHalf(1);
     LoadHalf(0);
   }
