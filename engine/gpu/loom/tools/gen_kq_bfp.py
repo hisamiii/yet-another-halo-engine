@@ -21,7 +21,7 @@ import sys
 import gen_iq4xs_bfp as I
 
 WG = I.WG
-BLK = {"Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "Q3_K": 110, "IQ3_XXS": 98, "IQ2_XS": 74, "IQ2_S": 82}
+BLK = {"Q2_K": 84, "Q4_K": 144, "Q5_K": 176, "IQ3_S": 110, "Q3_K": 110, "IQ3_XXS": 98, "IQ2_XS": 74, "IQ2_S": 82}
 # grid formats: the grid (tables/grid_<fmt>.bin) is a second input buffer of this many i32 words
 GRIDW = {"IQ3_S": 512, "IQ3_XXS": 256, "IQ2_XS": 1024, "IQ2_S": 2048}
 LDS = os.environ.get("KQ_LDS", "1") == "1"   # (gen_iq4xs_bfp.restage; KQ_LDS=0: 9 strided 8 B stores a lane)
@@ -570,6 +570,96 @@ def body_g2(fmt, rows, K, stream=None):
     return L
 
 
+def body_q2k(rows, K, stream=None):
+    """Q2_K: [scales 16 (sc | m << 4) | qs 64 | d | dmin] a super-block of 256 (gen_npu_dec.weights' order).
+    k-block kbl = 16 h + 4 j + 2 l + b (values 8 kbl ..): qs bytes 16 + 32 h + 8 (2 l + b), crumb j (bits 2 j);
+    scale byte kbl / 2; w = Mn0 + Mn1 + T0 (-base) + T1 (-base) + T0 X + T1 X, X = base + q (base 128 / 32: j even / odd),
+    T = d sc, Mn = -dmin m (two bf16 parts each, exact: 15 bits)"""
+    rb = K // 256 * 84
+    L = []
+    e = L.append
+    I.prologue(e, rows, K, rb, 0, stream, blk=84)
+    e("    %sb = index.div %kbi, %c32 : index")
+    e("    %kbl = index.rem %kbi, %c32 : index")
+    e("    %hl = index.div %kbl, %c16 : index")
+    e("    %r4 = index.rem %kbl, %c4 : index")
+    e("    %j4 = index.div %kbl, %c4 : index")
+    e("    %jj = index.rem %j4, %c4 : index")
+    e("    %jo = index.rem %jj, %c2 : index")
+    e("    %sco = index.div %kbl, %c2 : index")
+    e("    %sbo = index.mul %sb, %c136 : index")      # (c136: the block size, prologue's blk)
+    e("    %hlo = index.mul %hl, %c32 : index")
+    e("    %r4o = index.mul %r4, %c8 : index")
+    e("    %qs0 = index.add %hlo, %r4o : index")
+    e("    %qso = index.add %qs0, %c16 : index")
+    e("    %c80 = index.constant 80 : index")
+    e("    %row0 = index.mul %g8, %c8 : index")
+    e("    %rb0 = index.mul %row0, %crb : index")
+    e("    %blkb = index.add %rb0, %sbo : index")
+    e("    %jj_i = index.cast %jj : index to i32")
+    e("    %jo_i = index.cast %jo : index to i32")
+    for nm, v in (("i1", 1), ("i4", 4), ("i15", 15), ("i16", 16), ("i23", 23), ("i96", 96), ("i128", 128),
+                  ("i260", 260), ("i7fff", 0x7FFF), ("ihi", -65536)):
+        e(f"    %{nm} = scalar.constant {v} : i32")
+    e("    %qsh = scalar.shli %jj_i, %i1 : i32")       # 2 j
+    e("    %bo = scalar.muli %jo_i, %i96 : i32")
+    e("    %bsi = scalar.subi %i128, %bo : i32")       # base: 128 (j even) or 32
+    e("    %bsf = scalar.sitofp %bsi : i32 to f32")
+    e("    %nbase = scalar.negf %bsf : f32")
+    e("    %f127 = scalar.constant 127.0 : f32")
+    e("    %magic = scalar.constant 12582912.0 : f32")
+    src = []
+    for r in range(8):
+        n = f"{r}"
+        e(f"    %ro{n} = index.constant {r * rb} : index")
+        e(f"    %blk{n} = index.add %blkb, %ro{n} : index")
+        e(f"    %da{n} = index.add %blk{n}, %c80 : index")
+        e(f"    %dv{n} = vector.load %wv[%da{n}] : view<[%nin]xi8> -> vector<4xi8>")
+        e(f"    %dw{n} = vector.bitcast %dv{n} : vector<4xi8> to vector<1xi32>")
+        e(f"    %hw{n} = vector.extract %dw{n}[0] : vector<1xi32> -> i32")
+        e(f"    %d16_{n} = scalar.trunci %hw{n} : i32 to i16")
+        e(f"    %dh{n} = scalar.bitcast %d16_{n} : i16 to f16")
+        e(f"    %d{n} = scalar.extf %dh{n} : f16 to f32")
+        e(f"    %dmw{n} = scalar.shrui %hw{n}, %i16 : i32")
+        e(f"    %dm16_{n} = scalar.trunci %dmw{n} : i32 to i16")
+        e(f"    %dmh{n} = scalar.bitcast %dm16_{n} : i16 to f16")
+        e(f"    %dm{n} = scalar.extf %dmh{n} : f16 to f32")
+        e(f"    %sa{n} = index.add %blk{n}, %sco : index")
+        e(f"    %sbb{n} = view.load %wv[%sa{n}] : view<[%nin]xi8> -> i8")
+        e(f"    %sbi{n} = scalar.extui %sbb{n} : i8 to i32")
+        e(f"    %sc{n} = scalar.andi %sbi{n}, %i15 : i32")
+        e(f"    %mn{n} = scalar.shrui %sbi{n}, %i4 : i32")
+        e(f"    %scf{n} = scalar.sitofp %sc{n} : i32 to f32")
+        e(f"    %mnf{n} = scalar.sitofp %mn{n} : i32 to f32")
+        e(f"    %T{n} = scalar.mulf %d{n}, %scf{n} : f32")         # d sc, exact
+        e(f"    %Mp{n} = scalar.mulf %dm{n}, %mnf{n} : f32")
+        e(f"    %M{n} = scalar.negf %Mp{n} : f32")                 # -dmin m, exact
+        parts2(e, f"Tp{n}_", f"%T{n}")
+        parts2(e, f"Mq{n}_", f"%M{n}")
+        e(f"    %qa{n} = index.add %blk{n}, %qso : index")
+        e(f"    %qb{n} = vector.load %wv[%qa{n}] : view<[%nin]xi8> -> vector<8xi8>")
+        e(f"    %qw{n} = vector.bitcast %qb{n} : vector<8xi8> to vector<2xi32>")
+        for h in range(2):
+            e(f"    %qx{n}_{h} = vector.extract %qw{n}[{h}] : vector<2xi32> -> i32")
+            e(f"    %qy{n}_{h} = scalar.shrui %qx{n}_{h}, %qsh : i32")
+        e(f"    %wz0_{n} = scalar.addf %Mq{n}_0, %Mq{n}_1 : f32")
+        e(f"    %wz1_{n} = scalar.fmaf %Tp{n}_0, %nbase, %wz0_{n} : f32")
+        e(f"    %wzb{n} = scalar.fmaf %Tp{n}_1, %nbase, %wz1_{n} : f32")
+        ws = []
+        for j in range(8):
+            m = f"{n}_{j}"
+            e(f"    %q{m} = scalar.bitfield.extractu %qy{n}_{j // 4} {{offset = {8 * (j % 4)}, width = 2}} : i32 -> i32")
+            e(f"    %xi{m} = scalar.addi %q{m}, %bsi : i32")
+            e(f"    %X{m} = scalar.sitofp %xi{m} : i32 to f32")
+            e(f"    %wt{m} = scalar.fmaf %Tp{n}_0, %X{m}, %wzb{n} : f32")
+            e(f"    %wv{m} = scalar.fmaf %Tp{n}_1, %X{m}, %wt{m} : f32")
+            ws.append(f"%wv{m}")
+        bfp_tail(e, src, n, ws)
+    store(e, src)
+    e("  }")
+    return L
+
+
 def body(fmt, rows, K, stream=None):
     if fmt in ("IQ3_XXS", "IQ2_XS", "IQ2_S"):
         return body_g2(fmt, rows, K, stream)
@@ -577,6 +667,8 @@ def body(fmt, rows, K, stream=None):
         return body_q3k(rows, K, stream)
     if fmt == "IQ3_S":
         return body_iq3s(rows, K, stream)
+    if fmt == "Q2_K":
+        return body_q2k(rows, K, stream)
     rb = K // 256 * BLK[fmt]
     L = []
     e = L.append
