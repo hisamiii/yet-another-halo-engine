@@ -14,7 +14,13 @@ Measured (Scratch/gpudec/fuse/fuse4.py, slab map + FMF + UG, 11-20 09:3x): bit-e
 than the GEMM alone. Two rules held for every build there: a lane value used inside the K loop beyond the record
 offset makes the compiler allocate 180 VGPRs (+0.3 ms); cross-lane store assembly loses.
 Two bindings follow the GEMM's: the raw weights (gate then up, each N rows of K / 256 x 136 B; the NPU rows the last
-F of each) and the stream (2 F K / 8 records of 9 B)."""
+F of each) and the stream (2 F K / 8 records of 9 B).
+F per call (fuse / lane_records f=, geom): the swap's rows a tensor, 8192 or 8704 (F / 32 stream M blocks, one swap
+call a token panel): F / 16 workgroups decode (G owns q = 2 G, 2 G + 1 of 2 F / 16, tensor q / (F / 16)).
+Host block order (rows=, HORDER): the swap image's row r (of 4) takes M blocks 4 f + rows[r]; the stream holds them
+at r F / 128 + f (block_pos), so each row's A is one contiguous run (no block count in the shim DMA's 64-step
+iteration field: F 8704 is 68 blocks a row). Each block's 80 records are unchanged."""
+import contextlib
 import os
 import re
 
@@ -28,6 +34,45 @@ KS, PASSES, TILE = 32, 20, 64
 SB = 144 * KS                 # 4608 B a slab
 PHASES = 40                   # the GEMM's K phases (K / 128)
 LANES, WGS = 512, 512         # decode lanes a workgroup, workgroups that decode
+HORDER = None                 # (host block order) the swap image's rows' first blocks, e.g. (0, 2, 1, 3); None: in order
+FS_OK = (8192, 8704)          # (F whole 64-row M blocks of 32 gate + 32 up rows, F / 16 even)
+
+
+@contextlib.contextmanager
+def geom(f=None, rows=None):
+    """F (None: 8192) and the host block order (None: blocks in order) for the generators below."""
+    global F, NACT, WGS, HORDER
+    old = F, NACT, WGS, HORDER
+    f = f or 8192
+    assert f in FS_OK and f // 16 % 2 == 0, f
+    assert rows is None or sorted(rows) == [0, 1, 2, 3], rows
+    F, NACT, WGS, HORDER = f, 2 * f * KB // 40, f // 16, tuple(rows) if rows is not None else None
+    try:
+        yield
+    finally:
+        F, NACT, WGS, HORDER = old
+
+
+def block_pos(blk):
+    """(host block order) the stream position of M block blk (int or numpy): row r's run, r F / 128 + f, where
+    blk = 4 f + HORDER[r]; blk itself without an order."""
+    if HORDER is None:
+        return blk
+    import numpy as np
+    inv = [HORDER.index(b) for b in range(4)]   # (the row of a block 4 f + b)
+    r = np.take(np.array(inv), blk % 4) if hasattr(blk, "shape") else inv[blk % 4]
+    return r * (F // 128) + blk // 4
+
+
+def stream_offsets(f=None, rows=None):
+    """bfp16_check.offsets("act", 2 F, [32], 20, 64, True) in the host block order: the byte offset of every 8-row
+    group's k-blocks [2 F / 8][640] (for checkers and the standalone decoders)."""
+    import numpy as np
+    import bfp16_check as BC
+    with geom(f, rows):
+        off = BC.offsets("act", 2 * F, [KS], PASSES, TILE, True)
+        blk = (np.arange(2 * F // 8) // 8)[:, None]
+        return off + (block_pos(blk) - blk) * PASSES * 4 * SB
 KEEP = {"kp", "tid", "stg_lin", "c0", "base"}
 # The VGPR budget to allocate in (emit_prefill YAH_VGPR_TRY): on the fragment-major (tout) split at the default 192
 # the allocator squeezes the fused kernel to 180 VGPRs and spreads the GEMM's weight ds_stores over 134
@@ -53,8 +98,10 @@ def _frame_prologue(e, n, nin, nout):
     """The constants, views and lane map every payload shares (the slab map and the record's bfp math)."""
     for nm, v in (("nin", nin), ("nout", nout), ("ldmax", nin - 8), ("stmax", nout - 9), ("lanes", LANES),
                   ("cact", NACT), ("c1", 1), ("c2", 2), ("c4", 4), ("c8", 8), ("c9", 9), ("c16", 16), ("c20", 20),
-                  ("csb", SB), ("c32", 32), ("c512", 512), ("c288", 288), ("c511u", WGS - 1)):
+                  ("csb", SB), ("c32", 32), ("c%d" % (F // 16), F // 16), ("c288", 288), ("c511u", WGS - 1)):
         e(f"  %{nm} = index.constant {v} : index")
+    if HORDER is not None:
+        e(f"  %cnbr = index.constant {F // 128} : index")
     e("  %wv = buffer.view %dz_w_na[%base] : buffer -> view<[%nin]xi8>")
     e("  %ov = buffer.view %dz_out_na[%base] : buffer -> view<[%nout]xi8>")
     e("  %L0 = index.mul %stg_lin, %lanes : index")
@@ -87,8 +134,8 @@ def _frame_loads(e, kpv, t, ind):
     x(f"%{t}pq = index.div {kpv}, %c2 : index")
     x(f"%{t}pp = index.rem {kpv}, %c2 : index")
     x(f"%{t}q = index.add %G2, %{t}pp : index")
-    x(f"%{t}tt = index.div %{t}q, %c512 : index")
-    x(f"%{t}g16 = index.rem %{t}q, %c512 : index")
+    x(f"%{t}tt = index.div %{t}q, %c{F // 16} : index")
+    x(f"%{t}g16 = index.rem %{t}q, %c{F // 16} : index")
 
 
 class IQ4XS:
@@ -304,15 +351,31 @@ def _record(x, got, t, FMF):
         x(f"%{t}o{w} = vector.extract %{t}pmw{w}[0] : vector<2xi32> -> i32")
         words.append(f"%{t}o{w}")
     # the record: slab ((blk 20 + P) 4 + slab) SB + 288 w + 9 L, blk = g16 / 2, slab = 2 t + g16 % 2 of q = 2 G + p % 2
-    for ln in ("%sp = index.rem %kp, %c2 : index", "%sq = index.add %G2, %sp : index",
-               "%stt = index.div %sq, %c512 : index", "%sg = index.rem %sq, %c512 : index",
+    # (host block order: blk's position block_pos, r F / 128 + f for blk = 4 f + HORDER[r]; workgroup uniform)
+    fq = "%%c%d" % (F // 16)
+    ho = []
+    if HORDER is not None:
+        inv = [HORDER.index(b) for b in range(4)]
+        if inv == [0, 1, 2, 3]:
+            rown = ["%sbm = index.rem %sblk, %c4 : index"]
+        else:
+            assert inv == [0, 2, 1, 3], HORDER   # (r = 2 (b % 2) + b / 2)
+            rown = ["%sb4 = index.rem %sblk, %c4 : index", "%sb1 = index.rem %sb4, %c2 : index",
+                    "%sb2 = index.mul %sb1, %c2 : index", "%sb3 = index.div %sb4, %c2 : index",
+                    "%sbm = index.add %sb2, %sb3 : index"]
+        ho = rown + ["%sbf = index.div %sblk, %c4 : index", "%sbr = index.mul %sbm, %cnbr : index",
+                     "%sbp = index.add %sbr, %sbf : index"]
+    for ln in ["%sp = index.rem %kp, %c2 : index", "%sq = index.add %G2, %sp : index",
+               f"%stt = index.div %sq, {fq} : index", f"%sg = index.rem %sq, {fq} : index",
                "%sblk = index.div %sg, %c2 : index", "%sl0 = index.rem %sg, %c2 : index",
-               "%sl1 = index.mul %stt, %c2 : index", "%sslab = index.add %sl1, %sl0 : index",
-               "%s0 = index.mul %sblk, %c20 : index", "%s1 = index.add %s0, %pq : index",
+               "%sl1 = index.mul %stt, %c2 : index", "%sslab = index.add %sl1, %sl0 : index"] + ho + [
+               "%s0 = index.mul %sbp, %c20 : index" if ho else "%s0 = index.mul %sblk, %c20 : index",
+               "%s1 = index.add %s0, %pq : index",
                "%s2 = index.mul %s1, %c4 : index", "%s3 = index.add %s2, %sslab : index",
                "%s4 = index.mul %s3, %csb : index", "%rd = index.add %s4, %olane : index",
-               "%rec = index.min %rd, %stmax : index", "%rec1 = index.add %rec, %c1 : index"):
-        x(re.sub(r"%(sp|sq|stt|sg|sblk|sl0|sl1|sslab|s0|s1|s2|s3|s4|rd|rec|rec1)\b", lambda m: f"%{t}" + m.group(1), ln))
+               "%rec = index.min %rd, %stmax : index", "%rec1 = index.add %rec, %c1 : index"]:
+        x(re.sub(r"%(sp|sq|stt|sg|sblk|sl0|sl1|sslab|sb1|sb2|sb3|sb4|sbm|sbf|sbr|sbp|s0|s1|s2|s3|s4|rd|rec|rec1)\b",
+                 lambda m: f"%{t}" + m.group(1), ln))
     x(f"%{t}eb8 = scalar.trunci {e1} : i32 to i8")
     x(f"%{t}ev = vector.from_elements %{t}eb8 : vector<1xi8>")
     x(f"vector.store %{t}ev, %ov[%{t}rec] : vector<1xi8>, view<[%nout]xi8>")
@@ -336,7 +399,7 @@ def _decode(e, pays, carried, ind):
     else:
         x("%dsp = index.rem %kp, %c2 : index")
         x("%dsq = index.add %G2, %dsp : index")
-        x("%dtt = index.div %dsq, %c512 : index")
+        x(f"%dtt = index.div %dsq, %c{F // 16} : index")
         x("%disg = index.cmp eq, %dtt, %c0 : index")
         x("%disu = index.cmp ne, %dtt, %c0 : index")
         for k, (pay, cond) in enumerate(zip(pays, ("%disg", "%disu"))):
@@ -351,7 +414,7 @@ def _decode(e, pays, carried, ind):
         e(ind + ln)
 
 
-def fuse(text, n, nwg, lanes, pay=None):
+def fuse(text, n, nwg, lanes, pay=None, f=None, rows=None):
     """The GEMM text (n rows a tensor in the full shape, nwg workgroups of lanes lanes) with the decode in its decoder
     section: buffer arguments appended to its launch (the raw weights %dz_w, any payload buffers, the stream
     %dz_out), the prologue before its K loop, phase p's record decoded from the values loaded at phase p - 1 (the
@@ -371,7 +434,13 @@ def fuse(text, n, nwg, lanes, pay=None):
     A pair is loop-versioned (VERSION_PAIRS): the tensor a workgroup decodes is fixed for its whole run (%G2 < 512:
     gate), so the K loop and the epilogue run in one of two copies, each holding one payload's carried values and
     decode (registers near a single payload's, code twice), under a result-free scf.if; R5_PAIRIF=1: the scf.if per
-    phase."""
+    phase.
+    f, rows: geom's (the swap's F, the host block order)."""
+    with geom(f, rows):
+        return _fuse_f(text, n, nwg, lanes, pay)
+
+
+def _fuse_f(text, n, nwg, lanes, pay):
     assert lanes == LANES and nwg >= WGS, (lanes, nwg)
     pays = _pays(pay)
     nin = n * (2 * pays[0].row_bytes if len(pays) == 1 else pays[0].row_bytes + pays[1].row_bytes)
@@ -387,8 +456,8 @@ def fuse(text, n, nwg, lanes, pay=None):
     assert g[:mg] == u[:mu] and g[-tail:] == u[-tail:] and g[-1] == "}", "copies share the frame prologue and the end"
     outer = set(re.findall(r"%[\w$.-]+", "\n".join(g[:mg])))
     ren = lambda s: re.sub(r"%[\w$.-]+", lambda m: m.group(0) if m.group(0) in outer else m.group(0) + "_vu", s)
-    out = g[:mg] + ["  %dz_visg = index.cmp ult, %dz_G2, %dz_c512 : index",
-                    "  %dz_visu = index.cmp uge, %dz_G2, %dz_c512 : index", "  scf.if %dz_visg {"]
+    out = g[:mg] + [f"  %dz_visg = index.cmp ult, %dz_G2, %dz_c{F // 16} : index",
+                    f"  %dz_visu = index.cmp uge, %dz_G2, %dz_c{F // 16} : index", "  scf.if %dz_visg {"]
     out += ["  " + ln for ln in g[mg + 1:-tail]] + ["  }", "  scf.if %dz_visu {"]
     out += ["  " + ren(ln) for ln in u[mu + 1:-tail]] + ["  }"] + g[-tail:]
     return "\n".join(out) + "\n"
@@ -448,9 +517,15 @@ def _fuse(text, n, pays, nin, extra, mark=False):
     return "\n".join(L) + "\n"
 
 
-def lane_records(n, lanes=LANES):
+def lane_records(n, lanes=LANES, f=None, rows=None):
     """Every (lane, phase) record offset and raw load address of the kernel's index math, unclamped (numpy): the
-    bounds and the coverage before any run. Returns (records, header loads, qs loads), each [NACT][PHASES]."""
+    bounds and the coverage before any run. Returns (records, header loads, qs loads), each [NACT][PHASES].
+    f, rows: geom's."""
+    with geom(f, rows):
+        return _lane_records(n, lanes)
+
+
+def _lane_records(n, lanes):
     import numpy as np
     import bfp16_check as BC
     Lv = np.arange(NACT)
@@ -460,16 +535,16 @@ def lane_records(n, lanes=LANES):
     jp, whi = ww // 2, ww % 2
     p = np.arange(PHASES)
     q = 2 * Gw[:, None] + (p % 2)[None, :]
-    tt, g16 = q // 512, q % 512
+    tt, g16 = q // (F // 16), q % (F // 16)
     Pp = (p // 2)[None, :]
     row = 16 * g16 + r16[:, None]
     blk, slab = g16 // 2, 2 * tt + g16 % 2
-    rec = ((blk * 20 + Pp) * 4 + slab) * SB + 288 * ww[:, None] + 9 * Ll[:, None]
+    rec = ((block_pos(blk) * 20 + Pp) * 4 + slab) * SB + 288 * ww[:, None] + 9 * Ll[:, None]
     ha = tt * n * RBG + (n - F) * RBG + row * RBG + Pp * 136
     qa = ha + 8 + 16 * jp[:, None] + 8 * bb[:, None]
     kbv = 32 * Pp + 4 * jp[:, None] + 2 * whi[:, None] + bb[:, None]
     g8 = row // 8
     sg = 8 * (g8 // 4) + 4 * tt + g8 % 4
-    off = BC.offsets("act", 2 * F, [KS], PASSES, TILE, True)
+    off = stream_offsets(F, HORDER)
     assert np.array_equal(rec, off[sg, kbv] + 9 * (row % 8)), "record offsets differ from the stream layout"
     return rec, ha, qa
