@@ -227,6 +227,12 @@ class LoomPrefill {
         p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls(true) *
                                                            NpuBytesOf("npubytes4_ffndn" + tag).c);
     }
+    if (SwDown()) {   // (the down in swap form) its weight streams at A 0, a K part each; C a (part, panel) each
+      if (halves_) throw LoomError("YAH_PP_HALVES: the swap-form down is not built for halves");
+      const NpuBytes b = NpuBytesOf("npubytes_swdown");
+      p.a_bytes = std::max(p.a_bytes, 2 * Up4k(b.a));
+      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + 2 * std::size_t{B_ / 512} * b.c);
+    }
     if (OutCAfterH())   // (PanelQ: the out site's C after the FFN block's H, from FfnBlkDown)
       p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + op.c_bytes);
     p.dcol = geom_.count("npudcol") != 0;
@@ -1609,6 +1615,9 @@ class LoomPrefill {
       if (kv.first.starts_with("npurswap_")) m = std::max(m, SwapStream(kv.second.tokens));
     return m;
   }
+  // (emit_prefill_pp YAH_NPU_SWDOWN, dispatch.txt "npuswdown") the FFN block's down in swap form: ffnswap writes H as
+  // its token panels (GN_QHPAN), so every swap layer's down runs it (npu_swdown, npu_swddec_<fmt>)
+  bool SwDown() const { return geom_.count("npuswdown") != 0; }
   std::size_t SwapA(std::uint32_t half = 0) const {   // the swap's weight stream in A: its halves at A's end
     const std::size_t r = SwapStreamMax();
     return npu_->A().size - (R5Fuse() ? 2 : 1) * r + half * r;
@@ -2045,7 +2054,42 @@ class LoomPrefill {
     const std::uint32_t rows = FfnBlkRows(dn4), calls = FfnBlkCalls(dn4);
     const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf(bytes + DnTag(parts[0], apass)).c;
     std::vector<std::string> dtag;
-    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
+    // (SwDown) the down in swap form: per K part kp the GPU decodes the NPU's 4096 columns of all 5120 rows to A at
+    // kp sa (npu_swddec_<fmt>, H's K order); call (kp, t) reads that stream, token panel t of H (W in C: 8 M blocks
+    // apass units apart from part kp's first unit; the image's GN_QWCS) and writes C (kp, t) in swapc form
+    const bool swdown = rswap && SwDown();
+    if (SwDown() && !rswap) throw LoomError("prefill: " + pre + "a swap-form down set needs the swap gate / up (H as panels)");
+    std::vector<std::uint32_t> cswd;
+    std::size_t swc = 0, swa = 0;
+    if (swdown) {
+      if (!hap || apass != 32 || parts.size() != 2 || parts[0].p != 16 || parts[1].p != 16 || parts[0].r != 16 ||
+          parts[1].r != 16 || td->dims[0] != 17408 || td->dims[1] != 5120 || B_ % 512)
+        throw LoomError("prefill: " + pre + "the swap-form down needs H [M block][32 units], two 4096 parts, 17408 x 5120");
+      const NpuBytes b = NpuBytesOf("npubytes_swdown");
+      if (b.c != std::size_t{5120} * 1024) throw LoomError("prefill: npubytes_swdown's C is not 5120 x 512 bf16");
+      const std::string h = "npu_swddec_" + std::string(fd.name) + ".hal";
+      if (!geom_.count(h)) throw LoomError("prefill: the set has no " + h + " (" + pre + "ffn_down, swap form): re-emit it");
+      const Geom& gd = geom_.at(h);
+      swa = Up4k(b.a);
+      const std::uint32_t nt = B_ / 512;
+      for (std::uint32_t kp = 0; kp < 2; ++kp) {
+        // (the part's first block of row 0: in its K segment, rows 16 blocks wide (npu_swddec without kfull); else in
+        // the GGUF's rows)
+        const std::size_t k0 = ks ? std::size_t{5120} * (*ks)[kp + 1].first * blkd : (f0 / 256 + parts[kp].u0) * blkd;
+        hrx_buffer_ref_t wr = TRef(*td);
+        wr.offset += k0, wr.length = (std::size_t{5120} - 1) * srb(kp) + 16 * blkd;
+        std::vector<hrx_buffer_ref_t> db = {wr};
+        if (const auto gw = GemmWeights(*td, fd); gw.size() > 1) db.push_back(gw[1]);   // (a grid format's grid)
+        db.push_back(ARef(kp * swa, gd.tt));
+        Dispatch(Exe(h), std::strncmp(fd.name, "iq4", 3) == 0 ? "yah_iq4xs_bfp" : "yah_kq_bfp",
+                 (gd.tokens + gd.rowgrp - 1) / gd.rowgrp, 1, 1, gd.rowgrp, 1, 1, db, std::uint64_t{1} << (db.size() - 1));
+        for (std::uint32_t t = 0; t < nt; ++t, swc += b.c)
+          cswd.push_back(npu_->BindSwap(dir_ + "/npu_swdown.xdna", HA({kp * swa, b.a}),
+                                        HA({hbase(kp) + std::size_t{8} * t * qu * 18432, (std::size_t{7} * qu + 16) * 18432, true}),
+                                        HC({doff + swc, b.c}), "swdown"));
+      }
+    }
+    for (std::size_t ci = 0; ci < parts.size() && !swdown; ++ci) {
       const FfnPart u = parts[ci];
       dtag.push_back(DnTag(u, apass));
       // (an NP 4 down: its own family, its array state differs from the NP 5 images')
@@ -2092,7 +2136,9 @@ class LoomPrefill {
     // YAH_NPU_DNJOBS=1: a job per part)
     static const bool dnjobs = std::getenv("YAH_NPU_DNJOBS") != nullptr;
     const bool one = !dnjobs && std::all_of(dn.begin(), dn.end(), [&](const std::string& d) { return d == dn[0]; });
-    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
+    if (swdown)
+      NpuEnqueue(std::move(cswd), "swdown", {{ARef(0, 2 * swa), CRef(0, FfnBlkH())}, CRef(doff, swc)});
+    for (std::size_t ci = 0; ci < parts.size() && !swdown; ++ci) {
       if (one && ci + 1 < parts.size()) {
         cdn[ci + 1].insert(cdn[ci + 1].begin(), cdn[ci].begin(), cdn[ci].end());
         continue;
@@ -2152,10 +2198,11 @@ class LoomPrefill {
              MTiles(*td) / gr.rowgrp, gr.tt, 1, 32, 1, 1, r, std::uint64_t{1} << (r.size() - 1));
     NpuJoin();
     // the sum into hidden() waits for the next layer's norm, which fuses it when it feeds the NPU (RunLayerNorm)
-    ffn_pending_ = {doff, parts.size() * calls * cp};
-    ffn_pending4_ = dn4;
+    ffn_pending_ = {doff, swdown ? swc : parts.size() * calls * cp};
+    ffn_pending4_ = dn4 && !swdown;
+    ffn_pendingsw_ = swdown;
     // (npu_unorm reads the NP 5 downs' C; after the "_rr" sum, "npu_unorm[4]_rr_*" takes any down)
-    if (ffn_rr_ ? !geom_.count(UnormRr(false, NormOut::kTiled)) : !geom_.count("npu_unorm.hal") || dn4) FlushFfn();
+    if (ffn_rr_ ? !geom_.count(UnormRr(false, NormOut::kTiled)) : !geom_.count("npu_unorm.hal") || dn4 || swdown) FlushFfn();
     return true;
   }
   // The FFN block's sum (hidden + the GPU's down + the NPU's partials) into hidden(), if RunFfnBlock left it pending.
@@ -2164,10 +2211,12 @@ class LoomPrefill {
     if (!ffn_pending_.length) return;
     const hrx_buffer_ref_t remv{ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4};
     if (ffn_rr_)
-      NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4_rr.hal" : "npu_unpack_ffnblk_rr.hal", std::exchange(ffn_pending_, {}),
+      NpuUnpack(ffn_pendingsw_ ? "npu_unpack_ffnblk_sw_rr.hal" : ffn_pending4_ ? "npu_unpack_ffnblk_4_rr.hal" : "npu_unpack_ffnblk_rr.hal",
+                std::exchange(ffn_pending_, {}),
                 {remv, Ref(*hidden2_)}, 4);
     else
-      NpuUnpack(ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal", std::exchange(ffn_pending_, {}),
+      NpuUnpack(ffn_pendingsw_ ? "npu_unpack_ffnblk_sw.hal" : ffn_pending4_ ? "npu_unpack_ffnblk_4.hal" : "npu_unpack_ffnblk.hal",
+                std::exchange(ffn_pending_, {}),
                 {Ref(*hidden_), remv, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
   }
@@ -2208,7 +2257,7 @@ class LoomPrefill {
   std::string UnormRr(bool pk, NormOut mode, bool ns = false) const {
     static const bool off = std::getenv("YAH_NPU_NOUNORMF") != nullptr;
     if (off) return "-";
-    return std::string(ffn_pending4_ ? "npu_unorm4_rr_" : "npu_unorm_rr_") +
+    return std::string(ffn_pendingsw_ ? "npu_unormsw_rr_" : ffn_pending4_ ? "npu_unorm4_rr_" : "npu_unorm_rr_") +
            (mode == NormOut::kRow ? "r" : mode == NormOut::kTiled ? "t" : "rt") + (ns ? "_ns.hal" : pk ? "_pk.hal" : ".hal");
   }
   // swap: the layer's NPU sites are in swap form (their stream the GPU's decoders write): no BFP16 stream, npu_site unused
@@ -3700,6 +3749,7 @@ class LoomPrefill {
   std::uint32_t out_nn_ = 0;       // ... its NPU rows
   bool out_np4_ = false;           // ... from an NP 4 image (npu_unpack_out_4.hal)
   bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
+  bool ffn_pendingsw_ = false;     // ... from the swap-form down (npu_unpack_ffnblk_sw.hal, npu_unormsw_rr_*)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
   NormOut pending_mode_{};
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
@@ -3835,7 +3885,7 @@ class LoomPrefill {
   X(hidden_) X(hidden2_) X(partial_) X(scratch_) X(qkv_) X(gate_) X(alpha_) X(beta_) X(ab_) X(q_) X(q16_) X(qr16_)     \
   X(kbuf_) X(vbuf_) X(kqbuf_) X(lse_) X(normt_) X(raw_) X(raw2_) X(conv_out_) X(ffnup_) X(gateffn_) X(ostage_)         \
   X(npurem_) X(ffnrem_) X(ids_) X(embed_rows_) X(valid_) X(kv16_) X(n_) X(keep_rows_) X(tail_) X(trim_row_) X(layer_) \
-  X(norm_bfp_) X(norm_pk_) X(ffn_pending_) X(out_pending_) X(out_nn_) X(out_np4_) X(ffn_pending4_) X(ffn_rr_)         \
+  X(norm_bfp_) X(norm_pk_) X(ffn_pending_) X(out_pending_) X(out_nn_) X(out_np4_) X(ffn_pending4_) X(ffn_pendingsw_) X(ffn_rr_)         \
   X(pending_norm_) X(pending_mode_) X(gc_read_) X(qc_hal_) X(qc_c_) X(dn_c_end_) X(after_release_) X(panel_job_)       \
   X(last_job_) X(npu_a0_) X(npu_w0_) X(npu_c0_)
   struct HalfState {

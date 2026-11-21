@@ -2632,11 +2632,13 @@ class LoomNpuSplit : public NpuSplit {
   }
   std::uint32_t BindSwap(const std::string& image, NpuView a, NpuView w, NpuView c,
                          const std::string& family = "ffnswap") override {
-    const auto key = std::make_tuple(image, a.offset, a.length, w.offset, w.length, c.offset, c.length);
+    // (w.in_c: the panel is in C, the down in swap form reading H)
+    const auto key = std::make_tuple(image, a.offset, a.length, w.offset + (w.in_c ? std::size_t{1} << 62 : 0), w.length,
+                                     c.offset, c.length);
     if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
     const std::size_t slot = GateSlot();
     std::vector<LoomNpu::View> views{{&a_, a.offset, a.length},
-                                     {&w_, w.offset, w.length},
+                                     {w.in_c ? &c_ : &w_, w.offset, w.length},
                                      {&c_, c.offset, c.length},
                                      {&flags_, slot, plan_.gate_record},
                                      {&flags_, slot + kTick, plan_.gate_record},
