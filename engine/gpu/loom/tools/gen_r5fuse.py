@@ -358,24 +358,24 @@ def _record(x, got, t, FMF):
     if HORDER is not None:
         inv = [HORDER.index(b) for b in range(4)]
         if inv == [0, 1, 2, 3]:
-            rown = ["%sbm = index.rem %sblk, %c4 : index"]
+            rown = ["%shbm = index.rem %sblk, %c4 : index"]
         else:
             assert inv == [0, 2, 1, 3], HORDER   # (r = 2 (b % 2) + b / 2)
-            rown = ["%sb4 = index.rem %sblk, %c4 : index", "%sb1 = index.rem %sb4, %c2 : index",
-                    "%sb2 = index.mul %sb1, %c2 : index", "%sb3 = index.div %sb4, %c2 : index",
-                    "%sbm = index.add %sb2, %sb3 : index"]
-        ho = rown + ["%sbf = index.div %sblk, %c4 : index", "%sbr = index.mul %sbm, %cnbr : index",
-                     "%sbp = index.add %sbr, %sbf : index"]
+            rown = ["%shb4 = index.rem %sblk, %c4 : index", "%shb1 = index.rem %shb4, %c2 : index",
+                    "%shb2 = index.mul %shb1, %c2 : index", "%shb3 = index.div %shb4, %c2 : index",
+                    "%shbm = index.add %shb2, %shb3 : index"]
+        ho = rown + ["%shbf = index.div %sblk, %c4 : index", "%shbr = index.mul %shbm, %cnbr : index",
+                     "%shbp = index.add %shbr, %shbf : index"]
     for ln in ["%sp = index.rem %kp, %c2 : index", "%sq = index.add %G2, %sp : index",
                f"%stt = index.div %sq, {fq} : index", f"%sg = index.rem %sq, {fq} : index",
                "%sblk = index.div %sg, %c2 : index", "%sl0 = index.rem %sg, %c2 : index",
                "%sl1 = index.mul %stt, %c2 : index", "%sslab = index.add %sl1, %sl0 : index"] + ho + [
-               "%s0 = index.mul %sbp, %c20 : index" if ho else "%s0 = index.mul %sblk, %c20 : index",
+               "%s0 = index.mul %shbp, %c20 : index" if ho else "%s0 = index.mul %sblk, %c20 : index",
                "%s1 = index.add %s0, %pq : index",
                "%s2 = index.mul %s1, %c4 : index", "%s3 = index.add %s2, %sslab : index",
                "%s4 = index.mul %s3, %csb : index", "%rd = index.add %s4, %olane : index",
                "%rec = index.min %rd, %stmax : index", "%rec1 = index.add %rec, %c1 : index"]:
-        x(re.sub(r"%(sp|sq|stt|sg|sblk|sl0|sl1|sslab|sb1|sb2|sb3|sb4|sbm|sbf|sbr|sbp|s0|s1|s2|s3|s4|rd|rec|rec1)\b",
+        x(re.sub(r"%(sp|sq|stt|sg|sblk|sl0|sl1|sslab|shb1|shb2|shb3|shb4|shbm|shbf|shbr|shbp|s0|s1|s2|s3|s4|rd|rec|rec1)\b",
                  lambda m: f"%{t}" + m.group(1), ln))
     x(f"%{t}eb8 = scalar.trunci {e1} : i32 to i8")
     x(f"%{t}ev = vector.from_elements %{t}eb8 : vector<1xi8>")
