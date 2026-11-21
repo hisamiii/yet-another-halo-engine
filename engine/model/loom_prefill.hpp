@@ -2279,7 +2279,11 @@ class LoomPrefill {
         return;
       }
       FlushFfn();
-      RunNorm(wname, mode);
+      // (the q / qkv sites' token panel from the norm itself: SwSitePanel skips npu_swpanel once)
+      const bool pn = mode == NormOut::kTiled && geom_.count("npu_swpanel.hal") &&
+                      ::access((dir_ + "/norm_t_pn.hal").c_str(), R_OK) == 0;
+      RunNorm(wname, mode, pn ? "swsite" : nullptr, false, pn);
+      site_panel_ = pn;
       return;
     }
     if (ffn_pending_.length && ffn_rr_ && npu_site && geom_.count("npunormbfp") && geom_.count(UnormRr(pk, mode))) {
@@ -2378,7 +2382,11 @@ class LoomPrefill {
     // in the deferred-epilogue images' K split
     const bool g1s = npu_site && std::strcmp(npu_site, "ffnblk_s") == 0;
     const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
-    if (panel && (!g1 || g1s || mode != NormOut::kTiled)) throw LoomError("prefill: a panel norm off the FFN block");
+    // "swsite": a swap layer's attention norm writing the q / qkv sites' token panel (norm_t_pn.hal, RunLayerNorm)
+    const bool sws = npu_site && std::strcmp(npu_site, "swsite") == 0;
+    if (panel && ((!g1 && !sws) || g1s || mode != NormOut::kTiled))
+      throw LoomError("prefill: a panel norm off the FFN block and the swap sites' norm");
+    if (sws && !panel) throw LoomError("prefill: the swap sites' norm without its panel");
     // (the NPU input binding, built only where a norm writes one: npu_ is null on GPU-only norms)
     const auto ab = [&] {
       return panel ? WRef(0, geom_.at("npu_swpanel.hal").tt)
@@ -2416,12 +2424,12 @@ class LoomPrefill {
       return;
     }
     FlushOut();
-    const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
-    norm_bfp_ = bfp && !g1 ? npu_site : "";
+    const bool bfp = npu_site && (g1 || sws || geom_.count("npunormbfp"));
+    norm_bfp_ = bfp && !g1 && !sws ? npu_site : "";
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
     const bool wpk = bfp && !g1 && pk && geom_.count("npunormbfppk");
     norm_pk_ = wpk ? npu_site : "";
-    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1" + pn + ".hal"
+    const LoomExecutable& exe = Exe(sws ? std::string("norm_t_pn.hal") : g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1" + pn + ".hal"
                                     : hal + (wpk ? "_bfp_pk.hal" : bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
@@ -2651,6 +2659,7 @@ class LoomPrefill {
   // (out: "npu_swpanel_o[_t].hal" from its input's k 0 .. 5120)
   std::size_t SwSitePanel(const std::string& hal = "npu_swpanel.hal", const LoomBuffer* input = nullptr) {
     const Geom& gp = geom_.at(hal);
+    if (hal == "npu_swpanel.hal" && !input && std::exchange(site_panel_, false)) return gp.tt;   // (the norm wrote it)
     Dispatch(Exe(hal), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1, gp.rowgrp, 1, 1,
              {Ref(input ? *input : *normt_), WRef(0, gp.tt)}, 2);
     return gp.tt;
@@ -3753,7 +3762,8 @@ class LoomPrefill {
   std::uint32_t out_nn_ = 0;       // ... its NPU rows
   bool out_np4_ = false;           // ... from an NP 4 image (npu_unpack_out_4.hal)
   bool ffn_pending4_ = false;      // ... from NP 4 down calls (npu_unpack_ffnblk_4.hal)
-  bool ffn_pendingsw_ = false;     // ... from the swap-form down (npu_unpack_ffnblk_sw.hal, npu_unormsw_rr_*)
+  bool ffn_pendingsw_ = false;
+  bool site_panel_ = false;        // the attention norm wrote the q / qkv sites' token panel (norm_t_pn.hal)     // ... from the swap-form down (npu_unpack_ffnblk_sw.hal, npu_unormsw_rr_*)
   std::string pending_norm_;       // a fused norm's f16 output still to record (RunLayerNorm, RunPendingNorm)
   NormOut pending_mode_{};
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)

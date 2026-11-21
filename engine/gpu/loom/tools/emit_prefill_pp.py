@@ -1627,6 +1627,19 @@ def npu_split(rows, combos, B, outdir):
         E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
         out.append((nm_ + ".hal", gen_iq4xs_bfp.items(nn_, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(nn_, 5120, st_)))
     if SWSITE_DECO:   # (YAH_NPU_SWSITE) out's token panels: its input's k 0 .. 5120 (of 6144), row-major / fragment-major
+        if {"qkv", "q"} & set(NPU_SPLIT):
+            # (the attention norm with the q / qkv sites' token panel: norm_t.hal's output plus npu_swpanel.hal's W
+            # panel from the same f16 values, gen_half_norm.PANEL; LoomPrefill::RunLayerNorm swap)
+            import gen_half_norm
+            src = os.path.join(tmp, "norm_t_pn.loom")
+            gen_half_norm.PANEL = (RSWAP_KS, RSWAP_PASSES)
+            try:
+                open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
+                                                             bfp=(B, list(NPU_KS), NPU_PASSES)))
+            finally:
+                gen_half_norm.PANEL = None
+            E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                         "yah_half_norm.fused=0"], "norm_t_pn.hal", outdir)
         for t_ in (False, True):
             pn_ = "npu_swpanel_o%s.hal" % ("_t" if t_ else "")
             src = os.path.join(tmp, pn_[:-4] + ".loom")
