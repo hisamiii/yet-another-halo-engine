@@ -78,10 +78,10 @@ def stream_offsets(f=None, rows=None):
         blk = (np.arange(2 * F // 8) // 8)[:, None]
         return off + (block_pos(blk) - blk) * PASSES * 4 * SB
 KEEP = {"kp", "tid", "stg_lin", "c0", "base"}
-# The VGPR budget to allocate in (emit_prefill YAH_VGPR_TRY): at the default 192 the allocator squeezes the fused
-# kernel to 180 VGPRs and spreads the GEMM's weight ds_stores over 134 instructions (+0.66 ms); at 208 it serializes
-# plain's B loads; at 200 (port's ps1v) it keeps plain's 8 x (B B B B, vmcnt(2)) and lands at 192 VGPRs, 0 scratch.
-VGPR_TRY = "200"
+# The VGPR budget to allocate in (emit_prefill YAH_VGPR_TRY). With the next-step B prefetch (tile bnext, port's pf) 200
+# lands at 200 VGPRs (7 waves); 192 keeps 8 waves, 0 scratch, and rematerializes the decode's constants in the barrier
+# window (+53 v_mov a phase, cheap there): carrier_ab +1.70% vs ps1v's +3.28% (11-21). Without bnext: 200 (ps1v).
+VGPR_TRY = "192"
 
 
 def out_bytes(f=None):
@@ -484,7 +484,12 @@ def _fuse(text, n, pays, nin, extra, mark=False):
     D = _pre(D)
     # the next phase's payload loads right after step 0's B fragment loads (port's ps1v: half the IQ4_XS carrier's idle);
     # a schedule that issues those before the barrier (AFRAG b0early) keeps them before the last mma
-    si = next((i for i in range(b2, ri) if "%srhs0_1 = vector.fragment.load" in L[i]), ri - 1)
+    # with the next-step B prefetch (bnext) step 1's B is issued in step 0 too: the payload goes after it, so the first
+    # B load younger than the payload is step 2's (two steps of slack for its DRAM latency; vmcnt counts in order)
+    m0 = next(i for i in range(b2, ri) if L[i].strip().startswith("%sn0_0 = vector.mma"))
+    si = next((i for i in range(b2, m0) if "%srhs1_1 = vector.fragment.load" in L[i]
+               and L[i + 1].strip() == "scf.schedule.fence"), None)   # (bnext's fence; bpre's step-1 B is unfenced)
+    si = si if si is not None else next((i for i in range(b2, ri) if "%srhs0_1 = vector.fragment.load" in L[i]), ri - 1)
     L = L[:ki] + P + L[ki:b2 - 1] + D + L[b2 - 1:si + 1] + NX + L[si + 1:]
     return "\n".join(L) + "\n"
 

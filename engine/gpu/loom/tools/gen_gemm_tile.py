@@ -125,6 +125,9 @@ class Tile:
     wlate: bool = False        # afrag: next phase's weight loads in the last k step (registers free in the MMA section)
     b0early: bool = False      # afrag: issue k step 0's B fragments at the top of the phase, before the decode hides their latency
     bpre: int = 0              # afrag: each k step loads the first bpre of the next step's B fragments before its MMAs (in-phase)
+    bnext: bool = False        # afrag: each k step issues all of the next step's B fragments at its top, behind a schedule
+                               # fence (step 0: its own first), so a load issued after step 0's B waits until step 2's
+                               # (replaces bpre / b0early; with lhs_stream the A fragments still stream after the fence)
     lhs_stream: int = 0        # straight-line k steps: load the B fragments first, then each A fragment just before its MMAs,
                                # with a scheduling fence every lhs_stream A fragments (few A fragments live: tall per-wave tiles)
 
@@ -199,6 +202,8 @@ def check(t):
         (not (t.dbuf and t.decahead), "double buffering replaces decode-ahead"),
         (not t.afrag or t.ksl, "activation fragments from global need the straight-line k steps"),
         (not t.bpre or (t.afrag and not t.rhs_outer), "B prefetch is for afrag without rhs-outer"),
+        (not t.bnext or (t.afrag and not (t.bpre or t.b0early or t.rhs_outer)),
+         "next-step B is for afrag without bpre / b0early / rhs-outer"),
         (not t.b0early or (t.afrag and not t.dbuf and not t.decahead), "early step-0 B is for afrag without dbuf/decode-ahead"),
         (not t.tout or (t.afrag and not t.swepi), "tiled swiglu output is the plain swiglu epilogue of an afrag tile"),
         (not t.tallepi or t.tm > 32, "the tall LDS epilogue is for waves over 32 rows"),
@@ -1111,10 +1116,20 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         for st in range(nst):
             if st:
                 e("    scf.schedule.fence")
-            if not (t.bpre and st) and not (t.b0early and st == 0):
+            if not (t.bpre and st) and not (t.b0early and st == 0) and not (t.bnext and st):
                 e(f"    %sks{st} = index.constant {16 * st} : index")
             if t.bpre and st + 1 < nst and not (t.b0early > 1 and st == 0):
                 e(f"    %sks{st + 1} = index.constant {16 * (st + 1)} : index")
+            if t.bnext:
+                # the next step's B now, fenced above this step's A fragments and MMAs (without the fence the scheduler
+                # sinks the loads to their use); the r5 payload issued after step 0's then has two steps of slack
+                for j in range(FN if st == 0 else 0):
+                    afrag_rhs(st, j)
+                if st + 1 < nst:
+                    e(f"    %sks{st + 1} = index.constant {16 * (st + 1)} : index")
+                    for j in range(FN):
+                        afrag_rhs(st + 1, j)
+                e("    scf.schedule.fence")
 
             def slhs(i):
                 e(f"    %slr{st}_{i} = index.add %wr_off, %c{16 * i} : index")
@@ -1147,7 +1162,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
                     nxt, anx = next_loads()
             if t.lhs_stream:
                 if not t.bpre:
-                    for j in range(FN):
+                    for j in range(FN if not t.bnext else 0):
                         srhs(j)
                     if late and st == nst - 1:
                         nxt, anx = next_loads()
@@ -1167,7 +1182,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
                         e("    scf.schedule.fence")
             else:
                 if not t.bpre:
-                    for j in range(FN):
+                    for j in range(FN if not t.bnext else 0):
                         srhs(j)
                     if late and st == nst - 1:
                         nxt, anx = next_loads()
