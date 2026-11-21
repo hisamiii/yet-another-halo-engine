@@ -441,6 +441,7 @@ def had64(e, pre, vecs, xors, scale):
 # head half is wave-uniform (cbound % 128 == 0), so the C / buffer choice is one uniform branch per group.
 QC = None
 QC_N = [0]
+QC_SWAP = None   # (with QC) R: C is a swap-form site image's (R rows, gen_npu_unpack.swapc_base, one value an element)
 
 
 def qc_setup(e):
@@ -449,14 +450,16 @@ def qc_setup(e):
     cb, tok = QC
     nq = 12288 - cb
     assert cb % 128 == 0 and nq > 0 and nq % GN.TN == 0 and GU.CG in (1, 2)
-    e(f"  %qc_nc = index.constant {tok * nq * GU.CG // 2} : index")
+    assert not QC_SWAP or (tok % 512 == 0 and nq <= QC_SWAP)
+    e(f"  %qc_nc = index.constant {tok * QC_SWAP // 2 if QC_SWAP else tok * nq * GU.CG // 2} : index")
     e("  %qc_cv = buffer.view %cbuf[%base] : buffer -> view<[%qc_nc]xi32>")
     e("  %qc_c2 = index.constant 2 : index")
     e("  %qc_c16i = scalar.constant 16 : i32")
     e("  %qc_chii = scalar.constant -65536 : i32")
     e(f"  %qc_cgs = index.constant {tok * GN.TN} : index")
     e(f"  %qc_cb = index.constant {cb} : index")
-    e(f"  %qc_last = index.constant {tok * nq * GU.CG - 8 - tok * GN.TN * (GU.CG - 1)} : index")
+    last = GU.swapc_last(tok, nq, QC_SWAP) if QC_SWAP else tok * nq * GU.CG - 8 - tok * GN.TN * (GU.CG - 1)
+    e(f"  %qc_last = index.constant {last} : index")
     e("  %qc_c256 = index.constant 256 : index")
     e("  %qc_c512 = index.constant 512 : index")
     e("  %qc_c6144 = index.constant 6144 : index")
@@ -499,7 +502,7 @@ def qc_wrap(e, gate, runs, view, vt):
     tys = ", ".join([V4] * (2 * len(runs)))
     outs = [x for a, b, _ in runs for x in (a, b)]
     e(f"  {', '.join(outs)} = scf.if %{p}n -> ({tys}) {{")
-    tb = GU.c_tok(e, p + "t", f"%{p}tok")
+    tb = None if QC_SWAP else GU.c_tok(e, p + "t", f"%{p}tok")
     ys = []
     for k, (a, b, idx) in enumerate(runs):
         q = f"{p}{k}"
@@ -507,11 +510,15 @@ def qc_wrap(e, gate, runs, view, vt):
         e(f"  %{q}c = index.add %{p}col, %{q}dl : index")
         e(f"  %{q}cm = index.max %{q}c, %qc_cb : index")
         e(f"  %{q}j = index.sub %{q}cm, %qc_cb : index")
-        la = GU.c_lane(e, q + "l", f"%{q}j", QC[1])
-        e(f"  %{q}a0 = index.add {la}, {tb} : index")
-        e(f"  %{q}a = index.min %{q}a0, %qc_last : index")
+        if QC_SWAP:   # (swap form) one value per element
+            sb = GU.swapc_base(e, q + "s", f"%{q}j", f"%{p}tok", QC_SWAP)
+            e(f"  %{q}a = index.min {sb}, %qc_last : index")
+        else:
+            la = GU.c_lane(e, q + "l", f"%{q}j", QC[1])
+            e(f"  %{q}a0 = index.add {la}, {tb} : index")
+            e(f"  %{q}a = index.min %{q}a0, %qc_last : index")
         sm = qc_c8(e, q + "g0", f"%{q}a")
-        if GU.CG == 2:   # (the unpack's load_cg: g0 + g1)
+        if GU.CG == 2 and not QC_SWAP:   # (the unpack's load_cg: g0 + g1)
             e(f"  %{q}b = index.add %{q}a, %qc_cgs : index")
             g1 = qc_c8(e, q + "g1", f"%{q}b")
             for i in range(8):

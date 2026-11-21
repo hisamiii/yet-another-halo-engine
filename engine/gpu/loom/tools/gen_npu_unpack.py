@@ -46,8 +46,8 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K.
     remres (with resid and rem): rem already holds resid + the GPU's partial (its GEMM's residual epilogue): out = rem +
     the C chunks' sum (bindings c, rem, out), a summation order of its own.
-    swap = R (with last8 and out16 only): C is a swap-form site image's (R rows, swapc_base, one value an element)."""
-    assert not swap or (last8 and out16 and parts == 1 and not (resid or rem or swiglu or tiled or qg or bfp or dup)
+    swap = R (out16 or qg, one part): C is a swap-form site image's (R rows, swapc_base, one value an element)."""
+    assert not swap or ((out16 or qg) and parts == 1 and not (resid or rem or swiglu or tiled or bfp or dup)
                         and tokens % 512 == 0 and cols * GN.TN <= swap)
     assert not remres or (resid and rem)
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)

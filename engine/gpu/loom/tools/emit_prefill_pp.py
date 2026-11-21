@@ -981,7 +981,7 @@ R5_PARTS = (0, 1) if R5PART else (None,)
 R5_VTRY = "208,200,192"
 R5_SKIP = {"q3k_iq3s"}
 RSWAP_KQ = {"q4k": "Q4_K", "q5k": "Q5_K", "q3k": "Q3_K", "iq3s": "IQ3_S", "iq3xxs": "IQ3_XXS", "iq2xs": "IQ2_XS",
-            "iq2s": "IQ2_S"}   # (gen_kq_bfp's formats)
+            "iq2s": "IQ2_S", "q2k": "Q2_K"}   # (gen_kq_bfp's formats)
 RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.py's, checked)
 # YAH_NPU_RSWAP_NB=<n> (with RSWAP_EMIT): the swap image's weight M blocks (64 stream rows) a call, a multiple of 32
 # (today's 1024 features a call); the engine reads it from npubytes_ffnswap's A bytes. 128: 2 calls a token panel
@@ -1399,7 +1399,7 @@ def npu_split(rows, combos, B, outdir):
             nn = NPU_SPLIT_LAYERS.get((site, L)) or (npu_rows4(site) if np4(lfmt[nm]) else NPU_SPLIT[site])
             nb = -(-nn // 256) * 4
             SWSITE_NB.add(nb)
-            if site in ("qkv", "gate"):
+            if site in ("qkv", "gate", "q"):
                 SWSITE_DEC.add((lfmt[nm], nn))
             out.append(("npuswsite_%s@%d" % (site, L), nb, nn, 0))
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
@@ -1461,17 +1461,13 @@ def npu_split(rows, combos, B, outdir):
         N = mt * 16
         f = {"qkv": dict(out16=True), "gate": dict(out16=True), "q": dict(qg=True),
              "out": dict(resid=True, parts=len(npu_chunks("out")), rem=True)}[site]
-        # (YAH_NPU_SWSITE) qkv's and gate's C is the swap-form site image's (R rows): their direct readers take swap=R
-        # and the full unpack is not emitted (it has no swap form)
-        sw = GU.swap_rows(n) if SWSITE and site in ("qkv", "gate") else None
+        # (YAH_NPU_SWSITE) qkv's, gate's and q's C is the swap-form site image's (R rows): their readers take swap=R
+        sw = GU.swap_rows(n) if SWSITE and site in ("qkv", "gate", "q") else None
         name = "npu_unpack_%s%s.hal" % (site, sfx)
-        if not sw:
-            src = os.path.join(tmp, name[:-4] + ".loom")
-            open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
-            E.emit(src, ["nop=0"], name, outdir)
-            out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
-        else:
-            assert site == "qkv" or (DNSPLIT and 384 in O16_MT), ("YAH_NPU_SWSITE: gate's C read by the postnorm", site)
+        src = os.path.join(tmp, name[:-4] + ".loom")
+        open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, swap=sw, **f))
+        E.emit(src, ["nop=0"], name, outdir)
+        out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
         if site == "out" and NPU_FFNBLK and not NO_ONORM:
             # the same sum fused into the FFN block's norm ("norm_t_bfp_g1": its fragment-major f16 and the
             # one-replay-group stream): "npu_onorm<sfx>.hal", gen_half_norm.gen_osum (LoomPrefill::RunNorm)
@@ -1610,11 +1606,11 @@ def npu_split(rows, combos, B, outdir):
     for fm_, nn_ in sorted(SWSITE_DEC):   # (YAH_NPU_SWSITE) qkv's / gate's plain stream decoders
         import gen_iq4xs_bfp
         import gen_kq_bfp
-        assert fm_ == "iq4xs" or fm_ in RSWAP_KQ, ("YAH_NPU_SWSITE: no stream decoder for", fm_)
+        assert fm_ in ("iq4xs", "iq4nl") or fm_ in RSWAP_KQ, ("YAH_NPU_SWSITE: no stream decoder for", fm_)
         st_ = dict(ks=RSWAP_KS, passes=RSWAP_PASSES, tile=64, plain=True)
         nm_ = "npu_swsdec_%s_%d" % (fm_, nn_)
         src = os.path.join(tmp, nm_ + ".loom")
-        open(src, "w").write(gen_iq4xs_bfp.gen(nn_, 5120, st_) if fm_ == "iq4xs" else
+        open(src, "w").write(gen_iq4xs_bfp.gen(nn_, 5120, st_, nl=fm_ == "iq4nl") if fm_ in ("iq4xs", "iq4nl") else
                              gen_kq_bfp.gen(RSWAP_KQ[fm_], nn_, 5120, st_))
         E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
         out.append((nm_ + ".hal", gen_iq4xs_bfp.items(nn_, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(nn_, 5120, st_)))
@@ -2603,12 +2599,13 @@ def main():
                 hal = "wmma%s_qc%s.hal" % ("_t" if tiled else "", sfx)
                 src_ = os.path.join(tmp, hal[:-4] + ".loom")
                 gen_attn_fa.QC, gen_attn_fa.TILED_OUT = (12288 - nq, B), tiled
+                gen_attn_fa.QC_SWAP = GU.swap_rows(nq) if SWSITE else None   # (YAH_NPU_SWSITE: q's C in swap form)
                 gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = False   # (chunk 0: the single K buffer)
                 try:
                     with GN.np_override(np_):
                         write_attn(src_)
                 finally:
-                    gen_attn_fa.QC, gen_attn_fa.TILED_OUT = None, False
+                    gen_attn_fa.QC, gen_attn_fa.TILED_OUT, gen_attn_fa.QC_SWAP = None, False, None
                     gen_attn_fa.R2P_KDB = gen_attn_fa.R2P_RELANE = kdb
                 qca.append((src_, hal))
                 geom.append((hal, 1, 0, 0))
