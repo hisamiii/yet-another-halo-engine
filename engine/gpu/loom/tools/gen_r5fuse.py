@@ -279,29 +279,10 @@ def _bufname(b):
 
 
 def _loads(e, pays, kpv, t, ind):
-    """Phase kpv's carried values (names, types): one payload's loads, or the gate's / up's under an scf.if on the
-    workgroup-uniform tensor index (their carried types must match)."""
+    """Phase kpv's carried values (names, types): the payload's loads (one payload: a pair is loop-versioned)."""
     _frame_loads(e, kpv, t, ind)
-    if len(pays) == 1:
-        got = pays[0].loads(e, kpv, t, ind)
-        return [nm for nm, _ in got], [ty for _, ty in got]
-    a, b = [], []
-    ga = pays[0].loads(a.append, kpv, t + "g", ind + "  ", ft=t)
-    ub = pays[1].loads(b.append, kpv, t + "u", ind + "  ", ft=t)
-    tys = [ty for _, ty in ga]
-    assert tys == [ty for _, ty in ub], ("gate and up payloads must carry the same types", tys, ub)
-    names = [f"%{t}cv{i}" for i in range(len(tys))]
-    e(ind + f"%{t}isg = index.cmp eq, %{t}tt, %c0 : index")
-    e(f"{ind}{', '.join(names)} = scf.if %{t}isg -> ({', '.join(tys)}) {{")
-    for ln in a:
-        e(ln)
-    e(f"{ind}  scf.yield {', '.join(nm for nm, _ in ga)} : {', '.join(tys)}")
-    e(ind + "} else {")
-    for ln in b:
-        e(ln)
-    e(f"{ind}  scf.yield {', '.join(nm for nm, _ in ub)} : {', '.join(tys)}")
-    e(ind + "}")
-    return names, tys
+    got = pays[0].loads(e, kpv, t, ind)
+    return [nm for nm, _ in got], [ty for _, ty in got]
 
 
 def _record(x, got, t, FMF):
@@ -396,31 +377,14 @@ def _record(x, got, t, FMF):
 
 
 def _decode(e, pays, carried, ind):
-    """Phase %kp's record from the carried values. A (gate, up) pair decodes in two guarded blocks without results
-    (each with its own rounding and store): scf.if with results has miscompiled in Loom (kresq-fusion, 10-15)."""
+    """Phase %kp's record from the carried values (one payload: a pair is loop-versioned), under the %act guard."""
     FMF = "<nnan|nsz>"   # finite values; only the max's exponent bits and the 127.5 compare are read
     L = []
     x = L.append
-    noif = os.environ.get("R5_NOIF") == "1"   # (diag) no %act guard: clamped workgroups rewrite workgroup 511's records
-    if not noif:
-        x("scf.if %act {")
+    x("scf.if %act {")
     x("%pq = index.div %kp, %c2 : index")
-    if len(pays) == 1:
-        _record(x, pays[0].decode(x, carried, ""), "", FMF)
-    else:
-        x("%dsp = index.rem %kp, %c2 : index")
-        x("%dsq = index.add %G2, %dsp : index")
-        x(f"%dtt = index.div %dsq, %c{F // 16} : index")
-        x("%disg = index.cmp eq, %dtt, %c0 : index")
-        x("%disu = index.cmp ne, %dtt, %c0 : index")
-        for k, (pay, cond) in enumerate(zip(pays, ("%disg", "%disu"))):
-            tg = "gu"[k]
-            x(f"scf.if {cond} {{")
-            y = lambda s: x("  " + s)
-            _record(y, pay.decode(y, carried, "", tg), tg, FMF)
-            x("}")
-    if not noif:
-        x("}")
+    _record(x, pays[0].decode(x, carried, ""), "", FMF)
+    x("}")
     for ln in L:
         e(ind + ln)
 
@@ -442,10 +406,9 @@ def fuse(text, n, nwg, lanes, pay=None, f=None, rows=None, part=None):
       decode(e, carried, ind, t="") -> 8 f32 weight names (exact), or (E i32, 8 i32 mantissa words fma(w, jq, magic))
         when the payload rounds itself; local names tagged with t.
     Names a payload's prologue defines must not clash with the other payload's in a pair.
-    A pair is loop-versioned (VERSION_PAIRS): the tensor a workgroup decodes is fixed for its whole run (%G2 < 512:
+    A pair is loop-versioned: the tensor a workgroup decodes is fixed for its whole run (%G2 < 512:
     gate), so the K loop and the epilogue run in one of two copies, each holding one payload's carried values and
-    decode (registers near a single payload's, code twice), under a result-free scf.if; R5_PAIRIF=1: the scf.if per
-    phase.
+    decode (registers near a single payload's, code twice), under a result-free scf.if.
     f, rows, part: geom's (the swap's F, the host block order, the overlap half's decode part)."""
     with geom(f, rows, part):
         return _fuse_f(text, n, nwg, lanes, pay)
@@ -458,7 +421,7 @@ def _fuse_f(text, n, nwg, lanes, pay):
     extra = []
     for p in pays:
         extra += [_bufname(b) for b in p.buffers if _bufname(b) not in extra]
-    if len(pays) == 1 or not VERSION_PAIRS:
+    if len(pays) == 1:
         return _fuse(text, n, pays, nin, extra)
     g = _fuse(text, n, pays[:1], nin, extra, mark=True).rstrip("\n").split("\n")
     u = _fuse(text, n, pays[1:], nin, extra, mark=True).rstrip("\n").split("\n")
@@ -474,7 +437,6 @@ def _fuse_f(text, n, nwg, lanes, pay):
     return "\n".join(out) + "\n"
 
 
-VERSION_PAIRS = os.environ.get("R5_PAIRIF") != "1"
 MARK = "  // r5: frame prologue end"
 
 
@@ -521,10 +483,7 @@ def _fuse(text, n, pays, nin, extra, mark=False):
     D = []
     _decode(D.append, pays, [c.replace("%dz_", "%") for c in cur], "    ")
     D = _pre(D)
-    if os.environ.get("R5_LDTOP") == "1":   # (diag) the next phase's loads at the top of the phase
-        L = L[:ki] + P + L[ki:ki + 1] + NX + L[ki + 1:b2 - 1] + D + L[b2 - 1:]
-    else:
-        L = L[:ki] + P + L[ki:b2 - 1] + D + L[b2 - 1:ri] + NX + L[ri:]
+    L = L[:ki] + P + L[ki:b2 - 1] + D + L[b2 - 1:ri] + NX + L[ri:]
     return "\n".join(L) + "\n"
 
 
