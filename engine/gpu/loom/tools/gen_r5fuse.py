@@ -35,22 +35,26 @@ SB = 144 * KS                 # 4608 B a slab
 PHASES = 40                   # the GEMM's K phases (K / 128)
 LANES, WGS = 512, 512         # decode lanes a workgroup, workgroups that decode
 HORDER = None                 # (host block order) the swap image's rows' first blocks, e.g. (0, 2, 1, 3); None: in order
+PART = None                   # (two-chunk overlap) 0 / 1: this carrier decodes workgroups G of [PART F / 32, ..) only
 FS_OK = (8192, 8704)          # (F whole 64-row M blocks of 32 gate + 32 up rows, F / 16 even)
 
 
 @contextlib.contextmanager
-def geom(f=None, rows=None):
-    """F (None: 8192) and the host block order (None: blocks in order) for the generators below."""
-    global F, NACT, WGS, HORDER
-    old = F, NACT, WGS, HORDER
+def geom(f=None, rows=None, part=None):
+    """F (None: 8192), the host block order (None: blocks in order) and the decode's part (None: all; 0 / 1: the
+    two-chunk overlap's halves, F / 32 decoding workgroups each, part 1's from G F / 32 on) for the generators below."""
+    global F, NACT, WGS, HORDER, PART
+    old = F, NACT, WGS, HORDER, PART
     f = f or 8192
     assert f in FS_OK and f // 16 % 2 == 0, f
     assert rows is None or sorted(rows) == [0, 1, 2, 3], rows
-    F, NACT, WGS, HORDER = f, 2 * f * KB // 40, f // 16, tuple(rows) if rows is not None else None
+    assert part in (None, 0, 1), part
+    h = 1 if part is None else 2
+    F, NACT, WGS, HORDER, PART = f, 2 * f * KB // 40 // h, f // 16 // h, tuple(rows) if rows is not None else None, part
     try:
         yield
     finally:
-        F, NACT, WGS, HORDER = old
+        F, NACT, WGS, HORDER, PART = old
 
 
 def block_pos(blk):
@@ -103,13 +107,19 @@ def _frame_prologue(e, n, nin, nout):
         e(f"  %{nm} = index.constant {v} : index")
     if HORDER is not None:
         e(f"  %cnbr = index.constant {F // 128} : index")
+    if PART:
+        e(f"  %cpart = index.constant {F // 32} : index")
     e("  %wv = buffer.view %dz_w_na[%base] : buffer -> view<[%nin]xi8>")
     e("  %ov = buffer.view %dz_out_na[%base] : buffer -> view<[%nout]xi8>")
     e("  %L0 = index.mul %stg_lin, %lanes : index")
     e("  %L = index.add %L0, %tid : index")
     e("  %act = index.cmp ult, %L, %cact : index")
     # the workgroup and lane from the workgroup id and tid (scalar record base); inactive workgroups clamp to 511
-    e("  %Gc = index.min %stg_lin, %c511u : index")
+    if PART:   # (part 1: the second half of the workgroups' row groups)
+        e("  %Gc0 = index.min %stg_lin, %c511u : index")
+        e("  %Gc = index.add %Gc0, %cpart : index")
+    else:
+        e("  %Gc = index.min %stg_lin, %c511u : index")
     e("  %tl = index.add %tid, %c0 : index")
     e("  %ww = index.div %tl, %c32 : index")
     e("  %Ll = index.rem %tl, %c32 : index")
@@ -415,7 +425,7 @@ def _decode(e, pays, carried, ind):
         e(ind + ln)
 
 
-def fuse(text, n, nwg, lanes, pay=None, f=None, rows=None):
+def fuse(text, n, nwg, lanes, pay=None, f=None, rows=None, part=None):
     """The GEMM text (n rows a tensor in the full shape, nwg workgroups of lanes lanes) with the decode in its decoder
     section: buffer arguments appended to its launch (the raw weights %dz_w, any payload buffers, the stream
     %dz_out), the prologue before its K loop, phase p's record decoded from the values loaded at phase p - 1 (the
@@ -436,8 +446,8 @@ def fuse(text, n, nwg, lanes, pay=None, f=None, rows=None):
     gate), so the K loop and the epilogue run in one of two copies, each holding one payload's carried values and
     decode (registers near a single payload's, code twice), under a result-free scf.if; R5_PAIRIF=1: the scf.if per
     phase.
-    f, rows: geom's (the swap's F, the host block order)."""
-    with geom(f, rows):
+    f, rows, part: geom's (the swap's F, the host block order, the overlap half's decode part)."""
+    with geom(f, rows, part):
         return _fuse_f(text, n, nwg, lanes, pay)
 
 
@@ -518,11 +528,11 @@ def _fuse(text, n, pays, nin, extra, mark=False):
     return "\n".join(L) + "\n"
 
 
-def lane_records(n, lanes=LANES, f=None, rows=None):
+def lane_records(n, lanes=LANES, f=None, rows=None, part=None):
     """Every (lane, phase) record offset and raw load address of the kernel's index math, unclamped (numpy): the
     bounds and the coverage before any run. Returns (records, header loads, qs loads), each [NACT][PHASES].
-    f, rows: geom's."""
-    with geom(f, rows):
+    f, rows, part: geom's (a part: its lanes only; parts 0 and 1 together: the whole stream once)."""
+    with geom(f, rows, part):
         return _lane_records(n, lanes)
 
 
@@ -530,7 +540,7 @@ def _lane_records(n, lanes):
     import numpy as np
     import bfp16_check as BC
     Lv = np.arange(NACT)
-    Gw, tl = Lv // lanes, Lv % lanes
+    Gw, tl = Lv // lanes + (PART or 0) * (F // 32), Lv % lanes
     ww, Ll = tl // 32, tl % 32
     bb, r16 = Ll // 16, Ll % 16
     jp, whi = ww // 2, ww % 2
