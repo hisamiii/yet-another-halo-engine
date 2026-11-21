@@ -139,6 +139,7 @@ class LoomPrefill {
 
   [[nodiscard]] std::uint32_t chunk() const { return B_; }
   // the caller's chunk: 2 B with YAH_PP_HALVES (two halves of this set's B), else B
+  [[nodiscard]] std::size_t carriers(std::uint32_t h) const { return carriers_[h]; }   // carrier dispatches, half h
   [[nodiscard]] std::uint32_t chunk_tokens() const { return halves_ ? 2 * B_ : B_; }
   [[nodiscard]] std::uint32_t context() const { return T_; }
   [[nodiscard]] bool paged() const { return kv_paged_; }
@@ -156,7 +157,8 @@ class LoomPrefill {
   [[nodiscard]] NpuPlan npu_plan() const {
     NpuPlan p = NpuPlanOne();
     if (halves_) {
-      if (R5Fuse()) throw LoomError("YAH_PP_HALVES: the r5 carriers' halves are not built yet (emit YAH_NPU_R5CAR=0)");
+      if (R5Fuse() && !R5Part())
+        throw LoomError("YAH_PP_HALVES: whole r5 carriers do not split by half (emit YAH_NPU_R5PART=1 or YAH_NPU_R5CAR=0)");
       if (PanelQ()) throw LoomError("YAH_PP_HALVES: YAH_NPU_PANELQ is not built for halves");
       p.a_bytes = 2 * HalfA(p) + SwapAll(), p.w_bytes = 2 * Up4k(p.w_bytes), p.c_bytes = 2 * Up4k(p.c_bytes);
     }
@@ -478,7 +480,7 @@ class LoomPrefill {
     if (npu_attn_ && ci >= na_from_) ++na_seq_;  // the layers' ready / done values (words are reused per chunk)
     flagged_.clear();
     npu_job_ = 0, npu_cleared_ = 0, npu_joined_ = 0;
-    swap_layer_.clear(), swap_reader_ = -1;   // (halves: a chunk's job indices start again; its graph runs after the last)
+    swap_layer_.clear(), swap_reader_[0] = swap_reader_[1] = -1, part_done_[0] = part_done_[1] = -1;   // (halves: a chunk's job indices start again; its graph runs after the last)
     job_side_.clear();
     NewGraph();
     // Layer 0 goes first in a graph of its own, so the GPU runs it while the host records the other layers. The split
@@ -1414,6 +1416,15 @@ class LoomPrefill {
     static const std::string sfx = ".af.to.r5.npu.hal";
     for (const auto& kv : geom_)
       if (kv.first.size() > sfx.size() && kv.first.compare(kv.first.size() - sfx.size(), sfx.size(), sfx) == 0) return true;
+    return R5Part();
+  }
+  // (YAH_PP_HALVES=2) tile's part carriers (emit YAH_NPU_R5PART, gen_r5fuse part=): "<carrier>.af.to.r5..._p<h>.npu..."
+  // decodes half the next layer's stream (part 0: gate rows, part 1: up rows); half h's GEMM runs part h, so the two
+  // halves' GEMMs of layer k together write layer k + 1's stream. Without HALVES=2 the set's layers decode standalone.
+  bool R5Part() const {
+    if (!RSwapOn()) return false;
+    for (const auto& kv : geom_)
+      if (kv.first.find(".af.to.r5") != std::string::npos && kv.first.find("_p0.npu") != std::string::npos) return true;
     return false;
   }
   // the swap image's weight M blocks (64 stream rows of 5120 x 9 / 8 B) a call: 32 = 1024 features (emit_prefill_pp
@@ -1468,8 +1479,11 @@ class LoomPrefill {
   // (R5Fuse) layer k's split carries layer k + 1's decode: the set has that fused split
   std::string R5Hal(std::size_t k) const {
     if (k + 1 >= r5_.size() || r5_[k].carrier.empty() || !r5_[k + 1].payok) return "";
+    static const bool part = R5Part();
+    if (part && halves_ != 2) return "";
     const std::string h = r5_[k].carrier + ".af.to.r5" + r5_[k + 1].pay +
-                          (SwapTag(r5_[k + 1].f).empty() ? "" : "_f" + SwapTag(r5_[k + 1].f).substr(1)) + ".npu" +
+                          (SwapTag(r5_[k + 1].f).empty() ? "" : "_f" + SwapTag(r5_[k + 1].f).substr(1)) +
+                          (part ? "_p" + std::to_string(half_) : std::string()) + ".npu" +
                           (SwapTag(r5_[k].f).empty() ? "" : "_n" + SwapTag(r5_[k].f).substr(1)) + ".hal";
     return geom_.count(h) ? h : "";
   }
@@ -1772,7 +1786,8 @@ class LoomPrefill {
       const std::string cx = ".af.to.npu" + (F == F0 ? std::string() : "_n" + std::to_string(F)) + ".hal";
       const bool can = shape && cs.size() > cx.size() && cs.compare(cs.size() - cx.size(), cx.size(), cx) == 0;
       const bool iq4 = std::strcmp(f.name, "iq4xs") == 0 && std::strcmp(fu.name, "iq4xs") == 0;
-      if (npu_planning_) {
+      // (halves: the planning pass records both halves; the swap layers are listed once)
+      if (npu_planning_ && std::none_of(r5_.begin(), r5_.end(), [&](const R5Layer& x) { return x.pre == pre; })) {
         r5_.push_back({pre, can ? cs.substr(0, cs.size() - cx.size()) : "", iq4 ? "" : "_" + std::string(f.name) + "_" + fu.name,
                        shape && tu->offset == tg->offset + tg->bytes, F});
         if (r5_.size() > 1 && !R5Hal(r5_.size() - 2).empty())
@@ -1783,6 +1798,7 @@ class LoomPrefill {
         r5h = R5Hal(r5k);
         carry = !r5h.empty();
         carried = r5k > 0 && !R5Hal(r5k - 1).empty();
+        if (npu_planning_ && halves_ && carried) Exe(R5Hal(r5k - 1));   // (halves: each half's part carriers)
       }
     }
     // (R5Fuse) the carried decode's bindings after the GEMM's: the next layer's gate + up, its grids, the stream half
@@ -1818,10 +1834,17 @@ class LoomPrefill {
       if (halves_ && !npu_planning_) {
         decoded = swap_layer_ == pre;
         if (!decoded) {
-          if (swap_reader_ >= 0 && static_cast<std::size_t>(swap_reader_) >= npu_joined_) NpuJoin(swap_reader_, false);
+          SlotFree(R5Fuse() ? r5k % 2 : 0);
           swap_layer_ = pre;
         }
       }
+      // (part carriers) layer k's stream comes from both halves' layer k - 1 GEMMs: this half's ready store goes after
+      // the other half's part in the in-order GPU queue, so wait for it to be recorded
+      if (carried && R5Part() && halves_ == 2 && !npu_planning_)
+        while (part_done_[1 - half_] < static_cast<std::int64_t>(r5k) - 1) {
+          if (baton_ && baton_->done[1 - half_]) throw LoomError("prefill: the other half ended before its part carrier");
+          YieldHalf();
+        }
       for (const auto& [t, x, gu] : {std::tuple<const core::TensorInfo*, const Fmt*, const char*>{tg, &f, "g"},
                                      {tu, &fu, "u"}}) {
         if (carried || decoded) break;
@@ -1910,7 +1933,7 @@ class LoomPrefill {
     }
     if (rswap) {
       NpuEnqueue(std::move(csw), "ffnswap", {{Ref(npu_->A()), Ref(npu_->W())}, Ref(npu_->C())});
-      swap_reader_ = last_job_;   // (halves: the stream's latest reader)
+      swap_reader_[R5Fuse() ? r5k % 2 : 0] = last_job_;   // (halves: the slot's latest reader)
     } else
       NpuEnqueue(std::move(csw), "ffnsw");
     // the down's K parts as one job when they run one image (no GPU work between them: a job boundary, ~120 us, saved;
@@ -1937,8 +1960,9 @@ class LoomPrefill {
       const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
       const std::string sym = "yah_ffn_gemm_" + std::string(f.name) + (tg->type != tu->type ? "_" + std::string(fu.name) : "") + "_ffn";
       std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
-      if (carry) r5_bind(b, wmask);
+      if (carry) r5_bind(b, wmask), SlotFree((r5k + 1) % 2);
       Dispatch(Exe(carry ? r5h : fh), sym.c_str(), (M - F) / 16 / g.rowgrp, tt, 1, 32, 1, 1, b, wmask);
+      if (carry) part_done_[half_] = static_cast<std::int64_t>(r5k), carriers_[half_] += !npu_planning_;
     } else if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
       RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
@@ -1950,10 +1974,11 @@ class LoomPrefill {
       for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
       const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
       std::uint64_t wmask = GemmWrites(b, f, {ffnup_});
-      if (carry) r5_bind(b, wmask);   // (R5Fuse) swap layer k + 1's NPU gate / up rows into the other stream half
+      if (carry) r5_bind(b, wmask), SlotFree((r5k + 1) % 2);   // (R5Fuse) swap layer k + 1's NPU rows, other half
       const std::string& gh = carry ? r5h : sh;
       Dispatch(Exe(gh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(gh).rowgrp, tt, 1,
                32, 1, 1, b, wmask);
+      if (carry) part_done_[half_] = static_cast<std::int64_t>(r5k), carriers_[half_] += !npu_planning_;
     }
     // down over them: f32 [tokens][5120]. With "npuffnrem_<fmt>_<kbw>_rr.hal" its residual epilogue adds hidden() (the
     // GPU waits for the NPU's down here anyway), so the sum after the NPU's down reads one f32 tensor less
@@ -3493,7 +3518,16 @@ class LoomPrefill {
   std::size_t npu_a0_ = 0, npu_w0_ = 0, npu_c0_ = 0;   // this half's A / W / C region starts
   std::size_t a_one_ = 0, w_one_ = 0, c_one_ = 0;      // one half's A / W / C region bytes
   std::string swap_layer_;                  // (shared) the layer whose swap weights the stream holds
-  std::int64_t swap_reader_ = -1;           // (shared) the last swap job (it reads the stream)
+  std::size_t carriers_[2] = {0, 0};        // carrier dispatches recorded per half (half 0 without halves), logged
+  std::int64_t part_done_[2] = {-1, -1};     // (shared, part carriers) each half's last recorded carrier's r5k
+  std::int64_t swap_reader_[2] = {-1, -1};  // (shared) each stream slot's last swap job (it reads the slot)
+  // (halves) before a write into stream slot s: its last reader joined (no handover: the other half must not record
+  // between); in HALVES=2 order it already is (the NPU queue runs it before this half's joined jobs), so this waits
+  // only if that order breaks
+  void SlotFree(std::size_t s) {
+    if (halves_ && !npu_planning_ && swap_reader_[s] >= 0 && static_cast<std::size_t>(swap_reader_[s]) >= npu_joined_)
+      NpuJoin(swap_reader_[s], false);
+  }
 #define YAH_PF_HALF(X)                                                                                                \
   X(hidden_) X(hidden2_) X(partial_) X(scratch_) X(qkv_) X(gate_) X(alpha_) X(beta_) X(ab_) X(q_) X(q16_) X(qr16_)     \
   X(kbuf_) X(vbuf_) X(kqbuf_) X(lse_) X(normt_) X(raw_) X(raw2_) X(conv_out_) X(ffnup_) X(gateffn_) X(ostage_)         \

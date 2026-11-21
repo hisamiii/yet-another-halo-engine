@@ -370,6 +370,7 @@ int main(int argc, char** argv) {
     std::fwrite(logit_host.data(), 4, logit_host.size(), fl);
     std::fclose(fl);
     std::printf("argmax=%u\n", tok);
+    if (pf.carriers(0) + pf.carriers(1)) std::printf("carriers: half 0 %zu, half 1 %zu\n", pf.carriers(0), pf.carriers(1));
 
     if (opt.gen > 0) {
       const std::uint32_t ngen = opt.gen;
