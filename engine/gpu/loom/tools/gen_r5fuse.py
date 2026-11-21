@@ -81,8 +81,9 @@ KEEP = {"kp", "tid", "stg_lin", "c0", "base"}
 VGPR_TRY = "208"
 
 
-def out_bytes():
-    return 2 * F * KB * 9
+def out_bytes(f=None):
+    """The stream's bytes at F f (None: the current geom's F; outside fuse / lane_records / geom pass f)."""
+    return 2 * (f or F) * KB * 9
 
 
 def in_bytes(n):
@@ -470,7 +471,7 @@ MARK = "  // r5: frame prologue end"
 def _fuse(text, n, pays, nin, extra, mark=False):
     """fuse's body for one payload or a per-phase pair; mark: MARK after the frame prologue (the versioned pair's
     split point)."""
-    nout = out_bytes()
+    nout = out_bytes(F)
     L = text.rstrip("\n").split("\n")
     assert sum("= scf.for %kp = [" in ln for ln in L) == 1
     li = next(i for i, ln in enumerate(L) if ln.startswith("} launch("))
