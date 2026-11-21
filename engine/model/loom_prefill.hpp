@@ -977,6 +977,8 @@ class LoomPrefill {
       dnsplit_a_ = ds->second.rowgrp, dnsplit_b_ = ds->second.tt;
       if (dnsplit_a_ + dnsplit_b_ != kTs || (dnsplit_a_ * B) % 8 || (dnsplit_b_ * B) % 8)
         throw LoomError("dispatch.txt dnsplit does not cover the DeltaNet heads");
+      // (YAH_DNC_GROUP) the first part as dispatches of <= g heads ("dnc_a_p<i>"): one workgroup a WGP
+      if (const auto dg = geom_.find("dncgroup"); dg != geom_.end()) dnc_group_ = dg->second.tokens;
       raw2_ = &Alloc(B * kInner * 4);
     }
     conv_out_ = &part(gate_host, B * kQkv * 4);
@@ -2907,7 +2909,18 @@ class LoomPrefill {
       const Geom& ga = geom_.at(da);
       const Geom& gb = geom_.at(db);
       if (ga.tokens != dnsplit_a_ || gb.tokens != dnsplit_b_) throw LoomError("prefill: dnc parts do not match dnsplit");
-      Dispatch(Exe(da), "yah_deltanet", 1, ga.tokens, 1, ga.rowgrp, 1, 1, ba, 0b11000000000);
+      if (dnc_group_) {   // (dncgroup) heads [0, a) in dispatches of <= g heads: the same kernel per workgroup
+        std::uint32_t h = 0;
+        for (std::uint32_t i = 0; h < dnsplit_a_; ++i) {
+          const std::string dp = QkvHal("dnc_a_p" + std::to_string(i), wqkv, nq);
+          const Geom& gp = geom_.at(dp);
+          if (gp.tokens != std::min(dnc_group_, dnsplit_a_ - h)) throw LoomError("prefill: " + dp + " does not match dncgroup");
+          Dispatch(Exe(dp), "yah_deltanet", 1, gp.tokens, 1, gp.rowgrp, 1, 1, ba, 0b11000000000);
+          h += gp.tokens;
+        }
+      } else {
+        Dispatch(Exe(da), "yah_deltanet", 1, ga.tokens, 1, ga.rowgrp, 1, 1, ba, 0b11000000000);
+      }
       Dispatch(Exe(db), "yah_deltanet", 1, gb.tokens, 1, gb.rowgrp, 1, 1, bb, 0b11000000000);
       dn_done = true;
     } else if (conv_c.length) {
@@ -3038,6 +3051,7 @@ class LoomPrefill {
   std::map<std::string, LoomExecutable> exes_;
   std::deque<LoomBuffer> keep_;  // stable addresses
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, dn_threads_ = 256, attn_hpw_ = 0, attn_tpw_ = 0;
+  std::uint32_t dnc_group_ = 0;   // (dispatch.txt "dncgroup") the first DeltaNet part's heads a dispatch
   std::uint32_t dnsplit_a_ = 0, dnsplit_b_ = 0;  // DeltaNet head split (dispatch.txt "dnsplit"; 0: one dispatch)
   std::uint32_t qrot_first_ = 0;  // first chunk whose attention reads yah_qrot's rotated Q (dispatch.txt "qrot")
   std::size_t deq_bytes_ = 0;

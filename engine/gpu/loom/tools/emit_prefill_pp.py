@@ -962,6 +962,9 @@ QJOB_ENV = {}   # per NPU image name: environment knobs of its generator only (n
 # gen_kq_bfp stream): the swap image reads bfp16 only, so it serves every format.
 # YAH_DNSSC (default on, with a qkv split and dnsplit): DeltaNet as gen_gdn_ss reading the NPU's v channels from C ("dnc_*")
 DNSSC = os.environ.get("YAH_DNSSC", "1") != "0"   # (default on; "0": the chunked form)
+# YAH_DNC_GROUP=<g> (DNSSC): the first dnsplit part also as dispatches of <= g heads ("dnc_a_p<i>"), so a 20-WGP GPU
+# runs one workgroup a WGP (dn40 is throughput-bound with two a WGP: 1029 vs dn8's 392 us a WG); dispatch.txt "dncgroup"
+DNC_GROUP = int(os.environ.get("YAH_DNC_GROUP", "0"))
 RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT", "1") != "0"   # (default on; "0": off)
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
@@ -1459,6 +1462,15 @@ def npu_split(rows, combos, B, outdir):
                                  "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
                                  "yah_deltanet.num_heads=48"], hal, outdir)
                     out.append((hal, nh, gen_gdn_ss.THREADS, 0))
+                    for i, p0 in enumerate(range(h0, h0 + nh, DNC_GROUP) if tag == "a" and DNC_GROUP and nh > DNC_GROUP else ()):
+                        # (YAH_DNC_GROUP) the same kernel over heads p0 .. p0 + g - 1: each workgroup's code unchanged
+                        hp, pn = "dnc_a_p%d%s.hal" % (i, sfx), min(DNC_GROUP, h0 + nh - p0)
+                        src = os.path.join(tmp, hp[:-4] + ".loom")
+                        open(src, "w").write(gen_gdn_ss.gen(list(range(p0, p0 + pn)), N - n, n // GN.TN, B))
+                        E.emit(src, ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
+                                     "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
+                                     "yah_deltanet.num_heads=48"], hp, outdir)
+                        out.append((hp, pn, gen_gdn_ss.THREADS, 0))
         if row:
             out.append(("npusplit%s_%s" % (sfx[1:], site), n, 0, 0))
     for site, n in sorted(NPU_SPLIT.items()):
@@ -2632,6 +2644,8 @@ def main():
                 open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
         geom.append(("dnsplit", 0, ha, hb))
+        if DNSSC and DNC_GROUP and "qkv" in NPU_SPLIT:
+            geom.append(("dncgroup", DNC_GROUP, 0, 0))
     geom.append(("convtb", gen_conv_kq.TB, 0, 0))
 
     # loom_forward_pp reads the launch geometry from dispatch.txt instead of recomputing the grid.
