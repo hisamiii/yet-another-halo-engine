@@ -1500,18 +1500,14 @@ class LoomNpu {
         out.insert(out.end(), w, w + 24), ++ops;
       }
     }
-    if (WriteMerge()) MergeWrites(out, ops);
+    MergeWrites(out, ops);
     const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
     std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
     return out;
   }
-  // (WriteMerge) A block write that continues the block write right before it (the next address, nothing between)
+  // A block write that continues the block write right before it (the next address, nothing between)
   // joins it: the same words in the same order, one operation less (a setup's operations cost ~61 ns each beside
-  // ~1.5 ns a byte; a switch's DMA descriptors are ~500 such neighbours: ~30 us a switch). YAH_NPU_WMERGE=0: off.
-  static bool WriteMerge() {
-    static const bool on = [] { const char* e = std::getenv("YAH_NPU_WMERGE"); return !e || std::strcmp(e, "0"); }();
-    return on;
-  }
+  // ~1.5 ns a byte; a switch's DMA descriptors are ~500 such neighbours: ~30 us a switch).
   static void MergeWrites(std::vector<std::uint8_t>& out, std::uint32_t& ops) {
     std::vector<std::uint8_t> m(out.begin(), out.begin() + 16);
     std::size_t last = 0;   // the last operation in m when it is a block write (its offset), else 0

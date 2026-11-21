@@ -1884,17 +1884,12 @@ class LoomPrefill {
       if (!panel)
         Dispatch(Exe("npu_swpanel.hal"), "yah_bfp16_encode_wgt", (gp.tokens + gp.rowgrp - 1) / gp.rowgrp, 1, 1,
                  gp.rowgrp, 1, 1, {Ref(*normt_), WRef(0, gp.tt)}, 2);
-      // (diag) YAH_NPU_RSWAP_BOUTER=1: calls b-outer, t-inner (a weight block's token panels back to back: its reads
-      // after the first can hit the MALL; the panel changes every call); the default t-outer keeps a panel 8 / bpc calls
-      static const bool bouter = std::getenv("YAH_NPU_RSWAP_BOUTER") != nullptr;
-      // (diag, wrong output) YAH_NPU_RSWAP_DIAG=a0: every call reads weight block 0's A (a bound on fresh-stream reads)
-      static const bool a0 = [] { const char* e = std::getenv("YAH_NPU_RSWAP_DIAG"); return e && std::strcmp(e, "a0") == 0; }();
       const std::uint32_t nt = B_ / 512;
       for (std::uint32_t i = 0; i < nt * nbk; ++i) {
-        const std::uint32_t t = bouter ? i % nt : i / nbk, b = bouter ? i / nt : i % nbk;   // (call b: units uc b ..)
+        const std::uint32_t t = i / nbk, b = i % nbk;   // (call b: units uc b ..)
           // (FfnBlkFront: H's real units from the first part's pads on)
           const std::uint32_t j = uc * b, hf = FfnBlkFront(F) ? parts[0].p - parts[0].r : 0;
-          csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs" + SwapTag(F) + ".xdna", {sa + (a0 ? 0 : b) * bw.a, bw.a},
+          csw.push_back(npu_->BindSwap(dir_ + "/npu_ffnswap_iq4xs" + SwapTag(F) + ".xdna", {sa + b * bw.a, bw.a},
                                        HW({t * bw.w, bw.w}),
                                        HC({j / qu * qpart + std::size_t{j % qu + hf} * 18432 + std::size_t{8} * t * qu * 18432,
                                            std::size_t{nbk == 1 ? 8 * qu - hf : 7 * qu + uc} * 18432})));
