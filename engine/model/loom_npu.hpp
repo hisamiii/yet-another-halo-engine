@@ -1201,6 +1201,12 @@ class LoomNpu {
     static const bool on = std::getenv("YAH_NPU_PROF_MID") != nullptr;
     return on;
   }
+  // (diag, YAH_NPU_PROF_MID) each READ_REGS record's kind as commands are built, in log order: S after a family
+  // switch's setup, P / G before a job's gate (P: after the first call's split lead), D after its done
+  static void RecMap(char kind, const Kernel* k) {
+    if (!ProfMid()) return;
+    std::fprintf(stderr, "npu recmap: %c %s\n", kind, k->path.substr(k->path.find_last_of('/') + 1).c_str());
+  }
   void CheckHealth() {
     std::lock_guard<std::mutex> lock(mu_);
     if (!failure_.empty()) throw LoomError(failure_);
@@ -1995,7 +2001,7 @@ class LoomNpu {
             ds.swap(o);
           }
           append(ds);
-          if (ProfMid() && prof_) append_ops(prof_->Read(), 1);
+          if (ProfMid() && prof_) append_ops(prof_->Read(), 1), RecMap('S', k0);
         }
         lane_lost_ = false;
         fam = FamilyOf(k0), dec = k0->dec;
@@ -2004,7 +2010,7 @@ class LoomNpu {
       const Call& c0 = *calls[0];
       const bool pre = c0.k->streamed && !c0.lead_pre.empty() && !(c0.k->swap && c0.k->dec != dec);
       if (pre) append(c0.lead_pre);
-      if (ProfMid() && prof_) append_ops(prof_->Read(), 1);
+      if (ProfMid() && prof_) append_ops(prof_->Read(), 1), RecMap(pre ? 'P' : 'G', c0.k);
       append(calls[0]->gate);
       if (prof_) append_ops(prof_->Setup(calls[0]->k->path), prof_->SetupOps());
       const int panel = calls[0]->k->panel;   // (a later panel's first call after its go)
@@ -2015,7 +2021,7 @@ class LoomNpu {
         }
         append(calls.back()->done);
         remember(calls);
-        if (prof_) append_ops(prof_->Read(), 1);
+        if (prof_) append_ops(prof_->Read(), 1), RecMap('D', calls[0]->k);
         continue;
       }
       const Call* pend = nullptr;   // (early push) the call whose wait waits for the next call's push_pre
@@ -2071,7 +2077,7 @@ class LoomNpu {
         }();
         append_ops(w, static_cast<std::uint32_t>(w.size() / 24));
       }
-      if (prof_) append_ops(prof_->Read(), 1);
+      if (prof_) append_ops(prof_->Read(), 1), RecMap('D', calls[0]->k);
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);

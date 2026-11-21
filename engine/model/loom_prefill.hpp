@@ -240,6 +240,14 @@ class LoomPrefill {
   void ReportNpuProf() {
     NpuProf* const prof = npu_ ? npu_->Prof() : nullptr;
     if (!prof || prof_tags_.empty()) return;
+    if (std::getenv("YAH_NPU_PROF_MID")) {   // (diag) every record in log order (npu recmap: their kinds)
+      prof->Finish(0);
+      const std::vector<std::uint32_t> v = prof->Peek();
+      for (std::size_t r = 0; r * prof->Values() < v.size(); ++r)
+        std::fprintf(stderr, "npu prof: rec %zu %u %u %u\n", r, v[r * prof->Values()],
+                     v[r * prof->Values() + prof->Values() - 2], v[r * prof->Values() + prof->Values() - 1]);
+      return;
+    }
     const std::vector<std::uint32_t> v = prof->Finish(prof_tags_.size());
     std::fprintf(stderr, "npu prof: events %s\n", std::getenv("YAH_NPU_PROF"));
     for (std::size_t i = 0; i < prof_tags_.size(); ++i) {
