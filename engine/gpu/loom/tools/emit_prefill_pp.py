@@ -966,6 +966,10 @@ DNSSC = os.environ.get("YAH_DNSSC", "1") != "0"   # (default on; "0": the chunke
 # runs one workgroup a WGP (dn40 is throughput-bound with two a WGP: 1029 vs dn8's 392 us a WG); dispatch.txt "dncgroup"
 DNC_GROUP = int(os.environ.get("YAH_DNC_GROUP", "0"))
 RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT", "1") != "0"   # (default on; "0": off)
+# YAH_NPU_R5CAR=0: no r5 carriers (the FFN splits that decode the next swap layer's stream, gen_r5fuse); the engine
+# then decodes every swap layer with the standalone decoders (R5Hal ""). For B 1024 until the carriers take a half's
+# grid (gen_r5fuse needs F / 16 workgroups; a B 1024 split has 288).
+R5CAR = os.environ.get("YAH_NPU_R5CAR", "1") != "0"
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
 R5_VTRY = "208,200,192"
@@ -1785,7 +1789,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     mixed = [l for l in pairs if l["ffn_gate"][0] == l["ffn_up"][0] in NPU_SAME_SW or colpair(l)]
     bsw = [l for l in pairs if l not in mixed]
     bfp_pair_rows({"blk.%s." % n for n, l in by.items() if l in bsw}, F, outdir)
-    if RSWAP_EMIT and FS == gen_r5fuse.F:
+    if RSWAP_EMIT and R5CAR and FS == gen_r5fuse.F:
         r5_carriers(by, F, last, split)
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
@@ -1795,7 +1799,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
                 for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), FS)
-                    if RSWAP_EMIT and fmt == "iq4xs" and sfx == ".af.to.hal" and FS == gen_r5fuse.F and kb == 20:
+                    if RSWAP_EMIT and R5CAR and fmt == "iq4xs" and sfx == ".af.to.hal" and FS == gen_r5fuse.F and kb == 20:
                         # (row 5 swap) the same split decoding another layer's NPU gate / up rows into the swap's
                         # stream ("<hal>.af.to.r5.npu.hal", gen_r5fuse); its .fp dz_w: both tensors' raw rows
                         E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5" % (fmt, mt, kb)] = {"dz_w": mt * 16 * 2 * gen_r5fuse.RBG}
@@ -1820,7 +1824,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                              "npu_ffnsw_%s_%s" % (fmt, hord.lower()), 5 if np5 else 4))
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 if RSWAP_EMIT and fmt == "iq4xs" and not np5 and hord == "P4":
-                    assert B == 2048 and FS % 1024 == 0 and all(u[2] % 4 == 0 for u in ffnblk_units(FS))
+                    assert B % 512 == 0 and FS % 1024 == 0 and all(u[2] % 4 == 0 for u in ffnblk_units(FS))   # (a call: one 512-token panel)
                     assert RSWAP_NB % 32 == 0 and RSWAP_NB <= (FS // 32 if AHORD else 256) and FS // 32 % RSWAP_NB == 0, RSWAP_NB
                     jobs.append((GN.Config(NPU_COLS, RSWAP_NB, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
                                            rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
