@@ -115,7 +115,7 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcsw
         if gcswap:   # (swap form) the base clamped to the largest real one, for the bound proof
             assert gcswap % 64 == 0 and gc <= gcswap and B % 512 == 0
             gb = GU.swapc_base(sub.append, "gs_", "%gnc", "%tok", gcswap)
-            sub.append(f"  %gclast = index.constant {swapc_last(B, gc, gcswap)} : index")
+            sub.append(f"  %gclast = index.constant {GU.swapc_last(B, gc, gcswap)} : index")
             sub.append(f"  %gca = index.min {gb}, %gclast : index")
             GU.load_c(sub.append, "%gcv", "%gca")
         else:
@@ -216,15 +216,3 @@ def gen(B, h0, nh, ks, passes, tiled=False, gate16=True, bfp=True, gc=None, gcsw
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
-
-
-def swapc_last(B, n, R):
-    """The largest swapc_base over features 0, 8, .., n - 8 and tokens 0 .. B - 1 (its 8 elements stay in B R)."""
-    import numpy as np
-    f = np.arange(0, n, 8)[:, None]
-    t = np.arange(B)[None, :]
-    rb, c, t8 = f // 8, (t % 512) // 64, (t % 64) // 8
-    b = t // 512 * R * 512 + 64 * (c * R + (rb // 2) * 16 + (t8 // 2) * 4 + (rb % 2) * 2 + t8 % 2) + t % 8 * 8
-    m = int(b.max())
-    assert m + 8 <= B * R, (m, B, R)
-    return m

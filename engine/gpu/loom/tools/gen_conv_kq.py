@@ -254,20 +254,22 @@ def cw(n):
     return CW if n % CW == 0 else 128
 
 
-def gen_c(first, cols, batch, qkv_dim=10240):
+def gen_c(first, cols, batch, qkv_dim=10240, swap=None):
     """yah_ssm_conv_kq_c: the conv for the v channels first .. first + cols * TN - 1 of a NPU qkv split, its input
     read straight from the NPU's C. Bit-identical to the f16 unpack (gen_npu_unpack) + gen.
     A workgroup takes CW channels x TC tokens. Staging: lanes take the unpack's work items (8 C columns of one token,
     token fastest, so a wave reads whole 128-byte C blocks), sum the C partials and round to f16 with the unpack's ops,
     into LDS as [token][channel], for the TC tokens and the 8 before them. Then lane = channel: its weights and the
     window in registers, the conv as gen, f16 out.
-    Bindings: c (bf16 pairs), conv_weights, state (as gen), conv_out (f16 [batch][qkv_dim])."""
+    Bindings: c (bf16 pairs), conv_weights, state (as gen), conv_out (f16 [batch][qkv_dim]).
+    swap = R: C is a swap-form site image's (R rows, gen_npu_unpack.swapc_base, one value an element)."""
     import gen_npu_gemm as GN
     import gen_npu_unpack as GU
     n = cols * GN.TN
     CW = cw(n)
     assert n % CW == 0 and batch % TC == 0 and first >= 4096   # v channels only
-    nwords = batch * n * GU.CG // 2
+    assert not swap or (batch % 512 == 0 and n <= swap)
+    nwords = batch * swap // 2 if swap else batch * n * GU.CG // 2
     rows = TC + 8   # LDS rows: tokens t0 - 8 .. t0 + TC - 1
     items = CW // 8   # 8-column items per token row
     L = []
@@ -315,8 +317,11 @@ def gen_c(first, cols, batch, qkv_dim=10240):
     e("  %it = index.div %lane, %c8 : index")
     e("  %itc0 = index.mul %it, %c8 : index")
     e("  %itc = index.add %nc0, %itc0 : index")   # the item's first NPU column
-    la = GU.c_lane(e, "cl_", "%itc", batch)
-    e(f"  %nel = index.constant {2 * nwords - (GU.CG - 1) * batch * GN.TN - 8} : index")   # last group-0 item start
+    if swap:
+        e(f"  %nel = index.constant {GU.swapc_last(batch, n, swap)} : index")   # the last item start
+    else:
+        la = GU.c_lane(e, "cl_", "%itc", batch)
+        e(f"  %nel = index.constant {2 * nwords - (GU.CG - 1) * batch * GN.TN - 8} : index")   # last group-0 item start
     e("  %t0m8 = index.max %t0, %c8 : index")
     e("  %tlo = index.sub %t0m8, %c8 : index")
     for g in range(rows // 8):
@@ -328,10 +333,15 @@ def gen_c(first, cols, batch, qkv_dim=10240):
             e(f"  %{p}g = index.constant {8 * (g - 1)} : index")
             e(f"  %{p}t0 = index.add %t0, %{p}g : index")
         e(f"  %{p}tk = index.add %{p}t0, %tr : index")
-        tb = GU.c_tok(e, f"{p}k_", f"%{p}tk")
-        e(f"  %{p}i0 = index.add {la}, {tb} : index")
-        e(f"  %{p}i = index.min %{p}i0, %nel : index")   # in range by construction; for the bound proof
-        GU.load_cg(e, f"%{p}v", f"%{p}i")
+        if swap:
+            sb = GU.swapc_base(e, f"{p}w_", "%itc", f"%{p}tk", swap)
+            e(f"  %{p}i = index.min {sb}, %nel : index")   # in range by construction; for the bound proof
+            GU.load_c(e, f"%{p}v", f"%{p}i")
+        else:
+            tb = GU.c_tok(e, f"{p}k_", f"%{p}tk")
+            e(f"  %{p}i0 = index.add {la}, {tb} : index")
+            e(f"  %{p}i = index.min %{p}i0, %nel : index")   # in range by construction; for the bound proof
+            GU.load_cg(e, f"%{p}v", f"%{p}i")
         e(f"  %{p}h = vector.fptrunc %{p}v : vector<8xf32> to vector<8xf16>")
         e(f"  %{p}r = index.add %tr, %{p}o : index")
         e(f"  %{p}a0 = index.mul %{p}r, %ccw : index")

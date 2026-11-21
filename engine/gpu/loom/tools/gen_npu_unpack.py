@@ -28,7 +28,7 @@ def wg(cols):
 
 
 def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=False, tiled=False, qg=False, rem=False,
-        bfp=None, last8=False, dup=None, remres=False):
+        bfp=None, last8=False, dup=None, remres=False, swap=None):
     """resid: out = resid + C (f32; bindings c, resid, out), the kres GEMMs. parts: C is that many consecutive partial C
     blocks (the K chunks of one GEMM), summed in order. swiglu: C is the gate block then the up block; out =
     f16(silu(gate) * up) with the swiglu epilogue's scalar ops. tiled: f16 out fragment-major ([token / 16][column / 16]
@@ -45,7 +45,10 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     (the last call, which overlaps the one before it) go to out column base + (col - col0) * TN + 8 j (the overlapped
     columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K.
     remres (with resid and rem): rem already holds resid + the GPU's partial (its GEMM's residual epilogue): out = rem +
-    the C chunks' sum (bindings c, rem, out), a summation order of its own."""
+    the C chunks' sum (bindings c, rem, out), a summation order of its own.
+    swap = R (with last8 and out16 only): C is a swap-form site image's (R rows, swapc_base, one value an element)."""
+    assert not swap or (last8 and out16 and parts == 1 and not (resid or rem or swiglu or tiled or qg or bfp or dup)
+                        and tokens % 512 == 0 and cols * GN.TN <= swap)
     assert not remres or (resid and rem)
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
     assert not bfp or swiglu
@@ -86,7 +89,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     else:
         e("} launch(%c: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
-    e(f"  %nc = index.constant {c_elems * nblk // 2} : index")   # bf16 pairs
+    e(f"  %nc = index.constant {tokens * swap // 2 if swap else c_elems * nblk // 2} : index")   # bf16 pairs
     e(f"  %no = index.constant {tokens * stride} : index")
     if remres:
         e("  %c_na, %rem_na, %out_na = buffer.assume.noalias %c, %rem, %out : buffer, buffer, buffer")
@@ -169,7 +172,6 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %a7 = index.mul %row, %c8 : index")
     e("  %a8 = index.add %a6, %a7 : index")
     e("  %a9 = index.mul %tile, %ctile : index")
-    e("  %ca = index.add %a9, %a8 : index")
     # out: token blk * 64 + r, column col * TN + 8 * j + off
     e("  %t0 = index.mul %blk, %c64 : index")
     e("  %tok = index.add %t0, %r : index")
@@ -217,8 +219,16 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     else:
         e("  %tb = index.mul %tok, %cstride : index")
         e("  %oa = index.add %tb, %jo : index")
-    e(f"  %cgs = index.constant {tokens * TN} : index")   # group stride inside a column
-    load_cg(e, "%v", "%ca")
+    if swap:   # (swap form) one value per element: the item's feature 8 jg, its base clamped for the bound proof
+        e("  %fe = index.mul %jg, %c8 : index")
+        sb = swapc_base(e, "sw_", "%fe", "%tokg", swap)
+        e(f"  %calast = index.constant {swapc_last(tokens, cols * TN, swap)} : index")
+        e(f"  %ca = index.min {sb}, %calast : index")
+        load_c(e, "%v", "%ca")
+    else:
+        e("  %ca = index.add %a9, %a8 : index")
+        e(f"  %cgs = index.constant {tokens * TN} : index")   # group stride inside a column
+        load_cg(e, "%v", "%ca")
     val = "%v"
     for p in range(1, parts):   # the K chunks' partial sums
         e(f"  %cpo{p} = index.constant {p * c_elems} : index")
@@ -476,6 +486,23 @@ def swapc_base(e, p, nc, tok, R):
     e(f"  %{p}s4 = index.add %{p}s3, %{p}f0 : index")
     e(f"  %{p}base = index.add %{p}s4, %{p}f1 : index")
     return f"%{p}base"
+
+
+def swapc_last(B, n, R):
+    """The largest swapc_base over features 0, 8, .., n - 8 and tokens 0 .. B - 1 (its 8 elements stay in B R)."""
+    import numpy as np
+    f = np.arange(0, n, 8)[:, None]
+    t = np.arange(B)[None, :]
+    rb, c, t8 = f // 8, (t % 512) // 64, (t % 64) // 8
+    b = t // 512 * R * 512 + 64 * (c * R + (rb // 2) * 16 + (t8 // 2) * 4 + (rb % 2) * 2 + t8 % 2) + t % 8 * 8
+    m = int(b.max())
+    assert m + 8 <= B * R, (m, B, R)
+    return m
+
+
+def swap_rows(n):
+    """The swap-form site image's rows R for n real NPU rows (emit_prefill_pp SWSITE: nb = ceil(n / 256) 4, R = 64 nb)."""
+    return -(-n // 256) * 256
 
 
 def load_cg(e, dst, idx):

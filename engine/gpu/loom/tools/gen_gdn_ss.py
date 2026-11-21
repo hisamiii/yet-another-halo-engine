@@ -53,14 +53,15 @@ POOLC = VP + 7 * 136 * 2
 assert POOLC <= 65536
 
 
-def gen(heads, cfirst=None, ccols=0, batch=0):
+def gen(heads, cfirst=None, ccols=0, batch=0, swap=None):
     """cfirst (with ccols NPU columns, batch tokens): a NPU qkv split's form, the v channels cfirst .. 10239 read from
     the NPU's C (binding cbuf after out, gen_conv_kq.gen_c's addressing and the unpack's ops: bit-identical to the
     unpacked f16 x), staged per chunk in LDS (VS / VP) with x's for the GPU's heads; the conv reads its taps from there.
     O as f32 [batch][inner_size] at head h's own columns 128 h .. (gen_gdn_chunk's output, the
     plain postnorm's input), stored from the accumulators (no staging), and the v conv with gen_gdn_chunk's ops and V
     rounded to f16 as its Vt: one chaotic gate token (window 06) fails gate N with the fma / exp2 form (mean KL 2.45e-6
-    vs 1.06e-6)."""
+    vs 1.06e-6).
+    swap = R (with cfirst): C is a swap-form site image's (R rows, gen_npu_unpack.swapc_base, one value an element)."""
     L = []
     e = L.append
     nh = len(heads)
@@ -150,14 +151,16 @@ def gen(heads, cfirst=None, ccols=0, batch=0):
     if cfirst:
         import gen_npu_gemm as GN
         import gen_npu_unpack as GU
-        nwords = batch * ccols * GN.TN * GU.CG // 2
+        assert not swap or (batch % 512 == 0 and ccols * GN.TN <= swap)
+        nwords = batch * swap // 2 if swap else batch * ccols * GN.TN * GU.CG // 2
         o = region("vs", VS)
         e(f"  %vs = buffer.view %pool[{o}] : buffer -> view<32x136xf16>")
         o = region("vp", VP)
         e(f"  %vp = buffer.view %pool[{o}] : buffer -> view<7x136xf16>")
         e(f"  %nc = index.constant {nwords} : index")
         e(f"  %cgs = index.constant {batch * GN.TN} : index")
-        e(f"  %nel = index.constant {2 * nwords - (GU.CG - 1) * batch * GN.TN - 8} : index")
+        nel = GU.swapc_last(batch, ccols * GN.TN, swap) if swap else 2 * nwords - (GU.CG - 1) * batch * GN.TN - 8
+        e(f"  %nel = index.constant {nel} : index")
         e(f"  %cfirst = index.constant {cfirst} : index")
         e("  %c16i = scalar.constant 16 : i32")
         e("  %chii = scalar.constant -65536 : i32")
@@ -543,20 +546,24 @@ def gen(heads, cfirst=None, ccols=0, batch=0):
             e(f"    %sm{i}ch = index.add %sm{i}a, %sm{i}c : index")
             e(f"    %sm{i}m = index.max %sm{i}ch, %cfirst : index")
             e(f"    %sm{i}n = index.sub %sm{i}m, %cfirst : index")
-            las.append(GU.c_lane(e, f"sl{i}_", f"%sm{i}n", batch))
+            las.append(f"%sm{i}n" if swap else GU.c_lane(e, f"sl{i}_", f"%sm{i}n", batch))
         return las
 
     def stage_load(I, las):
         """(cfirst) this chunk's items: C words (both replay groups) and x's f16, in flight until stage_store"""
         import gen_npu_unpack as GU
         e(f"{I}%sk_tok = index.add %t0, %lt : index")
-        tb = GU.c_tok(e, "skt_", "%sk_tok")
+        tb = None if swap else GU.c_tok(e, "skt_", "%sk_tok")
         e(f"{I}%sk_xr = index.mul %sk_tok, %qkv_size : index")
         names = []
         for i in range(2):
-            e(f"{I}%sk{i}i0 = index.add {las[i]}, {tb} : index")
-            e(f"{I}%sk{i}i = index.min %sk{i}i0, %nel : index")   # (in range by construction; for the bound proof)
-            for g in range(GU.CG):
+            if swap:   # (swap form) one value per element
+                sb = GU.swapc_base(e, f"sk{i}w_", las[i], "%sk_tok", swap)
+                e(f"{I}%sk{i}i = index.min {sb}, %nel : index")   # (in range by construction; for the bound proof)
+            else:
+                e(f"{I}%sk{i}i0 = index.add {las[i]}, {tb} : index")
+                e(f"{I}%sk{i}i = index.min %sk{i}i0, %nel : index")   # (in range by construction; for the bound proof)
+            for g in range(1 if swap else GU.CG):
                 src = f"%sk{i}i" if g == 0 else f"%sk{i}j{g}"
                 if g:
                     e(f"{I}%sk{i}j{g} = index.add {f'%sk{i}i' if g == 1 else f'%sk{i}j{g - 1}'}, %cgs : index")
@@ -578,7 +585,7 @@ def gen(heads, cfirst=None, ccols=0, batch=0):
         e(f"{I}%sp_r = scf.select %sp_isp, %sp_r0, %c6 : index")
         for i in range(2):
             gs = []
-            for g in range(GU.CG):
+            for g in range(1 if swap else GU.CG):
                 vals = []
                 for w in range(4):
                     n = f"%ss{i}_{g}_{w}"
@@ -591,7 +598,7 @@ def gen(heads, cfirst=None, ccols=0, batch=0):
                 e(f"{I}%ss{i}v{g} = vector.from_elements {', '.join(vals)} : vector<8xf32>")
                 gs.append(f"%ss{i}v{g}")
             acc = gs[0]
-            for g in range(1, GU.CG):   # (gen_npu_unpack.load_cg's order)
+            for g in range(1, 1 if swap else GU.CG):   # (gen_npu_unpack.load_cg's order)
                 e(f"{I}%ss{i}a{g} = vector.addf {acc}, {gs[g]} : vector<8xf32>")
                 acc = f"%ss{i}a{g}"
             e(f"{I}%ss{i}h = vector.fptrunc {acc} : vector<8xf32> to {V8H}")
