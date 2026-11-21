@@ -975,6 +975,11 @@ RSWAP_EMIT = os.environ.get("YAH_NPU_RSWAP_EMIT", "1") != "0"   # (default on; "
 # then decodes every swap layer with the standalone decoders (R5Hal ""). For B 1024 until the carriers take a half's
 # grid (gen_r5fuse needs F / 16 workgroups; a B 1024 split has 288).
 R5CAR = os.environ.get("YAH_NPU_R5CAR", "1") != "0"
+# YAH_NPU_R5PART=1: every r5 carrier as two part carriers instead ("<carrier>[_<g>_<u>][_f<F'>]_p<part>.npu[_n<F>].hal",
+# gen_r5fuse part): _p0 decodes the next layer's gate rows, _p1 its up rows, F / 32 workgroups each (a B 1024 split's
+# 288 hold one part). port's YAH_PP_HALVES=2: half A's split runs _p0, half B's _p1.
+R5PART = os.environ.get("YAH_NPU_R5PART") == "1"
+R5_PARTS = (0, 1) if R5PART else (None,)
 # (RSWAP_EMIT) the gen_r5kq carriers' VGPR ladder (emit_prefill vtry) and the carriers left to the standalone decoders
 # (q3k_iq3s: 204 VGPRs with spills at every budget, +19% vs its plain split)
 R5_VTRY = "208,200,192"
@@ -1782,14 +1787,14 @@ def r5_carriers(by, nn, last, split, FL=None):
         # (the .fp's dz_w: the raw binding the payloads read, gate's n rows then up's, clamped below n (rb_g + rb_u))
         rb = lambda f_: gen_r5fuse.RBG if f_ == "iq4xs" else gen_r5kq.PAYLOADS[f_].row_bytes
         # (share-up: the "_f<F'>" carriers' stem too; the bound is the whole binding, any F)
-        E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5%s%s" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu),
-                                                      "" if fb == nn else "_f%d" % fb)] = {"dz_w": n * (rb(pg) + rb(pu))}
-        split(gf if gf == uf else gf + ":" + uf, "ffn", mt, kb, t,
-              "gemm_ffn_%s_%d_%d.af.to.r5%s%s.hal" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu),
-                                                     "" if fb == nn else "_f%d" % fb), fa,
-              wrap=lambda text, n_, nwg, lanes, p_=pay, f_=fb: gen_r5fuse.fuse(text, n_, nwg, lanes, pay=p_, f=f_,
-                                                                              rows=R5_ROWS),
-              vtry=R5_VTRY, **({} if fa == nn else {"osfx": "_n%d" % fa}))
+        for pt in R5_PARTS:   # (R5PART: _p0 / _p1)
+            stem = "gemm_ffn_%s_%d_%d.af.to.r5%s%s%s" % (car, mt, kb, "" if pg == pu == "iq4xs" else "_%s_%s" % (pg, pu),
+                                                       "" if fb == nn else "_f%d" % fb, "" if pt is None else "_p%d" % pt)
+            E.FP_FLOOR[stem] = {"dz_w": n * (rb(pg) + rb(pu))}
+            split(gf if gf == uf else gf + ":" + uf, "ffn", mt, kb, t, stem + ".hal", fa,
+                  wrap=lambda text, n_, nwg, lanes, p_=pay, f_=fb, pt_=pt: gen_r5fuse.fuse(text, n_, nwg, lanes, pay=p_,
+                                                                                          f=f_, rows=R5_ROWS, part=pt_),
+                  vtry=R5_VTRY, **({} if fa == nn else {"osfx": "_n%d" % fa}))
 
 
 def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
@@ -1873,9 +1878,12 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     if RSWAP_EMIT and R5CAR and fmt == "iq4xs" and sfx == ".af.to.hal" and FS == gen_r5fuse.F and kb == 20:
                         # (row 5 swap) the same split decoding another layer's NPU gate / up rows into the swap's
                         # stream ("<hal>.af.to.r5.npu.hal", gen_r5fuse); its .fp dz_w: both tensors' raw rows
-                        E.FP_FLOOR["gemm_ffn_%s_%d_%d.af.to.r5" % (fmt, mt, kb)] = {"dz_w": mt * 16 * 2 * gen_r5fuse.RBG}
-                        split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d.af.to.r5.hal" % (fmt, mt, kb), FS,
-                              wrap=lambda text, n_, nwg, lanes: gen_r5fuse.fuse(text, n_, nwg, lanes, rows=R5_ROWS))
+                        for pt in R5_PARTS:   # (R5PART: _p0 / _p1)
+                            stem = "gemm_ffn_%s_%d_%d.af.to.r5%s" % (fmt, mt, kb, "" if pt is None else "_p%d" % pt)
+                            E.FP_FLOOR[stem] = {"dz_w": mt * 16 * 2 * gen_r5fuse.RBG}
+                            split(fmt, "ffn", mt, kb, tt, stem + ".hal", FS,
+                                  wrap=lambda text, n_, nwg, lanes, pt_=pt: gen_r5fuse.fuse(text, n_, nwg, lanes,
+                                                                                           rows=R5_ROWS, part=pt_))
                     if sw5 and fmt == "iq4xs":   # (the row-segmented layers' GPU rows: their up rows F rows on)
                         try:
                             TG.FFUP = FS
