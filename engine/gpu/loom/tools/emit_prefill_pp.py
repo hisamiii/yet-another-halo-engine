@@ -1018,6 +1018,15 @@ if AHORD:
 # 512-token panel, F / 32 / RSWAP_NB), dispatch.txt "npupanel <k>"; the GPU may then open each panel on its own
 PANEL = os.environ.get("YAH_NPU_PANEL") == "1"
 RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP_REPLAY_GROUP"}
+# YAH_NPU_SWSITE=1 (tile's swap coverage, step 1): qkv and gate in swap form. Per layer its NPU rows on a plain
+# bfp16-A image "npu_swsite_<R>" (the swap image without SwiGLU: the weights its stream in the act layout
+# [64-row block][pass][..], the swap's token panel npu_swpanel resident, K 5120 in 20 passes, one call a 512-token
+# panel; npu chk/swd.py, 11-21: bit-exact). R = nb x 64, nb the real rows' blocks up to a multiple of 4 (the image's
+# 4 compute rows): the stream's pad rows are zero. C: bf16 8x8 blocks [8 tokens][8 rows], panel p at p R 1024 B, in
+# it per 64-token column c block c (R / 8) 8 + (rb / 2) 16 + (t / 2) 4 + (rb % 2) 2 + t % 2 ("swapc").
+# dispatch.txt "npuswsite_<site>@<L> <nb> <real rows>", "npubytes_swsite_<R>". Unset: no change.
+SWSITE = os.environ.get("YAH_NPU_SWSITE") == "1"
+SWSITE_NB = set()   # (the images' nb, filled by the per-layer sites)
 
 
 def ffnblk_parts(F):
@@ -1376,6 +1385,16 @@ def npu_split(rows, combos, B, outdir):
                 variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn, site, osfx=sfx_)
         lrows.add((fmt, site, nn))
         out.append(("npusplit_%s@%d" % (site, L), nn, 0, 0))
+    if SWSITE:   # (YAH_NPU_SWSITE) each layer's qkv / gate NPU rows in swap form (the sites the NPU computes today)
+        for nm in sorted(lfmt):
+            m = re.match(r"blk\.(\d+)\.attn_(qkv|gate)\.weight$", nm)
+            if not m or m[2] not in NPU_SPLIT or not (lfmt[nm] in QSITE_FMTS or np4(lfmt[nm])):
+                continue
+            L, site = int(m[1]), m[2]
+            nn = NPU_SPLIT_LAYERS.get((site, L)) or (npu_rows4(site) if np4(lfmt[nm]) else NPU_SPLIT[site])
+            nb = -(-nn // 256) * 4
+            SWSITE_NB.add(nb)
+            out.append(("npuswsite_%s@%d" % (site, L), nb, nn, 0))
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
     encs = set()
     for site in NPU_SPLIT:
@@ -1569,6 +1588,14 @@ def npu_split(rows, combos, B, outdir):
     bfp_site_rows(bsites, outdir)
     out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
     extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
+    for nb in sorted(SWSITE_NB):   # (YAH_NPU_SWSITE) the plain bfp16-A site images (npu chk/swd.py's config)
+        assert NPU_Q and NPU_QP1K and B % 512 == 0 and nb % 4 == 0, ("YAH_NPU_SWSITE: the Q' P1K set", nb)
+        name = "npu_swsite_%d" % (nb * 64)
+        extra.append((GN.Config(NPU_COLS, nb, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0, rawdma=0,
+                                gord="P4", qsw=False, dgu=0, hord="P4"), name, 4))
+        QJOB_ENV[name] = {k: v for k, v in RSWAP_ENV.items() if k != "GN_QSWHT"}
+        with GN.np_override(4):
+            out.append(("npubytes_swsite_%d" % (nb * 64),) + tuple(GN.stream_bytes(extra[-1][0])))
     out.extend(npu_images(images, B, tmp, outdir, extra))
     GE.ACT_PERM = None
     return out
@@ -1604,7 +1631,7 @@ def npu_images(images, B, tmp, outdir, extra=()):
         tl = name in os.environ.get("GN_QCYCIMG", "").split(",")   # (diag: these images with GN_QCYC stamps, GN.qtlp)
         qswap = GN.QSWAP
         try:
-            GN.QSWAP = qswap or name.startswith("npu_ffnswap_")   # (RSWAP_EMIT: gen_npu_gemm reads GN_QSWAP at import)
+            GN.QSWAP = qswap or name.startswith(("npu_ffnswap_", "npu_swsite_"))   # (RSWAP_EMIT: gen_npu_gemm reads GN_QSWAP at import)
             GN.QCYC = GN.QCYC or tl
             GN.QFCYC = tl and os.environ.get("GN_QFCYC") == "1"
             with GN.np_override(np_):
@@ -1612,7 +1639,7 @@ def npu_images(images, B, tmp, outdir, extra=()):
                 text = Q.gen(cfg) if NPU_Q else GN.gen(cfg)
                 open(src, "w").write(GN.qtlp(text) if tl and os.environ.get("GN_QTLP") == "1" else text)
                 env_ = dict(hrx_paths.env(), **(Q.loom_env(cfg) if NPU_Q else GN.loom_env(cfg)))
-                if name.startswith("npu_ffnswap_"):
+                if name.startswith(("npu_ffnswap_", "npu_swsite_")):
                     for k_, v_ in Q.P1K_LOOM.items():
                         if k_ not in RSWAP_DROP:
                             env_.setdefault(k_, v_)
@@ -1666,7 +1693,8 @@ def npu_images(images, B, tmp, outdir, extra=()):
     j0 = next(j for j in jobs if j[2] == NPU_NP)
     out = [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(j0[0])),
            ("npurows", NPU_ROWS, 0, 0)]
-    j4 = [j for j in jobs if NPU_Q and j[2] == 4 and j[0].fmt != "IQ4_XS" and not j[0].qsw]
+    j4 = [j for j in jobs if NPU_Q and j[2] == 4 and j[0].fmt != "IQ4_XS" and not j[0].qsw
+          and not j[1].startswith("npu_swsite_")]
     if j4 and NPU_QP1K:   # (the NP 4 formats' site images, np4)
         with GN.np_override(4):
             out += [("npubytes4_5120",) + tuple(GN.stream_bytes(j4[0][0])), ("npurows4", NPU_COLS * 64, 0, 0)]
