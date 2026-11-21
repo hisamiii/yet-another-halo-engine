@@ -345,13 +345,18 @@ def array_program(L, cfg):
     for r in range(R):   # row r: its M blocks' records [M block][pass][slab], multicast along the row
         if crel() or mrel():   # (row r: M blocks r, r + R, ...; merged pair relay: row 2 p + j's 4 f + 2 j + p)
             b0 = r if crel() or N.qcstage_on() else 2 * (r % 2) + r // 2   # (GN_QCSTAGE: the merge takes a pair round: row r owns 4 f + r)
-            e(f"  %ao{r} = constant.u64 {b0 * PA * MP * fa} : reg<aie2p.array.offset : offset>")
             na_, ra_ = (1, N.acap_tail(cfg)) if "a" in qfix() else (nbr, P * MP)
-            assert fa // 4 % asp_ == 0 and fa // 4 // asp_ <= 1023
-            ah_ = f"{asp_}x" if asp_ > 1 else ""
-            st_ = f"{fa // 4 // asp_}, " if asp_ > 1 else ""
-            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{na_}x{ra_}x{ah_}{fa // 4 // asp_}xi32, "
-              f"#encoding.layout.strided<strides=[{R * PA * MP * fa // 4}, {fa // 4}, {st_}1]>>>")
+            if ahord():   # (the host orders A: row r's blocks one run at block r nbr, dense)
+                assert PA == P and "a" not in qfix()
+                e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
+                e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nbr * P * MP}x{asp_}x{fa // 4 // asp_}xi32>>")
+            else:
+                e(f"  %ao{r} = constant.u64 {b0 * PA * MP * fa} : reg<aie2p.array.offset : offset>")
+                assert fa // 4 % asp_ == 0 and fa // 4 // asp_ <= 1023
+                ah_ = f"{asp_}x" if asp_ > 1 else ""
+                st_ = f"{fa // 4 // asp_}, " if asp_ > 1 else ""
+                e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{na_}x{ra_}x{ah_}{fa // 4 // asp_}xi32, "
+                  f"#encoding.layout.strided<strides=[{R * PA * MP * fa // 4}, {fa // 4}, {st_}1]>>>")
         else:
             assert PA == P, "GN Config.apass: the pair relay / merge's strided A (mrel / crel) only"
             e(f"  %ao{r} = constant.u64 {r * nbr * P * MP * fa} : reg<aie2p.array.offset : offset>")
@@ -634,6 +639,13 @@ def array_program(L, cfg):
                 e(f"  %chqx{t} = channel %qxs{t}, %qxr{t}, %one, %nqx : reg<aie2p.array.channel : tile<32xi32>>")
                 e(f"  constrain.leaf_sync %chqx{t}")
     e("  return\n}\n")
+
+
+def ahord():
+    """GN_QAHORD=1 (with the pair relay): the host orders A so each row's M blocks are one contiguous run (call c, row r
+    at block c NB + r nbr, its f-th block = M block c NB + 4 f + b0(r), b0 = (0, 2, 1, 3)): a dense A sender a row,
+    no block count on the shim DMA's iteration field (2..64), so a row may take more than 64 blocks a call."""
+    return os.environ.get("GN_QAHORD") == "1" and (crel() or mrel())
 
 
 def mrel():

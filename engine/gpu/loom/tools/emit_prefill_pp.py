@@ -979,9 +979,15 @@ RSWAP_KS, RSWAP_PASSES = (32,), 20   # (the swap's stream and panel split: swq.p
 # (11-21: -0.65 M a job in the gated checker, H in the same down layout). Default 256 when F / 32 allows it (11-21
 # on 5cd5aee: -11.9 ms pp2048, md5 unchanged), else 128.
 RSWAP_NB = int(os.environ.get("YAH_NPU_RSWAP_NB", "256" if NPU_FFNBLKS and NPU_FFNBLKS // 32 % 256 == 0 else "128"))
+# YAH_NPU_AHORD=1: the swap stream in tile's host order (gen_r5fuse.stream_offsets: row r's blocks one run a call),
+# the image's A a dense run a row (gen_npu_q GN_QAHORD), so a row may take > 64 blocks (RSWAP_NB > 256, F 8704). The
+# GPU carriers must write the same order: one switch for both.
+AHORD = os.environ.get("YAH_NPU_AHORD") == "1"
 RSWAP_ENV = dict(GN_QSWAP="1", GN_QSWHT="1", GN_QFKH="0", GN_QPSHARE="0", GN_QF4R="0", GN_QPREFILL="0",
                  GN_QFGUARD="0", GN_QF4RSWAP="0", GN_QF4RCOPY="0", GN_QFEGR2="0",   # (no fill at fuse 0)
                  GN_QSWPAIR=os.environ.get("GN_QSWPAIR", "1"))   # 8 A streams (gen_npu_q; 11-20: -53.8 ms pp2048)
+if AHORD:
+    RSWAP_ENV["GN_QAHORD"] = "1"
 # YAH_NPU_PANEL=1 (with RSWAP_EMIT): the swap image opens a job panel by panel (gen_npu_gemm GN_QPANEL: its calls a
 # 512-token panel, F / 32 / RSWAP_NB), dispatch.txt "npupanel <k>"; the GPU may then open each panel on its own
 PANEL = os.environ.get("YAH_NPU_PANEL") == "1"
@@ -1802,7 +1808,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                 QJOB_ENV[jobs[-1][1]] = dict(GN_QFEGR2="0")
                 if RSWAP_EMIT and fmt == "iq4xs" and not np5 and hord == "P4":
                     assert B == 2048 and FS % 1024 == 0 and all(u[2] % 4 == 0 for u in ffnblk_units(FS))
-                    assert RSWAP_NB % 32 == 0 and RSWAP_NB <= 256 and FS // 32 % RSWAP_NB == 0, RSWAP_NB
+                    assert RSWAP_NB % 32 == 0 and RSWAP_NB <= (FS // 32 if AHORD else 256) and FS // 32 % RSWAP_NB == 0, RSWAP_NB
                     jobs.append((GN.Config(NPU_COLS, RSWAP_NB, RSWAP_KS, RSWAP_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=0,
                                            rawdma=0, gord="P4", qsw=True, dgu=0, swcol=32, hpass=qcallss, hord="P4"),
                                  "npu_ffnswap_iq4xs", 4))
