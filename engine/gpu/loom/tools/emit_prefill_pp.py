@@ -1028,6 +1028,9 @@ RSWAP_DROP = {"LOOM_EXP_PANEL_STREAM", "LOOM_EXP_PANEL_STREAM_SINGLE", "LOOM_EXP
 # dispatch.txt "npuswsite_<site>@<L> <nb> <real rows>", "npubytes_swsite_<R>". Unset: no change.
 SWSITE = os.environ.get("YAH_NPU_SWSITE") == "1"
 SWSITE_NB = set()   # (the images' nb, filled by the per-layer sites)
+# (YAH_NPU_SWSITE) qkv's and gate's (format, NPU rows): the GPU's plain stream decoders of those rows (K 5120),
+# "npu_swsdec_<fmt>_<rows>.hal", the engine's standalone decode before the site's job (carriers may take it over)
+SWSITE_DEC = set()
 
 
 def ffnblk_parts(F):
@@ -1396,6 +1399,8 @@ def npu_split(rows, combos, B, outdir):
             nn = NPU_SPLIT_LAYERS.get((site, L)) or (npu_rows4(site) if np4(lfmt[nm]) else NPU_SPLIT[site])
             nb = -(-nn // 256) * 4
             SWSITE_NB.add(nb)
+            if site in ("qkv", "gate"):
+                SWSITE_DEC.add((lfmt[nm], nn))
             out.append(("npuswsite_%s@%d" % (site, L), nb, nn, 0))
     # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
     encs = set()
@@ -1602,6 +1607,17 @@ def npu_split(rows, combos, B, outdir):
     bfp_site_rows(bsites, outdir)
     out.extend(("npusitebx_" + t, 1, 0, 0) for t, _ in sorted(bsites))
     extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
+    for fm_, nn_ in sorted(SWSITE_DEC):   # (YAH_NPU_SWSITE) qkv's / gate's plain stream decoders
+        import gen_iq4xs_bfp
+        import gen_kq_bfp
+        assert fm_ == "iq4xs" or fm_ in RSWAP_KQ, ("YAH_NPU_SWSITE: no stream decoder for", fm_)
+        st_ = dict(ks=RSWAP_KS, passes=RSWAP_PASSES, tile=64, plain=True)
+        nm_ = "npu_swsdec_%s_%d" % (fm_, nn_)
+        src = os.path.join(tmp, nm_ + ".loom")
+        open(src, "w").write(gen_iq4xs_bfp.gen(nn_, 5120, st_) if fm_ == "iq4xs" else
+                             gen_kq_bfp.gen(RSWAP_KQ[fm_], nn_, 5120, st_))
+        E.emit(src, ["nop=0"], nm_ + ".hal", outdir)
+        out.append((nm_ + ".hal", gen_iq4xs_bfp.items(nn_, 5120), gen_iq4xs_bfp.WG, gen_iq4xs_bfp.out_bytes(nn_, 5120, st_)))
     for nb in sorted(SWSITE_NB):   # (YAH_NPU_SWSITE) the plain bfp16-A site images (npu chk/swd.py's config)
         assert NPU_Q and NPU_QP1K and B % 512 == 0 and nb % 4 == 0, ("YAH_NPU_SWSITE: the Q' P1K set", nb)
         name = "npu_swsite_%d" % (nb * 64)
