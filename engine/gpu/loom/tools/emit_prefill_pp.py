@@ -3042,13 +3042,13 @@ def main():
     open(clk_src, "w").write(GU.gen_clk_probe())
     geom.append(("clk_probe.hal", 1, 32, 0))
     geom.append(("native", 0, 0, 0))   # the engine loads the GGUF as it is (core/gguf_convert.cpp)
-    # the output head: the tile-free GEMV (gen_gemv) for Q8_0 (a GGUF head that is not Q6_K, which
-    # yah_gemv_q6k_f32 reads), rows per workgroup / lanes / workgroups in its row
-    head_src, head_fmt = None, gen_gemv.GGML.get(types["output.weight"])
-    if head_fmt:
-        head_src = os.path.join(tmp, "yah_gemv_head.loom")
-        open(head_src, "w").write(gen_gemv.gen("plain", [head_fmt], 248320, 5120))
-        geom.append(("gemv.hal", gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
+    # the output head: the tile-free GEMV (gen_gemv) in the head's format, named by it (gemv_<fmt>.hal: the engine
+    # refuses a set for another head format); rows per workgroup / lanes / workgroups in its row
+    head_fmt = gen_gemv.GGML[types["output.weight"]]
+    head_hal = "gemv_%s.hal" % head_fmt
+    head_src = os.path.join(tmp, "yah_gemv_head.loom")
+    open(head_src, "w").write(gen_gemv.gen("plain", [head_fmt], 248320, 5120))
+    geom.append((head_hal, gen_gemv.rows_per_wg(), 32 * 4, 248320 // gen_gemv.rows_per_wg()))
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
@@ -3192,8 +3192,7 @@ def main():
         *([(vseed_src, "vseed.hal", ["yah_kvq.token_count=%d" % B])] if (vq8_on or vq4_on) else []),
         ("yah_rmsnorm_f32.loom", "rmsnorm.hal",
          ["yah_rmsnorm.rows=1", "yah_rmsnorm.eps=1e-06"]),
-        *([(head_src, "gemv.hal", ["nop=0"])] if head_src else [("yah_gemv_q6k_f32.loom", "gemv.hal",
-          ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"])]),
+        (head_src, head_hal, ["nop=0"]),
         ("yah_argmax_f32.loom", "argmax.hal", ["yah_argmax.vocab=248320"]),
     ]
     # Loom low-level LICM (HRX patch 0011) for the attention kernels where it wins: it hoists the fragment loads'

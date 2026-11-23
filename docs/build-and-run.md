@@ -162,7 +162,7 @@ engine/run/gpu_run.sh dec -- engine/build/loom_decode <model> <decode set> --ids
 
 ## Serving
 
-`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and KV format. `--ctx` (default 32768, a multiple of 2048) and `--kv` (default `kv8`; `fp16`, `kv4`, `k8v4`, `k4v8`) pick them: a release bundle's `hal/<ctx>-<kv>/`, or in a source tree `~/.cache/yah/hal/<model file name>/<ctx>-<kv>/` (`XDG_CACHE_HOME`), emitted there on first use. The sets run the model's own formats, so each model has its own. `--prefill` / `--decode` name sets instead.
+`engine/build/yah_server` serves the model over the OpenAI Responses and Chat Completions APIs. It runs one generation at a time; other requests wait. The engine behind it (`engine/model/engine.hpp`) needs a chunked, paged prefill set and a decode set with the same context and KV format. `--ctx` (default 32768, a multiple of 2048) and `--kv` (default `kv8`; `fp16`, `kv4`, `k8v4`, `k4v8`) pick them: a release bundle's `hal/<ctx>-<kv>/`, or in a source tree `~/.cache/yah/hal/<model file name>/v2/<ctx>-<kv>/` (`XDG_CACHE_HOME`; the version changes when older sets no longer fit the engine), emitted there on first use. The sets run the model's own formats, so each model has its own. `--prefill` / `--decode` name sets instead.
 
 ```
 source engine/hrx-env.sh

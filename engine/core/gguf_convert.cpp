@@ -1,6 +1,6 @@
 // A GGUF model as the engine reads it: the projections keep their bytes (the sets run the GGUF's own formats), ffn_up
 // right after ffn_gate (the NPU FFN block's image reads gate through up rows in one view); token_embd becomes Q8_0, as
-// does an output.weight that is not Q6_K or Q8_0, and the small tensors f32.
+// does an output.weight in a format the GEMVs do not read, and the small tensors f32.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -37,6 +37,12 @@ struct Item {
   Kind kind;
 };
 
+// gen_gemv.GGML: the formats a GEMV reads.
+bool HeadReadable(GgmlType t) {
+  const int v = static_cast<int>(t);
+  return v == 8 || (v >= 10 && v <= 14) || (v >= 16 && v <= 18) || (v >= 20 && v <= 23);
+}
+
 bool IsProjection(const TensorInfo& t) {
   static const char* const kSites[] = {"attn_q",    "attn_k",    "attn_v",       "attn_output", "attn_qkv",
                                        "attn_gate", "ssm_alpha", "ssm_beta",     "ssm_out",     "ffn_gate",
@@ -72,8 +78,8 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
       throw std::runtime_error(std::string("gguf: tensor type ") + TypeName(t.type) + " of " + t.name +
                                " is not supported (F32, F16, BF16, Q4_0 .. Q8_0, Q2_K .. Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, "
                                "IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS are)");
-    // the head GEMVs read Q6_K (yah_gemv_q6k) and Q8_0 (gen_gemv): a head of another format becomes Q8_0
-    if (t.name == "output.weight" && t.type != GgmlType::kQ6_K && t.type != GgmlType::kQ8_0)
+    // the head GEMV (gen_gemv) reads Q8_0, Q2_K .. Q6_K and the IQ formats but IQ1; other heads become Q8_0
+    if (t.name == "output.weight" && !HeadReadable(t.type))
       return add(&t, t.name, t.dims, GgmlType::kQ8_0, Kind::kQ8_0);
     add(&t, t.name, t.dims, t.type, Kind::kCopy);
   };

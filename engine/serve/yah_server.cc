@@ -44,7 +44,7 @@ int Usage() {
                "       yah_server --model <model> --fake [--host ...] [--port ...]   canned replies, no GPU\n"
                "--ctx: the context in tokens (a multiple of 2048); --kv: the KV cache format, fp16, kv8, kv4, k8v4 or\n"
                "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
-               "~/.cache/yah/hal/<model file name>/<ctx>-<kv>/, emitted there on first use. --prefill / --decode\n"
+               "~/.cache/yah/hal/<model file name>/v2/<ctx>-<kv>/, emitted there on first use. --prefill / --decode\n"
                "name sets instead.\n"
                "--npu: the NPU computes part of the prefill's GEMMs and attention, with a prefill set that has\n"
                "the NPU split (prefill-npu/ beside prefill/, emitted on first use in a source tree; or --prefill\n"
@@ -65,10 +65,14 @@ bool Exists(const std::string& path) { return ::access(path.c_str(), R_OK) == 0;
 
 #ifndef YAH_SERVE_FAKE_ONLY
 // The HAL sets for a context and KV format when the command line names none: a bundle's hal/<ctx>-<kv>/, else (a
-// source tree, root = engine/) ~/.cache/yah/hal/<model file name>/<ctx>-<kv>/, emitted there on first use (the Python
-// emitters). The sets run the model's own formats, so the cache is per model (a bundle ships one model's sets).
+// source tree, root = engine/) ~/.cache/yah/hal/<model file name>/v<kSetsVersion>/<ctx>-<kv>/, emitted there on first
+// use (the Python emitters). The sets run the model's own formats, so the cache is per model (a bundle ships one
+// model's sets).
 // npu: the prefill set with the NPU split (prefill-npu/, emit_prefill_pp.py YAH_NPU_SPLIT: not emitted here), the plain
 // prefill/ when there is none (the engine then says the NPU is off and why).
+// Bumped when the engine stops reading the sets emitted before it (2: the head GEMV in the GGUF's own format).
+constexpr int kSetsVersion = 2;
+
 std::pair<std::string, std::string> HalSets(const std::string& root, const std::string& model, std::uint32_t ctx,
                                             const std::string& kv, bool npu) {
   const std::string name = std::to_string(ctx) + "-" + kv;
@@ -82,7 +86,7 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
   const char* home = std::getenv("HOME");
   const std::string dir =
       (xdg && *xdg ? std::string(xdg) : std::string(home ? home : ".") + "/.cache") + "/yah/hal/" +
-      std::filesystem::path(model).filename().string() + "/" + name;
+      std::filesystem::path(model).filename().string() + "/v" + std::to_string(kSetsVersion) + "/" + name;
   // steps: emitters run in turn as <command> <model> <set> <args>
   const auto emit = [&](const std::string& sub, const std::string& marker,
                         std::initializer_list<std::pair<std::string, std::string>> steps) {

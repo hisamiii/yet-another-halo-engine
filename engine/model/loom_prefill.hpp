@@ -934,14 +934,12 @@ class LoomPrefill {
     const auto* ow = Find("output.weight");
     Dispatch(Exe("rmsnorm.hal"), "yah_rmsnorm", 1, 1, 1, 32, 1, 1,
              {{hidden_->handle, std::size_t{row} * kHidden * 4, std::size_t{kHidden} * 4}, TRef(*onw), Ref(*normed_)});
-    if (geom_.count("gemv.hal")) {   // gen_gemv's tile-free GEMV (a head that is not Q6_K)
-      const Geom& g = geom_.at("gemv.hal");   // (rows per workgroup, lanes, workgroups)
-      Dispatch(Exe("gemv.hal"), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
-      return;
-    }
-    if (ow->type != core::GgmlType::kQ6_K)
-      throw LoomError("output.weight is not Q6_K, and the set has no gemv.hal row for its head");
-    Dispatch(Exe("gemv.hal"), "yah_gemv_q6k", kVocab, 1, 1, 32, 1, 1, {TRef(*ow), Ref(*normed_), dst});
+    Fmt f{};   // gen_gemv's tile-free GEMV in the head's format
+    if (!FmtOf(static_cast<std::uint32_t>(ow->type), &f)) throw LoomError("output.weight: no head GEMV for its format");
+    const std::string hal = std::string("gemv_") + f.name + ".hal";
+    if (!geom_.count(hal)) throw LoomError("the set has no " + hal + " for the model's head (re-emit the set)");
+    const Geom& g = geom_.at(hal);   // (rows per workgroup, lanes, workgroups)
+    Dispatch(Exe(hal), "yah_gemv", g.tt, 1, 1, g.rowgrp, 1, 1, {TRef(*ow), Ref(*normed_), dst});
   }
   // Argmax of kVocab f32 logits into dst (one u32).
   void Argmax(const hrx_buffer_ref_t& logits, const hrx_buffer_ref_t& dst) {
@@ -1399,7 +1397,7 @@ class LoomPrefill {
           (!g.rowgrp || !g.tokens || kHeads % g.rowgrp || (B_ + g.tokens - 1) / g.tokens != g.tt))
         throw LoomError(name + ": its launch geometry does not fit (re-emit the set)");
     for (const char* hal : {"norm.hal", "convkq.hal", "prepab.hal", "rowsplit.hal", "postnorm.hal", "unpack.hal",
-                            "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
+                            "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
       Exe(hal);
     GeomOf("embed.hal");   // one token per workgroup: refuses a set emitted for another chunk size
     // embed.hal decodes Q8_0 (core/gguf_convert.cpp makes a GGUF's token_embd Q8_0)
