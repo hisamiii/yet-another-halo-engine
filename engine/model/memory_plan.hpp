@@ -49,8 +49,8 @@ struct MemoryPlan {
     const core::Gguf index = core::Gguf::OpenIndex(model);
     for (const auto& t : index.tensors()) p.weights += t.bytes;
     // Fitted to the lowest MemAvailable on gfx1151 with the native UD-IQ4_XS sets, kv8 (2026-11-23): yah_server --npu
-    // at 16K over a load and 3 requests 19.26 GB; loom_forward_pp's growth with the context 45.7 KB a token (8K, 32K,
-    // 128K); the NPU split's own buffers (GEMM + attention) 1.39 GB (32K, with and without --npu). What grows with the
+    // over a load and 3 requests 19.26 / 19.68 / 21.83 GB at 16K / 32K / 64K (the estimate at or above each); the NPU
+    // split's own buffers (GEMM + attention) 1.39 GB (loom_forward_pp 32K, with and without --npu). What grows with the
     // context is the KV pools (K and V of 16 layers x 1024 per token, at the format's bits plus scales) and f32 / f16
     // attention scratch.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
@@ -89,7 +89,7 @@ struct MemoryPlan {
  private:
   // kFixed: the chunk-sized buffers, state snapshots, the host side and HRX's own memory; kNpuFixed: the NPU split's
   // command arenas, operand and attention buffers (beside its npu_bfp_ rows)
-  static constexpr std::uint64_t kFixed = 1650ull * 1000 * 1000, kScratchPerToken = 12000,
+  static constexpr std::uint64_t kFixed = 1650ull * 1000 * 1000, kScratchPerToken = 16500,
                                  kNpuFixed = 1400ull * 1000 * 1000;
 };
 
