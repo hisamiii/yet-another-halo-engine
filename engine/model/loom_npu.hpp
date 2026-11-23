@@ -257,7 +257,27 @@ class LoomNpu {
   }
   // Another context on the same array whose commands interleave with this one's (both enqueued by one thread), set
   // before either builds a command.
-  void SetPeer(LoomNpu& peer) { peer_ = peer.counts_; }
+  void SetPeer(LoomNpu& peer) { peer_ = peer.counts_, peer_npu_ = &peer; }
+  // Before the peer builds a command: an early-asking image that ran last here left its waiter's ask for the next job
+  // on the tick channel, which the peer's setup must not find. A command of the drop alone (AskDrop) takes it off;
+  // the next command here sets its image up in full (PeerRan).
+  void DropAsk() {
+    const void* r = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      r = resident_;
+    }
+    const auto it = r ? ask_drop_.find(r) : ask_drop_.end();
+    if (it == ask_drop_.end()) return;
+    if (cmd_header_.size() != 16) throw LoomError("npu: DropAsk: no command header");
+    std::vector<std::uint8_t> bytes(cmd_header_);
+    bytes.insert(bytes.end(), it->second.begin(), it->second.end());
+    const std::uint32_t ops = kAskDropOps, size = static_cast<std::uint32_t>(bytes.size());
+    std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    SubmitOrdered(Place(bytes), {}, std::chrono::steady_clock::now());
+    std::lock_guard<std::mutex> lock(mu_);
+    resident_ = nullptr, resident_dec_ = -1, program_lost_ = true, lane_lost_ = true, ++epoch_;
+  }
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
   ~LoomNpu() {
@@ -959,6 +979,7 @@ class LoomNpu {
   };
   void EnqueueAttn(const AttnJob& job) {
     CheckHealth();
+    if (peer_npu_) peer_npu_->DropAsk();   // (before this command records the peer's count: PeerNeed)
     const auto t0 = std::chrono::steady_clock::now();
     const AttnImage& a = *job.calls.at(0)->image;
     if (job.nb > a.nb_built || job.nb < 32 || job.nb % 16) throw LoomError("npu: attention nb");
@@ -1839,6 +1860,8 @@ class LoomNpu {
   // per family of an early-asking image (Kernel::ask_early), the ops that take its waiter's pending ask off the tick
   // channel (AskDrop), from its last job's gate
   std::map<const void*, std::vector<std::uint8_t>> ask_drop_;
+  std::vector<std::uint8_t> cmd_header_;   // a fused command's first 16 bytes (DropAsk's command)
+  LoomNpu* peer_npu_ = nullptr;            // SetPeer (its DropAsk before this side builds an attention command)
   // AskDrop's ops: one record of the gate's tick channel into a BD of no lock and no chain (BD 14: no gate uses it),
   // then a sync on its token (the job's done block synced the tick task's own), so the next setup's channel resets
   // find the stream empty. The pending ask is the record after the tick task's last (the queue runs in order), so the
@@ -2113,6 +2136,7 @@ class LoomNpu {
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    if (cmd_header_.empty()) cmd_header_.assign(bytes.begin(), bytes.begin() + 16);
     static int cmddumped = 0;   // (diag, YAH_NPU_SETUPDUMP) the first fused commands whole
     if (const char* sd = std::getenv("YAH_NPU_SETUPDUMP"); sd && cmddumped < 8) {
       const std::string f = std::string(sd) + "/cmd" + std::to_string(cmddumped++) + ".bin";
