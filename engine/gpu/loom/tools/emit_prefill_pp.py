@@ -3038,6 +3038,7 @@ def main():
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
     # YAH_CLK_PROBE (diag): one wave that measures the GPU clock over 20 us (gen_npu_unpack.gen_clk_probe)
     clk_src = os.path.join(tmp, "yah_clk_probe.loom")
+    import gen_npu_unpack as GU   # (main's other imports of it sit in NPU branches: a set without the split has none)
     open(clk_src, "w").write(GU.gen_clk_probe())
     geom.append(("clk_probe.hal", 1, 32, 0))
     geom.append(("native", 0, 0, 0))   # the engine loads the GGUF as it is (core/gguf_convert.cpp)
