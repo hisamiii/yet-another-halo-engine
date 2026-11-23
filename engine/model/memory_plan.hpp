@@ -48,9 +48,10 @@ struct MemoryPlan {
     p.context = context;
     const core::Gguf index = core::Gguf::OpenIndex(model);
     for (const auto& t : index.tensors()) p.weights += t.bytes;
-    // Fitted to MemAvailable over a load and 4 requests on gfx1151 with the removed MQ4 engine (2048-token chunks,
-    // MTP drafting on; 8K and 32K kv8 within 0.15 GB); not refitted on the native sets. What grows with the context
-    // is the KV pools (K and V of 16 layers x 1024 per token, at the format's bits plus scales) and f32 / f16
+    // Fitted to the lowest MemAvailable on gfx1151 with the native UD-IQ4_XS sets, kv8 (2026-11-23): yah_server --npu
+    // at 16K over a load and 3 requests 19.26 GB; loom_forward_pp's growth with the context 45.7 KB a token (8K, 32K,
+    // 128K); the NPU split's own buffers (GEMM + attention) 1.39 GB (32K, with and without --npu). What grows with the
+    // context is the KV pools (K and V of 16 layers x 1024 per token, at the format's bits plus scales) and f32 / f16
     // attention scratch.
     const std::uint64_t kv = 16ull * 1024 * (kb + vb) / 8 * 33 / 32;
     p.buffers = kFixed + std::uint64_t{p.context} * (kv + kScratchPerToken);
@@ -86,8 +87,10 @@ struct MemoryPlan {
   }
 
  private:
-  // kFixed: the chunk-sized buffers, state snapshots, the host side (~1.1 GB resident) and HRX's own memory
-  static constexpr std::uint64_t kFixed = 3600ull << 20, kScratchPerToken = 19500, kNpuFixed = 0;
+  // kFixed: the chunk-sized buffers, state snapshots, the host side and HRX's own memory; kNpuFixed: the NPU split's
+  // command arenas, operand and attention buffers (beside its npu_bfp_ rows)
+  static constexpr std::uint64_t kFixed = 1650ull * 1000 * 1000, kScratchPerToken = 12000,
+                                 kNpuFixed = 1400ull * 1000 * 1000;
 };
 
 }  // namespace yah::model
