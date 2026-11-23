@@ -1400,8 +1400,9 @@ class LoomPrefill {
                             "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
       Exe(hal);
     GeomOf("embed.hal");   // one token per workgroup: refuses a set emitted for another chunk size
-    // embed.hal decodes Q8_0 (core/gguf_convert.cpp makes a GGUF's token_embd Q8_0)
-    if (Find("token_embd.weight")->type != core::GgmlType::kQ8_0)
+    // embed.hal reads the set's token_embd format (dispatch.txt embed_type; a set without the row: Q8_0)
+    const auto et = geom_.find("embed_type");
+    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != (et == geom_.end() ? 8u : et->second.tokens))
       throw LoomError("prefill: token_embd: its format does not match embed.hal (re-emit the set)");
   }
 

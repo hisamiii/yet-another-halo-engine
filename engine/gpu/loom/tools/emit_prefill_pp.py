@@ -3029,13 +3029,14 @@ def main():
     # Each row over NORM_SPLIT waves (gen_half_norm.gen_split: the same per-lane chain order, so the same bits):
     # 0.383 -> 0.299 ms per call at 2048 rows (latency-bound -> ~214 GB/s). The driver reads the split from dispatch.txt.
     geom.append(("norm_split", 0, NORM_SPLIT, 0))
-    # The chunk's token_embd rows from its token ids on the GPU (gen_decode_misc.gen_embed_iq4xs, one workgroup per row),
+    # The chunk's token_embd rows from its token ids on the GPU (gen_decode_misc.EMBED, one workgroup per row),
     # so the host stages ids and never waits between chunks.
     embed_src = os.path.join(tmp, "yah_embed.loom")
-    if types["token_embd.weight"] != 8:
-        raise SystemExit("emit_prefill_pp: the embed kernel reads a Q8_0 token_embd")
-    open(embed_src, "w").write(gen_decode_misc.gen_embed_q8_0(rows=B))
+    if types["token_embd.weight"] not in gen_decode_misc.EMBED:
+        raise SystemExit("emit_prefill_pp: no embed kernel reads token_embd's format")
+    open(embed_src, "w").write(gen_decode_misc.EMBED[types["token_embd.weight"]][0](rows=B))
     geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
+    geom.append(("embed_type", types["token_embd.weight"], 1, 1))   # the GGML type it reads (the engine checks it)
     # YAH_CLK_PROBE (diag): one wave that measures the GPU clock over 20 us (gen_npu_unpack.gen_clk_probe)
     clk_src = os.path.join(tmp, "yah_clk_probe.loom")
     import gen_npu_unpack as GU   # (main's other imports of it sit in NPU branches: a set without the split has none)

@@ -29,12 +29,14 @@ SWIGLU = {"ffn_up.weight"}
 
 # gen_gemv.GGML's keys: the formats the head GEMV reads
 GEMV_TYPES = (8, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 23)
+# gen_decode_misc.EMBED's keys: the token_embd formats the embed kernels read (others convert to Q8_0)
+EMBED_TYPES = (8, 11)
 
 
 def parse(model):
     """Return [(name, dims, type)] for every tensor of a GGUF as the engine sees it (core/gguf_convert.cpp): the GGUF's
-    own tensors (token_embd converted to Q8_0, the embed kernel's format, and an output.weight in a format
-    gen_gemv does not read)."""
+    own tensors (a token_embd in a format no embed kernel reads and an output.weight in a format gen_gemv does not
+    read converted to Q8_0)."""
     f = open(model, "rb")
     if f.read(4) != b"GGUF":
         raise SystemExit("%s: not a GGUF file (the engine reads GGUF models only)" % model)
@@ -59,7 +61,7 @@ def parse(model):
         dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
         ty = struct.unpack("<I", f.read(4))[0]
         f.read(8)
-        q8 = nm == "token_embd.weight" or (nm == "output.weight" and ty not in GEMV_TYPES)
+        q8 = (nm == "token_embd.weight" and ty not in EMBED_TYPES) or (nm == "output.weight" and ty not in GEMV_TYPES)
         rows.append((nm, dims, 8 if q8 else ty))
     return rows
 

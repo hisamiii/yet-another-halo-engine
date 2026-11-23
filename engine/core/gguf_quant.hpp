@@ -1,5 +1,5 @@
-// GGML block formats to f32 on the CPU, and Q8_0 from f32: what loading a GGUF needs (core/gguf_convert.cpp: token_embd
-// and a head the GEMVs cannot read become Q8_0, the small tensors f32).
+// GGML block formats to f32 on the CPU, and Q8_0 from f32: what loading a GGUF needs (core/gguf_convert.cpp: a token_embd
+// no embed kernel reads and a head the GEMVs cannot read become Q8_0, the small tensors f32).
 #ifndef YAH_CORE_GGUF_QUANT_HPP_
 #define YAH_CORE_GGUF_QUANT_HPP_
 

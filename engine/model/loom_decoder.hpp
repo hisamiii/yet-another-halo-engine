@@ -10,7 +10,7 @@
 //                              conv + DeltaNet in one kernel (gated norm inside), ssm_out GEMV += hidden
 //   rmsnorm -> ffn_gate|ffn_up SwiGLU GEMV -> ffn_down GEMV += hidden
 // Head: rmsnorm -> output GEMV -> argmax into a device token stream (decode.txt "amax": inside the output GEMV).
-// The next step's embedding kernel (Q8_0 token_embd) reads that stream: steps queue back to back, no host round trip.
+// The next step's embedding kernel (token_embd in its format) reads that stream: steps queue back to back, no host round trip.
 //
 // The recurrent state and the KV pools are external (LoomDecoderState) and use the prefill's layouts.
 // Use OwnState() for a prompt fed through decode, or bind the prefill's state (loom_forward_pp --gen).
@@ -73,6 +73,7 @@ class LoomDecoder {
       while (in >> k >> kind >> r >> w) {
         if (k == "rw") rw_[kind] = {r, w};
         if (k == "grid") grid_[kind] = r;  // the exact grid each GEMV kernel was compiled for
+        if (k == "embed") embed_type_ = r;   // "embed - T 0": the GGML type the embed kernel reads
         if (k == "kv") {
           kbits_ = r;
           vbits_ = w;
@@ -86,8 +87,8 @@ class LoomDecoder {
       if (quant() && !(ok(kbits_) && ok(vbits_))) throw LoomError("decode.txt: kv formats must both be 8 or 4");
     }
     const std::uint32_t npg = T_ / 256;
-    // embed decodes Q8_0 (a GGUF model's token_embd converts to it at load)
-    if (Find("token_embd.weight")->type != core::GgmlType::kQ8_0)
+    // the embed kernel reads the set's token_embd format (a set without the row: Q8_0)
+    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != embed_type_)
       throw LoomError("token_embd: its format does not match the decode set's embed (re-emit)");
     hidden_ = &Alloc(kHidden * 4);
     normed_ = &Alloc(kHidden * 4);
@@ -541,6 +542,7 @@ class LoomDecoder {
   std::uint32_t T_ = 0, kbits_ = 16, vbits_ = 16, next_pos_ = kAnyTile;
   std::vector<hrx_buffer_ref_t> vopen_;  // quantized V: each layer's open tile, [1024][16] f16
   bool chain_ = false;     // decode.txt "chain"
+  std::uint32_t embed_type_ = 8;   // decode.txt "embed": token_embd's GGML type in the embed kernel
   bool amax_ = false;      // decode.txt "amax"
   bool late_ = false;      // decode.txt "latestate"
   bool sampling_ = false;  // SetSampling

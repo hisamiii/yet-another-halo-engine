@@ -25,7 +25,7 @@ Qwen3.8-27B is a hybrid: every 4th layer is full (softmax) attention, the others
 
 ### Loading
 
-`engine/core/gguf.cpp` reads the GGUF (`core::Gguf`) and `engine/core/gguf_convert.cpp` presents it as the engine reads it: the projections keep their bytes (the sets run the GGUF's own formats), ffn_up right after ffn_gate (the NPU FFN block reads gate through up rows in one view); token_embd becomes Q8_0, as does an output.weight that is not Q6_K or Q8_0, and the small tensors f32 (`engine/core/gguf_quant.cpp` has the dequantizers). Every kernel works in the GGUF's DeltaNet value-head order. The MTP layer (`blk.64.*`) is skipped. The file is read into anonymous memory (2 MB pages where the kernel has them), range by range as the device uploads it.
+`engine/core/gguf.cpp` reads the GGUF (`core::Gguf`) and `engine/core/gguf_convert.cpp` presents it as the engine reads it: the projections keep their bytes (the sets run the GGUF's own formats), ffn_up right after ffn_gate (the NPU FFN block reads gate through up rows in one view); token_embd becomes Q8_0 unless an embed kernel reads its format (Q8_0, Q3_K), as does an output.weight that is not Q6_K or Q8_0, and the small tensors f32 (`engine/core/gguf_quant.cpp` has the dequantizers). Every kernel works in the GGUF's DeltaNet value-head order. The MTP layer (`blk.64.*`) is skipped. The file is read into anonymous memory (2 MB pages where the kernel has them), range by range as the device uploads it.
 
 The tensors are then copied into device-local HRX buffers of about 1 GiB cut at tensor boundaries (`LoomWeights`), each host range released right after its copy: RAM holds one copy of the model. A mapped file does not work: reclaim and compaction scan its page-cache folios, and every scan of a GPU-imported page evicts all of the process's GPU queues (hardware.md).
 
@@ -37,7 +37,7 @@ The GEMMs run on the f16 WMMA with f16 activations; the weights are decoded from
 
 ### Kernels per layer
 
-The chunk graph starts with `yah_embed` (`gen_decode_misc.gen_embed_q8_0`, rows = B), which dequantizes the token_embd rows of the chunk's token ids.
+The chunk graph starts with `yah_embed` (`gen_decode_misc.EMBED` in token_embd's format, rows = B), which dequantizes the token_embd rows of the chunk's token ids.
 
 Every layer starts with `yah_half_norm` (attn_norm) into f16: row-major (`norm`), fragment-major for afrag GEMMs (`norm_t`, below) or both (`norm_rt`); dispatch.txt `norm_split` gives a row several waves.
 

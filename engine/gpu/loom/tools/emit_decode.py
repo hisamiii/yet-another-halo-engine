@@ -221,15 +221,18 @@ def main():
         "yah_fused_qk_rope.cache32_elems=%d" % (NUM_KV * HEAD_DIM),
         "yah_fused_qk_rope.cache16_elems=%d" % (NUM_KV * HEAD_DIM)])
     emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
-    # token_embd row (Q8_0) from the device token stream
-    emit_src(DM.gen_embed_q8_0(), "embed", outdir)
+    # token_embd row from the device token stream, in token_embd's format (gen_decode_misc.EMBED)
+    etype = next(ty for nm, _, ty in EP.parse(model) if nm == "token_embd.weight")
+    if etype not in DM.EMBED:
+        raise SystemExit("emit_decode: no embed kernel reads token_embd's format")
+    emit_src(DM.EMBED[etype][0](), "embed", outdir)
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
     emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-k / top-p / min-p sampling into the token stream
     emit_src(DM.gen_penalty(T=T), "penalty", outdir)     # repetition / frequency / presence penalties on the logits
     for f in os.listdir(os.path.join(LOOM, "tables")):   # the GEMVs of the IQ formats read their grids
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
-        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "chain - 0 0\n" + "amax - 0 0\n" +
+        "ctx %d\n" % T + ("kv q %d %d\n" % (kb, vb) if kb != 16 else "") + "chain - 0 0\n" + "amax - 0 0\n" + "embed - %d 0\n" % etype +
         "latestate - 0 0\n" + "".join("rw %s %d %d\n" % (k, r, w) for k, (r, w) in sorted(RW.items())) +
         "".join("grid %s %d 0\n" % (n, g) for n, g in sorted(grids.items())))
     shutil.rmtree(os.path.join(outdir, ".emit_tmp"), ignore_errors=True)

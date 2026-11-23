@@ -1,6 +1,7 @@
 // A GGUF model as the engine reads it: the projections keep their bytes (the sets run the GGUF's own formats), ffn_up
-// right after ffn_gate (the NPU FFN block's image reads gate through up rows in one view); token_embd becomes Q8_0, as
-// does an output.weight in a format the GEMVs do not read, and the small tensors f32.
+// right after ffn_gate (the NPU FFN block's image reads gate through up rows in one view); token_embd becomes Q8_0
+// unless an embed kernel reads its format (Q3_K), as does an output.weight in a format the GEMVs do not read, and the
+// small tensors f32.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -94,7 +95,11 @@ std::vector<Item> Plan(const Gguf& src, std::uint64_t* total) {
       if (up != by_name.end()) projection(*up->second);
     } else if (t.name == "token_embd.weight") {
       if (!CanDequantize(t.type)) throw std::runtime_error(std::string("gguf: token_embd type ") + TypeName(t.type));
-      add(&t, t.name, t.dims, GgmlType::kQ8_0, t.type == GgmlType::kQ8_0 ? Kind::kCopy : Kind::kQ8_0);
+      // the embed kernels (gen_decode_misc EMBED) read Q8_0 and Q3_K; other formats become Q8_0
+      if (t.type == GgmlType::kQ8_0 || t.type == GgmlType::kQ3_K)
+        add(&t, t.name, t.dims, t.type, Kind::kCopy);
+      else
+        add(&t, t.name, t.dims, GgmlType::kQ8_0, Kind::kQ8_0);
     } else {
       if (!CanDequantize(t.type)) throw std::runtime_error(std::string("gguf: tensor type ") + TypeName(t.type));
       add(&t, t.name, t.dims, GgmlType::kF32, t.type == GgmlType::kF32 ? Kind::kCopy : Kind::kF32);
