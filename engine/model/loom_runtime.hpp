@@ -343,6 +343,15 @@ class LoomDevice {
     return e;
   }
   void Wait(const LoomEvent& e) { LoomCheck(hrx_event_synchronize(e.handle), "hrx_event_synchronize"); }
+  // Wait, sleep-polling as Synchronize does under SetSleepSync (a long wait leaves the host core free).
+  void WaitPolled(const LoomEvent& e) {
+    for (bool done = false; sleep_us_ > 0;) {
+      LoomCheck(hrx_event_query(e.handle, &done), "hrx_event_query");
+      if (done) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_us_));
+    }
+    Wait(e);
+  }
   // Host data into the buffer in stream order (copied now; at most 64 KB).
   void Update(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     Order();

@@ -28,6 +28,7 @@ struct ChatRequest {
   bool stream = false;
   bool include_usage = false;  // stream_options.include_usage
   bool ignore_eos = false;     // llama.cpp's and vLLM's: generate max_tokens tokens past the end of turn (benchmarks)
+  bool return_progress = false;  // llama.cpp's: streamed prompt_progress chunks while the prompt runs
 };
 
 // llama.cpp's timings object: prompt_n tokens prefilled (the cached ones are cache_n) in prompt_ms, to the first token;
@@ -64,10 +65,15 @@ class ChatStream {
   bool Start();
   bool OnToken(std::string_view bytes);
   bool Finish(const model::GenerateResult& result);
+  // llama-server's prompt progress chunk (return_progress, streaming): an empty assistant delta and
+  // "prompt_progress": {total, cache, processed (the cached tokens included), time_ms}.
+  bool Progress(std::uint32_t total, std::uint32_t cached, std::uint32_t processed, double ms);
   void Fail(const std::string& message);
   [[nodiscard]] Json Response() const;
   [[nodiscard]] const std::string& id() const { return id_; }
   [[nodiscard]] bool client_alive() const { return alive_; }
+  [[nodiscard]] const ChatRequest& request() const { return request_; }
+  [[nodiscard]] bool streaming() const { return static_cast<bool>(emit_); }
   // A stop string ended the output: the generator stops at the next token.
   [[nodiscard]] bool stopped() const { return stop_.stopped(); }
 

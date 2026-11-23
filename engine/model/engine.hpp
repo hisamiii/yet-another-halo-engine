@@ -18,6 +18,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -167,6 +168,12 @@ class Engine : public TextGenerator {
     // The host queues every chunk without waiting: one chunk costs the whole prefill's time over its chunks' shares.
     const auto tp = std::chrono::steady_clock::now();
     double shares = 0.0;
+    // on_prefill: each chunk's event, waited on (and reported) once the next chunk is queued
+    std::optional<LoomEvent> pending;
+    std::uint32_t pending_at = 0;
+    const auto report = [&](std::uint32_t at) {
+      params.on_prefill(at, from, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    };
     for (std::uint32_t c = from / B; c < chunks; ++c) {
       const std::uint32_t valid = std::min(B, n - c * B);
       shares += ChunkShare(valid);
@@ -185,9 +192,19 @@ class Engine : public TextGenerator {
       prefill_.RunLayers(c, hook, head ? std::int64_t{valid} - 1 : LoomPrefill::kNoRows);
       if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
       if (at_prefill > from && (c + 1) * B == at_prefill) Save(xs, at_prefill, prefill_.conv_state());
+      if (params.on_prefill && c + 1 < chunks) {
+        LoomEvent done = gpu_.Mark();
+        if (pending) gpu_.WaitPolled(*pending), report(pending_at);
+        pending = std::move(done);
+        pending_at = c * B + valid;
+      }
       if (c + 1 == chunks) {
         gpu_.Synchronize();
         Track(chunk_ms_, (std::chrono::steady_clock::now() - tp) / shares, true);
+        if (params.on_prefill) {
+          if (pending) report(pending_at);
+          report(c * B + valid);
+        }
       }
     }
     // Every token, greedy or sampled (LoomDecoder::SetSampling), is picked on the GPU into the decoder's token stream,

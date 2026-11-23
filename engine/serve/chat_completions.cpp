@@ -104,7 +104,8 @@ ChatRequest ParseChatRequest(const Json& body) {
       "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p",
       "presence_penalty", "frequency_penalty", "repetition_penalty", "repeat_last_n", "stop", "seed", "stream",
       "stream_options", "reasoning_effort", "chat_template_kwargs", "n", "user", "store", "metadata", "service_tier",
-      "parallel_tool_calls", "prompt_cache_key", "safety_identifier", "ignore_eos", "tools", "tool_choice"};
+      "parallel_tool_calls", "prompt_cache_key", "safety_identifier", "ignore_eos", "tools", "tool_choice",
+      "return_progress"};
   // clang-format on
   for (const auto& [key, value] : body.items()) {
     if (kAccepted.contains(key) || IsEmptyValue(value) || IsDefaultValue(key, value)) continue;
@@ -210,6 +211,10 @@ ChatRequest ParseChatRequest(const Json& body) {
     if (!stream->is_boolean()) throw ApiError(400, "'stream' must be a boolean.", "stream");
     request.stream = stream->get<bool>();
   }
+  if (const Json* progress = Field(body, "return_progress")) {
+    if (!progress->is_boolean()) throw ApiError(400, "'return_progress' must be a boolean.", "return_progress");
+    request.return_progress = progress->get<bool>();
+  }
   if (const Json* ignore = Field(body, "ignore_eos")) {
     if (!ignore->is_boolean()) throw ApiError(400, "'ignore_eos' must be a boolean.", "ignore_eos");
     request.ignore_eos = ignore->get<bool>();
@@ -285,6 +290,17 @@ bool ChatStream::EmitChunk(Json delta, const Json& finish_reason, const Json* us
 
 bool ChatStream::Start() {
   EmitChunk({{"role", "assistant"}, {"content", ""}}, nullptr);
+  return alive_;
+}
+
+bool ChatStream::Progress(std::uint32_t total, std::uint32_t cached, std::uint32_t processed, double ms) {
+  if (!emit_ || !alive_) return alive_;
+  Json chunk = {{"id", id_}, {"object", "chat.completion.chunk"}, {"created", created_}, {"model", request_.model}};
+  chunk["choices"] = Json::array({{{"index", 0}, {"delta", {{"role", "assistant"}, {"content", nullptr}}},
+                                    {"logprobs", nullptr}, {"finish_reason", nullptr}}});
+  chunk["prompt_progress"] = {{"total", total}, {"cache", cached}, {"processed", processed},
+                              {"time_ms", static_cast<std::int64_t>(ms)}};
+  alive_ = emit_(Sse(chunk));
   return alive_;
 }
 

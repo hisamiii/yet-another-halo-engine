@@ -34,6 +34,10 @@ struct GenerateParams {
   std::uint32_t max_tokens = 1024;
   SamplingParams sampling;
   std::vector<core::TokenId> stop_ids;  // generation ends at the first of these; it is not reported
+  // Set: called once the device has run each prefill chunk, with the prompt tokens through it (the cached ones
+  // included), the cached tokens and the ms since the request started. The host then waits on each chunk a chunk
+  // behind the one it queues, so the device never idles for it.
+  std::function<void(std::uint32_t processed, std::uint32_t cached, double ms)> on_prefill;
 };
 
 struct GenerateResult {

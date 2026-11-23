@@ -3,6 +3,7 @@
 // Built with YAH_SERVE_FAKE_ONLY (the CMake target yah_server_fake) it has only --fake: no Engine, no HRX, no GPU.
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -250,8 +252,25 @@ class Server {
     try {
       // A client that left while waiting for the lock costs no generation.
       if (stream.Start()) {
-        result = generator_.Generate(
-            prompt, params, [&](TokenId id) { return stream.OnToken(generator_.tokenizer().DecodeToken(id)); });
+        GenerateParams p = params;
+        const auto total = static_cast<std::uint32_t>(prompt.size());
+        std::uint32_t shown = 0, cache = 0;   // return_progress: the last processed count sent
+        const auto start = std::chrono::steady_clock::now();
+        if constexpr (std::is_same_v<S, ChatStream>) {
+          if (stream.request().return_progress && stream.streaming())
+            p.on_prefill = [&](std::uint32_t processed, std::uint32_t cached, double ms) {
+              cache = cached;
+              if (processed > shown) stream.Progress(total, cached, shown = processed, ms);
+            };
+        }
+        result = generator_.Generate(prompt, p, [&](TokenId id) {
+          if constexpr (std::is_same_v<S, ChatStream>) {
+            if (p.on_prefill && shown < total)   // (a tail run as decode steps ends the prompt here)
+              stream.Progress(total, cache, shown = total,
+                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+          }
+          return stream.OnToken(generator_.tokenizer().DecodeToken(id));
+        });
       }
     } catch (const std::exception& error) {
       std::fprintf(stderr, "yah_server: %s failed: %s\n", stream.id().c_str(), error.what());
