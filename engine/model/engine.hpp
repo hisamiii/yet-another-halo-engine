@@ -254,14 +254,23 @@ class Engine : public TextGenerator {
 #ifdef YAH_WITH_NPU
     npu_status_ = NpuProblem();
     if (npu_status_.empty()) {
+      // a set may split the GEMMs, the attention (dispatch.txt npuattn) or both, as loom_forward_pp --npu runs them
       const NpuPlan plan = prefill_.npu_plan();
-      if (!plan.a_bytes) {
-        npu_status_ = "the prefill set has no NPU split (emit_prefill_pp.py YAH_NPU_SPLIT)";
+      if (!plan.a_bytes && !prefill_.npu_attn_set()) {
+        npu_status_ = "the prefill set has no NPU split (emit_prefill_pp.py YAH_NPU_SPLIT or YAH_NPU_ATTN)";
+      } else if (!plan.a_bytes) {   // the attention alone: no DPM pin (LoomNpuAttn)
+        npu_attn_ = std::make_unique<LoomNpuAttn>(gpu_);
+        prefill_.EnableNpuAttn(npu_attn_.get());
       } else if (npu_status_ = dpm_.Pin(); npu_status_.empty()) {
         npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
         weights_.ForEachShared(
             [&](const void* key, std::size_t bytes, const LoomBuffer& b) { npu_->ShareWeights(key, bytes, b); });
         prefill_.EnableNpu(npu_.get());
+        if (prefill_.npu_attn_set()) {   // both: two NPU contexts, their commands ordered by the host (SetPeer)
+          npu_attn_ = std::make_unique<LoomNpuAttn>(gpu_);
+          npu_->Npu().SetPeer(npu_attn_->Npu()), npu_attn_->Npu().SetPeer(npu_->Npu());
+          prefill_.EnableNpuAttn(npu_attn_.get());
+        }
       }
     }
 #else
@@ -353,6 +362,7 @@ class Engine : public TextGenerator {
 #ifdef YAH_WITH_NPU
   DpmPin dpm_;                         // (the level restored after the NPU stops)
   std::unique_ptr<LoomNpuSplit> npu_;  // (destroyed before the prefill that points at it)
+  std::unique_ptr<LoomNpuAttn> npu_attn_;  // a set with the NPU attention split's (destroyed before npu_, its peer)
 #endif
   std::string npu_status_ = "off";
   LoomBuffer logits_, seed_;

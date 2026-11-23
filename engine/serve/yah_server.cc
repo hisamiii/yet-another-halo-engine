@@ -46,9 +46,9 @@ int Usage() {
                "k4v8. They pick the HAL sets: a release bundle's hal/<ctx>-<kv>/; in a source tree\n"
                "~/.cache/yah/hal/<model file name>/<ctx>-<kv>/, emitted there on first use. --prefill / --decode\n"
                "name sets instead.\n"
-               "--npu: the NPU computes part of the prefill's GEMMs, with a prefill set that has the NPU split\n"
-               "(prefill-npu/ beside prefill/, or --prefill a set emitted with YAH_NPU_SPLIT); without what it\n"
-               "needs the GPU runs everything.\n"
+               "--npu: the NPU computes part of the prefill's GEMMs and attention, with a prefill set that has\n"
+               "the NPU split (prefill-npu/ beside prefill/, emitted on first use in a source tree; or --prefill\n"
+               "a set emitted with it); without what it needs the GPU runs everything.\n"
                "--no-reuse: every request prefills from scratch (no multi-turn cache).\n");
   return 2;
 }
@@ -104,6 +104,18 @@ std::pair<std::string, std::string> HalSets(const std::string& root, const std::
   const std::string pp = "YAH_CTX=" + std::to_string(ctx) + " python3 tools/emit_prefill_pp.py";
   emit("prefill", "dispatch.txt", {{pp, "2048"}});
   emit("decode", "decode.txt", {{"python3 tools/emit_decode.py", std::to_string(ctx)}});
+  // --npu: the production split (the GEMM split with emit_prefill_pp's Q' P1K defaults and FFN block 8192, and the NPU
+  // attention over 2 KV heads from chunk 4). Its pre-decoded rows need numpy and gguf-py: YAH_PYTHON names a python
+  // with them (default python3). Failing, the GPU runs the prefill alone.
+  if (npu) try {
+      emit("prefill-npu", "dispatch.txt",
+           {{"YAH_CTX=" + std::to_string(ctx) +
+                 " YAH_NPU_Q=4 YAH_NPU_QP1K=1 YAH_NPU_FFNBLK=8192 YAH_ATTN_W64=4 YAH_ATTN_KSPLIT=4 YAH_NPU_ATTN=2"
+                 " \"${YAH_PYTHON:-python3}\" tools/emit_prefill_pp.py",
+             "2048"}});
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "yah_server: %s (YAH_PYTHON: a python with numpy and gguf-py)\n", e.what());
+    }
   return {dir + (npu && Exists(dir + "/prefill-npu/dispatch.txt") ? "/prefill-npu" : "/prefill"), dir + "/decode"};
 }
 #endif
